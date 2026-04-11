@@ -12,6 +12,7 @@ from tqdm import tqdm
 
 from SCOP.dataset_reader import DatasetReader
 
+from .depth import DepthAnythingV2Estimator, DepthConfig
 from .filters import (
     get_relative_position,
     has_minimal_overlap,
@@ -120,6 +121,8 @@ def generate_object_relationships(
     per_image_annots: dict[int, list[CocoInstanceAnnotation]],
     params: SCOPParameters,
     limit_images: int | None = None,
+    reader: DatasetReader | None = None,
+    depth_config: DepthConfig | None = None,
 ) -> tuple[dict[int, list[dict[str, Any]]], int]:
     """
     Apply spatial constraints and generate clear spatial relationships.
@@ -135,6 +138,12 @@ def generate_object_relationships(
     image_items = list(per_image_annots.items())
     if limit_images is not None:
         image_items = image_items[:limit_images]
+
+    depth_estimator = None
+    if depth_config is not None:
+        if reader is None:
+            raise ValueError("reader is required when depth_config is provided")
+        depth_estimator = DepthAnythingV2Estimator(depth_config)
 
     # Process each image's annotations
     total_image_count = len(image_items)
@@ -153,6 +162,14 @@ def generate_object_relationships(
         # 2. Create pairs of objects
         object_pairs = list(itertools.combinations(filtered_annots, 2))
         valid_relationships = []
+        normalized_depth_map = None
+        depth_preview = None
+
+        if depth_estimator is not None:
+            image = reader.get_image(image_id)
+            raw_depth_map = depth_estimator.predict_depth(image)
+            normalized_depth_map = depth_estimator.normalize_depth(raw_depth_map)
+            depth_preview = depth_estimator.render_depth_preview(raw_depth_map)
 
         # 3. Apply spatial constraints
         for a1, a2 in object_pairs:
@@ -182,12 +199,45 @@ def generate_object_relationships(
                 for r21 in rel21:
                     relative_positions.append([object_name2, r21, object_name1])
 
+                depth_summary = None
+                if depth_estimator is not None and normalized_depth_map is not None:
+                    depth_summary = depth_estimator.compare_bboxes(
+                        normalized_depth_map, a1.bbox, a2.bbox
+                    )
+
+                    if (
+                        depth_summary is not None
+                        and depth_config is not None
+                        and depth_config.include_order_labels
+                    ):
+                        if depth_summary["ordering"] == "bbox1_closer":
+                            relative_positions.append(
+                                [object_name1, "in front of", object_name2]
+                            )
+                            relative_positions.append(
+                                [object_name2, "behind", object_name1]
+                            )
+                        elif depth_summary["ordering"] == "bbox2_closer":
+                            relative_positions.append(
+                                [object_name2, "in front of", object_name1]
+                            )
+                            relative_positions.append(
+                                [object_name1, "behind", object_name2]
+                            )
+
                 # Add to valid relationships
                 valid_relationships.append(
-                    {"annotations": [a1, a2], "relative_positions": relative_positions}
+                    {
+                        "annotations": [a1, a2],
+                        "relative_positions": relative_positions,
+                        "depth": depth_summary,
+                    }
                 )
 
         if valid_relationships:
+            if depth_preview is not None:
+                for relationship in valid_relationships:
+                    relationship["depth_preview"] = depth_preview
             image_id_to_relationships[image_id] = valid_relationships
             total_filtered_pairs += len(valid_relationships)
 
@@ -234,15 +284,18 @@ def export_dataset(
         for i, rel_data in enumerate(relationships):
             annotations = rel_data["annotations"]
             rel_positions = rel_data["relative_positions"]
+            depth_data = rel_data.get("depth")
 
-            metadata_entries.append(
-                {
-                    "seq": i,
-                    "file_name": f"images/{image_name}",  # Relative path
-                    "oros": rel_positions,
-                    "annots": [ann.asdict() for ann in annotations],
-                }
-            )
+            entry = {
+                "seq": i,
+                "file_name": f"images/{image_name}",  # Relative path
+                "oros": rel_positions,
+                "annots": [ann.asdict() for ann in annotations],
+            }
+            if depth_data is not None:
+                entry["depth"] = depth_data
+
+            metadata_entries.append(entry)
 
         return metadata_entries
 

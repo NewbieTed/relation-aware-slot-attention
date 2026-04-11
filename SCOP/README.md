@@ -18,6 +18,40 @@ The `--coco-root` directory should contain `annotations/` and `train2017/`.
 On successful processing of COCO2017, the output directory (`scop-coco2017` in this example) should
 have a `metadata.jsonl` file (28,028 lines) and an `images/` folder (15,426 images).
 
+### Optional: Depth Anything V2 Enrichment
+
+This branch also supports optional per-pair depth enrichment with the Hugging Face
+`depth-anything/Depth-Anything-V2-Base-hf` checkpoint.
+
+```bash
+python3 -m SCOP \
+  --coco-root /path/to/coco2017 \
+  --output-dir ./scop-coco2017-depth \
+  --limit-images 50 \
+  --create-samples \
+  --use-depth-anything \
+  --depth-device auto
+```
+
+When depth is enabled, each exported relationship entry may include a `depth` field in
+`metadata.jsonl` with bbox-level statistics and a conservative depth ordering. Sample
+visualizations also become side-by-side RGB and depth previews.
+
+If you additionally pass `--include-depth-order-labels`, the pipeline appends
+`in front of` / `behind` to `oros` only when the normalized median-depth gap is above
+`--depth-min-separation`. The default behavior stays unchanged unless depth is enabled.
+
+Backend behavior:
+
+- `--depth-device auto` prefers `cuda`, then `mps`, then `cpu`.
+- `--depth-device mps` explicitly targets Apple Silicon GPU when available.
+- On Apple Silicon, the code enables `PYTORCH_ENABLE_MPS_FALLBACK=1` so unsupported
+  ops can fall back to CPU while keeping the rest of the model on `mps`.
+- If MPS still cannot execute the model reliably, the depth module falls back to full
+  CPU inference instead of crashing the run.
+- `--depth-device cuda` is supported for Linux/NVIDIA environments and falls back to
+  CPU if CUDA is unavailable.
+
 ### Obtaining Object Masks (Optional for FLUX.1, required for Stable Diffusion 1.4/1.5/2.1)
 
 Install [SAM2] per the [official instructions][SAM2] (if you ran the [../setup_env.sh](../setup_env.sh)

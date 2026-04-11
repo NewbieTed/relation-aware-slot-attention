@@ -110,8 +110,45 @@ def create_sample_visualization(
         rel_text = f"{relative_positions[0][0]} {relative_positions[0][1]} {relative_positions[0][2]}"
         draw.text((10, 10), rel_text, fill="white", stroke_width=2, stroke_fill="black")
 
+        final_image = img_with_annotations
+        depth_summary = relationship.get("depth")
+        depth_preview = relationship.get("depth_preview")
+
+        if depth_preview is not None:
+            depth_panel = depth_preview.resize(
+                img_with_annotations.size, resample=Image.Resampling.BILINEAR
+            )
+            panel_width = img_with_annotations.width + depth_panel.width
+            panel_height = max(img_with_annotations.height, depth_panel.height)
+            combined = Image.new("RGB", (panel_width, panel_height), "black")
+            combined.paste(img_with_annotations, (0, 0))
+            combined.paste(depth_panel, (img_with_annotations.width, 0))
+
+            combined_draw = ImageDraw.Draw(combined)
+            combined_draw.text(
+                (img_with_annotations.width + 10, 10),
+                "Depth Anything V2",
+                fill="white",
+                stroke_width=2,
+                stroke_fill="black",
+            )
+
+            if depth_summary is not None:
+                ordering = depth_summary["ordering"]
+                delta = depth_summary["delta_median"]
+                depth_text = f"depth: {ordering} ({delta:+.3f})"
+                combined_draw.text(
+                    (img_with_annotations.width + 10, 40),
+                    depth_text,
+                    fill="white",
+                    stroke_width=2,
+                    stroke_fill="black",
+                )
+
+            final_image = combined
+
         # Save the image
         output_path = output_dir / f"sample_{i}_{image_id}.jpg"
-        img_with_annotations.save(output_path)
+        final_image.save(output_path)
 
     print(f"Created {len(sample_image_ids)} sample visualizations in {output_dir}")
