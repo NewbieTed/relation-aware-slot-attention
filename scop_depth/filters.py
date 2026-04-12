@@ -62,8 +62,20 @@ def has_minimal_overlap(
     a1: CocoInstanceAnnotation, a2: CocoInstanceAnnotation, threshold: float = 0.3
 ) -> bool:
     """Check if the overlapping area is below a threshold percentage of the smaller box."""
-    x1, y1, w1, h1 = a1.bbox
-    x2, y2, w2, h2 = a2.bbox
+    return get_overlap_ratio(a1.bbox, a2.bbox) < threshold
+
+
+def has_significant_overlap(
+    a1: CocoInstanceAnnotation, a2: CocoInstanceAnnotation, threshold: float = 0.4
+) -> bool:
+    """Check if the overlap is large enough to support an occlusion-style relation."""
+    return get_overlap_ratio(a1.bbox, a2.bbox) >= threshold
+
+
+def get_overlap_ratio(bbox1: BoundingBox, bbox2: BoundingBox) -> float:
+    """Return intersection area divided by the smaller bbox area."""
+    x1, y1, w1, h1 = bbox1
+    x2, y2, w2, h2 = bbox2
 
     # Calculate intersection coordinates
     x_left = max(x1, x2)
@@ -73,7 +85,7 @@ def has_minimal_overlap(
 
     # Check for no intersection
     if x_right < x_left or y_bottom < y_top:
-        return True  # No intersection, so overlap is definitely small
+        return 0.0
 
     # Calculate intersection area
     intersection_area = (x_right - x_left) * (y_bottom - y_top)
@@ -82,11 +94,11 @@ def has_minimal_overlap(
     area1 = w1 * h1
     area2 = w2 * h2
 
-    # Find the smaller area
     smaller_area = min(area1, area2)
+    if smaller_area <= 0:
+        return 0.0
 
-    # Check if overlap is small enough
-    return intersection_area < threshold * smaller_area
+    return intersection_area / smaller_area
 
 
 def has_size_balance(

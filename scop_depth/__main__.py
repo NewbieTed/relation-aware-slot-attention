@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-SCOP: Spatial Constraints-Oriented Pairing
+SCOP-Depth: Spatial Constraints-Oriented Pairing with Depth Relations
 
 A data engine that identifies and validates spatial relationships
 between object pairs through carefully designed spatial constraints.
@@ -20,12 +20,13 @@ from .data_processing import (
     load_per_image_annotations,
 )
 from .dataset_reader import DatasetReader
+from .depth import DEFAULT_DEPTH_MODEL_ID, DepthConfig
 from .visualize import create_sample_visualization
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="SCOP: Spatial Constraints-Oriented Pairing data engine"
+        description="SCOP-Depth: Spatial Constraints-Oriented Pairing with depth-aware relation extraction"
     )
 
     parser.add_argument(
@@ -53,7 +54,7 @@ def main() -> int:
         "--output-dir",
         type=Path,
         required=True,
-        help="Output directory for SCOP dataset",
+        help="Output directory for the SCOP-Depth dataset",
     )
 
     parser.add_argument(
@@ -116,6 +117,54 @@ def main() -> int:
         type=int,
         default=5,
         help="Number of sample visualizations to create (default: 5)",
+    )
+
+    parser.add_argument(
+        "--use-depth-anything",
+        action="store_true",
+        help="Run Depth Anything V2 to enrich pair metadata with per-object depth summaries",
+    )
+
+    parser.add_argument(
+        "--depth-model-id",
+        type=str,
+        default=DEFAULT_DEPTH_MODEL_ID,
+        help=f"Hugging Face model ID for depth inference (default: {DEFAULT_DEPTH_MODEL_ID})",
+    )
+
+    parser.add_argument(
+        "--depth-device",
+        type=str,
+        default="auto",
+        choices=("auto", "cpu", "mps", "cuda"),
+        help="Torch device for depth inference (default: auto)",
+    )
+
+    parser.add_argument(
+        "--depth-min-separation",
+        type=float,
+        default=0.2,
+        help="Minimum normalized median-depth gap before a pair gets a confident depth ordering",
+    )
+
+    parser.add_argument(
+        "--depth-center-crop-ratio",
+        type=float,
+        default=0.6,
+        help="Fraction of each bbox side used for center-crop depth summarization (default: 0.6)",
+    )
+
+    parser.add_argument(
+        "--hidden-overlap-threshold",
+        type=float,
+        default=0.4,
+        help="Overlap ratio threshold for emitting occlusion labels like 'hidden by' (default: 0.4)",
+    )
+
+    parser.add_argument(
+        "--include-depth-order-labels",
+        action="store_true",
+        help="Append conservative 'in front of' / 'behind' labels when depth separation is strong",
     )
 
     args = parser.parse_args()
@@ -182,15 +231,28 @@ def main() -> int:
             size_balance=args.size_balance,
             min_bbox_area=args.min_bbox_area,
         )
+        depth_config = None
+        if args.use_depth_anything:
+            depth_config = DepthConfig(
+                model_id=args.depth_model_id,
+                device=args.depth_device,
+                min_separation=args.depth_min_separation,
+                center_crop_ratio=args.depth_center_crop_ratio,
+                hidden_overlap_threshold=args.hidden_overlap_threshold,
+                include_order_labels=args.include_depth_order_labels,
+            )
+
         image_id_to_relationships, _ = generate_object_relationships(
             coco_inst,
             per_image_annots,
             params=params,
             limit_images=args.limit_images,
+            reader=reader,
+            depth_config=depth_config,
         )
 
         # Step 4: Export dataset
-        print(f"Exporting SCOP dataset to {args.output_dir}...")
+        print(f"Exporting SCOP-Depth dataset to {args.output_dir}...")
         export_dataset(
             reader,
             image_id_to_relationships,
@@ -207,7 +269,7 @@ def main() -> int:
             )
 
         elapsed_time = time.time() - start_time
-        print(f"SCOP processing completed in {elapsed_time:.2f} seconds")
+        print(f"SCOP-Depth processing completed in {elapsed_time:.2f} seconds")
 
         # Print dataset statistics
         total_images = len(image_id_to_relationships)
@@ -215,7 +277,7 @@ def main() -> int:
             len(rels) for rels in image_id_to_relationships.values()
         )
 
-        print("\nSCOP Dataset Statistics:")
+        print("\nSCOP-Depth Dataset Statistics:")
         print(f"  - Images: {total_images}")
         print(f"  - Object pairs: {total_relationships}")
         print(f"  - Output directory: {args.output_dir}")
