@@ -3,10 +3,10 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "coco-scop"
+name = "scop-depth"
 version = "0.1.0"
-description = "COCO adaptation of the CoMPaSS SCOP data pipeline"
-readme = "SCOP/README.md"
+description = "SCOP-Depth: a depth-augmented extension of the CoMPaSS SCOP data pipeline"
+readme = "scop_depth/README.md"
 requires-python = ">=3.10"
 dependencies = [
   "numpy>=1.26.0",
@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.scripts]
-coco-scop = "SCOP.__main__:main"
+scop-depth = "scop_depth.__main__:main"
 
 [tool.setuptools]
-packages = ["SCOP"]
+packages = ["scop_depth"]

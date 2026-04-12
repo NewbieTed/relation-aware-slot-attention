@@ -39,7 +39,7 @@ def _draw_text_block(
     block_height = sum(line_heights) + line_gap * (len(lines) - 1) + padding * 2
     draw.rectangle(
         [x, y, x + max_width + padding * 2, y + block_height],
-        fill=(0, 0, 0, 180),
+        fill="black",
     )
 
     cursor_y = y + padding

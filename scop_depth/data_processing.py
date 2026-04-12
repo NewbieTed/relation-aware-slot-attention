@@ -10,7 +10,7 @@ from typing import Any
 
 from tqdm import tqdm
 
-from SCOP.dataset_reader import DatasetReader
+from scop_depth.dataset_reader import DatasetReader
 
 from .depth import DepthAnythingV2Estimator, DepthConfig
 from .filters import (
@@ -308,7 +308,7 @@ def export_dataset(
     shared_images_dir: Path | None = None,
 ) -> None:
     """
-    Export the SCOP dataset to the specified directory.
+    Export the SCOP-Depth dataset to the specified directory.
     Creates:
         - A metadata.jsonl file with relationship information
         - Either:

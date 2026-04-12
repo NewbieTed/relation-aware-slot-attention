@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-SCOP: Spatial Constraints-Oriented Pairing
+SCOP-Depth: Spatial Constraints-Oriented Pairing with Depth Relations
 
 A data engine that identifies and validates spatial relationships
 between object pairs through carefully designed spatial constraints.
@@ -26,7 +26,7 @@ from .visualize import create_sample_visualization
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="SCOP: Spatial Constraints-Oriented Pairing data engine"
+        description="SCOP-Depth: Spatial Constraints-Oriented Pairing with depth-aware relation extraction"
     )
 
     parser.add_argument(
@@ -54,7 +54,7 @@ def main() -> int:
         "--output-dir",
         type=Path,
         required=True,
-        help="Output directory for SCOP dataset",
+        help="Output directory for the SCOP-Depth dataset",
     )
 
     parser.add_argument(
@@ -252,7 +252,7 @@ def main() -> int:
         )
 
         # Step 4: Export dataset
-        print(f"Exporting SCOP dataset to {args.output_dir}...")
+        print(f"Exporting SCOP-Depth dataset to {args.output_dir}...")
         export_dataset(
             reader,
             image_id_to_relationships,
@@ -269,7 +269,7 @@ def main() -> int:
             )
 
         elapsed_time = time.time() - start_time
-        print(f"SCOP processing completed in {elapsed_time:.2f} seconds")
+        print(f"SCOP-Depth processing completed in {elapsed_time:.2f} seconds")
 
         # Print dataset statistics
         total_images = len(image_id_to_relationships)
@@ -277,7 +277,7 @@ def main() -> int:
             len(rels) for rels in image_id_to_relationships.values()
         )
 
-        print("\nSCOP Dataset Statistics:")
+        print("\nSCOP-Depth Dataset Statistics:")
         print(f"  - Images: {total_images}")
         print(f"  - Object pairs: {total_relationships}")
         print(f"  - Output directory: {args.output_dir}")

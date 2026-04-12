@@ -1,6 +1,8 @@
-# Spatial Constraints-Oriented Pairing (SCOP) Data Engine
+# SCOP-Depth Data Engine
 
-This directory contains the official implementation of the SCOP data engine.
+This directory contains the implementation of `SCOP-Depth`, a depth-augmented extension of the SCOP data engine.
+
+The Python module path is `scop_depth`, so commands use `python3 -m scop_depth ...`.
 
 ## Usage
 
@@ -10,7 +12,7 @@ Go to the repository root (i.e. parent directory of this directory) and run:
 
 ```bash
 # make sure CWD is the repository root
-python3 -m SCOP --coco-root /path/to/coco2017 --output-dir ./scop-coco2017
+python3 -m scop_depth --coco-root /path/to/coco2017 --output-dir ./scop-coco2017
 ```
 
 The `--coco-root` directory should contain `annotations/` and `train2017/`.
@@ -24,7 +26,7 @@ This branch also supports optional per-pair depth enrichment with the Hugging Fa
 `depth-anything/Depth-Anything-V2-Base-hf` checkpoint.
 
 ```bash
-python3 -m SCOP \
+python3 -m scop_depth \
   --coco-root /path/to/coco2017 \
   --output-dir ./scop-coco2017-depth \
   --limit-images 50 \
@@ -64,7 +66,7 @@ script to set up your environment, SAM2 should have already been installed), the
 
 ```bash
 # make sure CWD is the repository root
-python3 -m SCOP.process_masks ./scop-coco2017
+python3 -m scop_depth.process_masks ./scop-coco2017
 ```
 
 [SAM2]: <https://github.com/facebookresearch/sam2>
