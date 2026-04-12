@@ -51,7 +51,9 @@ def resolve_torch_device(device_preference: str = "auto") -> str:
 class DepthConfig:
     model_id: str = DEFAULT_DEPTH_MODEL_ID
     device: str = "auto"
-    min_separation: float = 0.12
+    min_separation: float = 0.2
+    center_crop_ratio: float = 0.6
+    hidden_overlap_threshold: float = 0.4
     include_order_labels: bool = False
 
 
@@ -84,12 +86,22 @@ class DepthAnythingV2Estimator:
             return
 
         self._enable_mps_fallback()
-        self.processor = AutoImageProcessor.from_pretrained(
-            self.config.model_id, use_fast=False
-        )
-        self.model = AutoModelForDepthEstimation.from_pretrained(
-            self.config.model_id
-        ).to(self.device)
+        try:
+            self.processor = AutoImageProcessor.from_pretrained(
+                self.config.model_id, use_fast=False
+            )
+            self.model = AutoModelForDepthEstimation.from_pretrained(
+                self.config.model_id
+            ).to(self.device)
+        except Exception:
+            # Fall back to locally cached files so visualization rerenders and
+            # offline runs still work after the checkpoint has been downloaded.
+            self.processor = AutoImageProcessor.from_pretrained(
+                self.config.model_id, use_fast=False, local_files_only=True
+            )
+            self.model = AutoModelForDepthEstimation.from_pretrained(
+                self.config.model_id, local_files_only=True
+            ).to(self.device)
         self.model.eval()
 
     def _run_model(self, pixel_values: torch.Tensor) -> torch.Tensor:
@@ -170,13 +182,21 @@ class DepthAnythingV2Estimator:
 
     @staticmethod
     def summarize_bbox_depth(
-        depth_map: np.ndarray, bbox: BoundingBox
+        depth_map: np.ndarray, bbox: BoundingBox, center_crop_ratio: float = 1.0
     ) -> dict[str, float] | None:
         x, y, w, h = bbox
-        x0 = max(0, int(round(x)))
-        y0 = max(0, int(round(y)))
-        x1 = min(depth_map.shape[1], int(round(x + w)))
-        y1 = min(depth_map.shape[0], int(round(y + h)))
+        if center_crop_ratio <= 0 or center_crop_ratio > 1:
+            raise ValueError("center_crop_ratio must be in the interval (0, 1]")
+
+        crop_w = w * center_crop_ratio
+        crop_h = h * center_crop_ratio
+        crop_x = x + (w - crop_w) / 2
+        crop_y = y + (h - crop_h) / 2
+
+        x0 = max(0, int(round(crop_x)))
+        y0 = max(0, int(round(crop_y)))
+        x1 = min(depth_map.shape[1], int(round(crop_x + crop_w)))
+        y1 = min(depth_map.shape[0], int(round(crop_y + crop_h)))
 
         if x1 <= x0 or y1 <= y0:
             return None
@@ -191,16 +211,12 @@ class DepthAnythingV2Estimator:
             "min": float(np.min(patch)),
             "max": float(np.max(patch)),
             "std": float(np.std(patch)),
+            "center_crop_ratio": float(center_crop_ratio),
         }
 
-    def compare_bboxes(
-        self, normalized_depth_map: np.ndarray, bbox1: BoundingBox, bbox2: BoundingBox
+    def compare_depth_stats(
+        self, stats1: dict[str, float], stats2: dict[str, float]
     ) -> dict[str, Any] | None:
-        stats1 = self.summarize_bbox_depth(normalized_depth_map, bbox1)
-        stats2 = self.summarize_bbox_depth(normalized_depth_map, bbox2)
-        if stats1 is None or stats2 is None:
-            return None
-
         # For the relative Depth Anything checkpoints, larger values behave like
         # stronger inverse depth, so we interpret larger values as "closer".
         delta = stats1["median"] - stats2["median"]
@@ -225,6 +241,20 @@ class DepthAnythingV2Estimator:
             "closer_index": closer_index,
             "threshold": self.config.min_separation,
         }
+
+    def compare_bboxes(
+        self, normalized_depth_map: np.ndarray, bbox1: BoundingBox, bbox2: BoundingBox
+    ) -> dict[str, Any] | None:
+        stats1 = self.summarize_bbox_depth(
+            normalized_depth_map, bbox1, center_crop_ratio=self.config.center_crop_ratio
+        )
+        stats2 = self.summarize_bbox_depth(
+            normalized_depth_map, bbox2, center_crop_ratio=self.config.center_crop_ratio
+        )
+        if stats1 is None or stats2 is None:
+            return None
+
+        return self.compare_depth_stats(stats1, stats2)
 
     @staticmethod
     def render_depth_preview(depth_map: np.ndarray) -> Image.Image:

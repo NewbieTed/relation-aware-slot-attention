@@ -143,8 +143,22 @@ def main() -> int:
     parser.add_argument(
         "--depth-min-separation",
         type=float,
-        default=0.12,
+        default=0.2,
         help="Minimum normalized median-depth gap before a pair gets a confident depth ordering",
+    )
+
+    parser.add_argument(
+        "--depth-center-crop-ratio",
+        type=float,
+        default=0.6,
+        help="Fraction of each bbox side used for center-crop depth summarization (default: 0.6)",
+    )
+
+    parser.add_argument(
+        "--hidden-overlap-threshold",
+        type=float,
+        default=0.4,
+        help="Overlap ratio threshold for emitting occlusion labels like 'hidden by' (default: 0.4)",
     )
 
     parser.add_argument(
@@ -223,6 +237,8 @@ def main() -> int:
                 model_id=args.depth_model_id,
                 device=args.depth_device,
                 min_separation=args.depth_min_separation,
+                center_crop_ratio=args.depth_center_crop_ratio,
+                hidden_overlap_threshold=args.hidden_overlap_threshold,
                 include_order_labels=args.include_depth_order_labels,
             )
 

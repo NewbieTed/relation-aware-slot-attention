@@ -39,7 +39,12 @@ visualizations also become side-by-side RGB and depth previews.
 
 If you additionally pass `--include-depth-order-labels`, the pipeline appends
 `in front of` / `behind` to `oros` only when the normalized median-depth gap is above
-`--depth-min-separation`. The default behavior stays unchanged unless depth is enabled.
+`--depth-min-separation` (default: `0.2`). Depth summaries are computed from the center crop of each
+bounding box, controlled by `--depth-center-crop-ratio` (default: `0.6`), to reduce
+background contamination. Overlapping pairs can also emit `hidden by` when the overlap
+ratio exceeds `--hidden-overlap-threshold` (default: `0.4`) and the depth ordering is
+confident; in that case the export includes both `behind` and `hidden by`. The default
+behavior stays unchanged unless depth is enabled.
 
 Backend behavior:
 
