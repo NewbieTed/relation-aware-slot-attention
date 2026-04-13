@@ -2,10 +2,12 @@ import random
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from .dataset_reader import DatasetReader
 from .depth import DepthAnythingV2Estimator, DepthConfig
+from .geometry import segmentation_to_mask
 from .models import CocoInstanceAnnotation
 
 
@@ -55,7 +57,7 @@ def visualize_object_pair(
     font_path: str | None = None,
 ) -> tuple[Image.Image, Image.Image]:
     """
-    Visualize a pair of objects with bounding boxes.
+    Visualize a pair of objects with both bbox outlines and COCO segmentation overlays.
 
     Args:
         annot_pair: Tuple of two annotations to visualize
@@ -71,30 +73,38 @@ def visualize_object_pair(
 
     # Get the image using the reader
     image = reader.get_image(a1.image_id)
-    image_with_annotations = image.copy()
-
-    # Create draw object
-    draw = ImageDraw.Draw(image_with_annotations)
-
     # Try to load font, fallback to default if specified font isn't available
     font = _load_font(size=24, font_path=font_path)
 
-    # Draw bounding boxes and labels
     colors = ["cyan", "magenta"]
+    overlay = np.asarray(image.copy()).copy()
+
+    for i, annot in enumerate([a1, a2]):
+        rgb = (0, 255, 255) if i == 0 else (255, 0, 255)
+        # The overlay is informational only. SCOP's 2D constraints still come from
+        # bbox geometry; we show the visible-instance masks to make the depth pooling
+        # regions easier to inspect in samples.
+        mask = segmentation_to_mask(annot, image.width, image.height)
+        if mask is not None and np.any(mask):
+            tint = np.zeros_like(overlay)
+            tint[..., 0] = rgb[0]
+            tint[..., 1] = rgb[1]
+            tint[..., 2] = rgb[2]
+            overlay[mask] = (0.45 * overlay[mask] + 0.55 * tint[mask]).astype(
+                np.uint8
+            )
+
+    image_with_annotations = Image.fromarray(overlay)
+    draw = ImageDraw.Draw(image_with_annotations)
 
     for i, annot in enumerate([a1, a2]):
         x, y, w, h = annot.bbox
         category = category_dict[annot.category_id]
         color = colors[i % len(colors)]
 
-        # Draw rectangle
         draw.rectangle([x, y, x + w, y + h], outline=color, width=3)
-
-        # Draw label background
         text_bbox = draw.textbbox((x, y), category, font=font)
         draw.rectangle(text_bbox, fill="black")
-
-        # Draw label text
         draw.text((x, y), category, font=font, fill=color)
 
     return image, image_with_annotations
@@ -210,7 +220,22 @@ def create_sample_visualization(
             if depth_summary is not None:
                 ordering = depth_summary["ordering"]
                 delta = depth_summary["delta_median"]
-                right_lines.append(f"depth: {ordering} ({delta:+.3f})")
+                # Convert internal slot ordering into object names so sample panels are
+                # readable without needing to know which annotation was "bbox1" or "bbox2".
+                if ordering == "bbox1_closer":
+                    left_name = category_dict[annot_pair[0].category_id]
+                    right_name = category_dict[annot_pair[1].category_id]
+                    right_lines.append(
+                        f"depth: {left_name} closer than {right_name} ({delta:+.3f})"
+                    )
+                elif ordering == "bbox2_closer":
+                    left_name = category_dict[annot_pair[0].category_id]
+                    right_name = category_dict[annot_pair[1].category_id]
+                    right_lines.append(
+                        f"depth: {right_name} closer than {left_name} ({delta:+.3f})"
+                    )
+                else:
+                    right_lines.append(f"depth: ambiguous ({delta:+.3f})")
                 right_lines.extend(depth_lines)
             _draw_text_block(
                 combined_draw,

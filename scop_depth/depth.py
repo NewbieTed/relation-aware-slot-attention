@@ -62,7 +62,9 @@ class DepthAnythingV2Estimator:
     Thin wrapper around the Hugging Face Depth Anything V2 checkpoints.
 
     The relative-depth model is used conservatively here:
-    - we summarize depth inside each bounding box
+    - SCOP filtering still uses bbox geometry elsewhere in the pipeline
+    - depth pooling prefers instance segmentations to reduce background leakage
+    - bbox pooling remains the fallback when a usable segmentation mask is unavailable
     - we only emit front/behind labels when the separation is clearly large
     """
 
@@ -184,6 +186,10 @@ class DepthAnythingV2Estimator:
     def summarize_bbox_depth(
         depth_map: np.ndarray, bbox: BoundingBox, center_crop_ratio: float = 1.0
     ) -> dict[str, float] | None:
+        """Summarize depth inside the bbox center crop.
+
+        This is the fallback path when segmentation-based pooling is not available.
+        """
         x, y, w, h = bbox
         if center_crop_ratio <= 0 or center_crop_ratio > 1:
             raise ValueError("center_crop_ratio must be in the interval (0, 1]")
@@ -212,6 +218,57 @@ class DepthAnythingV2Estimator:
             "max": float(np.max(patch)),
             "std": float(np.std(patch)),
             "center_crop_ratio": float(center_crop_ratio),
+            "source": "bbox",
+        }
+
+    @staticmethod
+    def summarize_mask_depth(
+        depth_map: np.ndarray,
+        mask: np.ndarray,
+        bbox: BoundingBox | None = None,
+        center_crop_ratio: float = 1.0,
+    ) -> dict[str, float] | None:
+        """Summarize depth over the visible object mask.
+
+        If `center_crop_ratio < 1`, we intersect the mask with the bbox-centered crop
+        so background near the box edges contributes less to the pooled depth.
+        """
+        if mask.shape != depth_map.shape:
+            raise ValueError("mask and depth_map must have the same shape")
+        if center_crop_ratio <= 0 or center_crop_ratio > 1:
+            raise ValueError("center_crop_ratio must be in the interval (0, 1]")
+
+        valid_mask = mask.astype(bool)
+        if bbox is not None and center_crop_ratio < 1.0:
+            x, y, w, h = bbox
+            crop_w = w * center_crop_ratio
+            crop_h = h * center_crop_ratio
+            crop_x = x + (w - crop_w) / 2
+            crop_y = y + (h - crop_h) / 2
+
+            x0 = max(0, int(round(crop_x)))
+            y0 = max(0, int(round(crop_y)))
+            x1 = min(depth_map.shape[1], int(round(crop_x + crop_w)))
+            y1 = min(depth_map.shape[0], int(round(crop_y + crop_h)))
+            if x1 <= x0 or y1 <= y0:
+                return None
+
+            crop_mask = np.zeros_like(valid_mask, dtype=bool)
+            crop_mask[y0:y1, x0:x1] = True
+            valid_mask = np.logical_and(valid_mask, crop_mask)
+
+        values = depth_map[valid_mask]
+        if values.size == 0:
+            return None
+
+        return {
+            "mean": float(np.mean(values)),
+            "median": float(np.median(values)),
+            "min": float(np.min(values)),
+            "max": float(np.max(values)),
+            "std": float(np.std(values)),
+            "center_crop_ratio": float(center_crop_ratio),
+            "source": "segmentation",
         }
 
     def compare_depth_stats(
