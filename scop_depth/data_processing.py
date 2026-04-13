@@ -24,6 +24,7 @@ from .filters import (
     is_visually_significant,
     remove_small_bboxes,
 )
+from .geometry import segmentation_to_mask
 from .models import CocoInstanceAnnotation, serialize_jsonl
 
 
@@ -35,6 +36,8 @@ def _append_depth_relations(
     *,
     include_hidden_by: bool = False,
 ) -> None:
+    """Append conservative depth relations to a pair's exported labels."""
+
     if depth_summary["ordering"] == "bbox1_closer":
         relative_positions.append([object_name1, "in front of", object_name2])
         relative_positions.append([object_name2, "behind", object_name1])
@@ -148,6 +151,13 @@ def generate_object_relationships(
 ) -> tuple[dict[int, list[dict[str, Any]]], int]:
     """
     Apply spatial constraints and generate clear spatial relationships.
+
+    Design note:
+    - SCOP's 2D constraints remain bbox-based for stability and parity with the
+      original filtering logic.
+    - Depth summaries use COCO instance segmentation masks when available so the
+      pooled depth values are less contaminated by background pixels.
+
     Returns a dictionary mapping image_ids to lists of relationship dictionaries.
     """
     image_metadata = {m["id"]: m for m in coco_inst["images"]}
@@ -174,6 +184,8 @@ def generate_object_relationships(
     for image_id, annots in tqdm(
         image_items, total=total_image_count, desc="Processing images"
     ):
+        image_info = image_metadata[image_id]
+
         # 1. Remove small bounding boxes
         filtered_annots = remove_small_bboxes(annots, min_area=params.min_bbox_area)
 
@@ -194,16 +206,35 @@ def generate_object_relationships(
             normalized_depth_map = depth_estimator.normalize_depth(raw_depth_map)
             depth_preview = depth_estimator.render_depth_preview(raw_depth_map)
             for annot in filtered_annots:
-                depth_stats_by_annot_id[annot.id] = depth_estimator.summarize_bbox_depth(
-                    normalized_depth_map,
-                    annot.bbox,
-                    center_crop_ratio=depth_config.center_crop_ratio
-                    if depth_config is not None
-                    else 1.0,
+                center_crop_ratio = (
+                    depth_config.center_crop_ratio if depth_config is not None else 1.0
                 )
+                stats = None
+                # Visible-region masks are cleaner for depth pooling than raw bboxes,
+                # especially when the bbox includes large amounts of background.
+                mask = segmentation_to_mask(
+                    annot,
+                    image_width=image_info["width"],
+                    image_height=image_info["height"],
+                )
+                if mask is not None:
+                    stats = depth_estimator.summarize_mask_depth(
+                        normalized_depth_map,
+                        mask,
+                        bbox=annot.bbox,
+                        center_crop_ratio=center_crop_ratio,
+                    )
+                if stats is None:
+                    stats = depth_estimator.summarize_bbox_depth(
+                        normalized_depth_map,
+                        annot.bbox,
+                        center_crop_ratio=center_crop_ratio,
+                    )
+                depth_stats_by_annot_id[annot.id] = stats
 
         # 3. Apply spatial constraints
         for a1, a2 in object_pairs:
+            # Keep the original SCOP-style filtering and 2D relation logic on bboxes.
             pair_is_valid = (
                 is_visually_significant(a1, a2, image_metadata, params.visual_significance)
                 and has_semantic_distinction(a1, a2)
