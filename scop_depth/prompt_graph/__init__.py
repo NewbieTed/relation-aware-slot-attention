@@ -9,4 +9,3 @@ __all__ = [
     "SceneNode",
     "scene_graph_from_scop_depth_row",
 ]
-

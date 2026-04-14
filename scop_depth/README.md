@@ -36,17 +36,22 @@ python3 -m scop_depth \
 ```
 
 When depth is enabled, each exported relationship entry may include a `depth` field in
-`metadata.jsonl` with bbox-level statistics and a conservative depth ordering. Sample
+`metadata.jsonl` with object-level statistics and a conservative depth ordering. Sample
 visualizations also become side-by-side RGB and depth previews.
 
 If you additionally pass `--include-depth-order-labels`, the pipeline appends
 `in front of` / `behind` to `oros` only when the normalized median-depth gap is above
-`--depth-min-separation` (default: `0.2`). Depth summaries are computed from the center crop of each
-bounding box, controlled by `--depth-center-crop-ratio` (default: `0.6`), to reduce
-background contamination. Overlapping pairs can also emit `hidden by` when the overlap
+`--depth-min-separation` (default: `0.2`). Depth summaries are computed inside the COCO
+instance segmentation when available and restricted by the bbox center crop ratio
+(`--depth-center-crop-ratio`, default: `0.6`) to reduce background contamination.
+If a usable segmentation mask is unavailable, the pipeline falls back to bbox-based
+depth summarization automatically. Overlapping pairs can also emit `hidden by` when the overlap
 ratio exceeds `--hidden-overlap-threshold` (default: `0.4`) and the depth ordering is
 confident; in that case the export includes both `behind` and `hidden by`. The default
 behavior stays unchanged unless depth is enabled.
+
+Sample visualizations overlay the COCO instance segmentation for each selected object,
+while the SCOP 2D relations and overlap filtering still come from the original bbox-based logic.
 
 Backend behavior:
 

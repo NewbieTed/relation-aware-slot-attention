@@ -66,4 +66,3 @@ class SceneGraph:
                 raise ValueError(f"Unknown source node id: {edge.source_id}")
             if edge.target_id not in ids:
                 raise ValueError(f"Unknown target node id: {edge.target_id}")
-
