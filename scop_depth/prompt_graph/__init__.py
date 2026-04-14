@@ -1,5 +1,11 @@
-"""Prompt-side scene graph structures for SCOP-Depth."""
+from .adapter import SCOPDepthExample, scene_graph_from_scop_depth_row
+from .schema import RelationType, SceneEdge, SceneGraph, SceneNode
 
-from .schema import SceneEdge, SceneGraph, SceneNode
-
-__all__ = ["SceneNode", "SceneEdge", "SceneGraph"]
+__all__ = [
+    "RelationType",
+    "SCOPDepthExample",
+    "SceneEdge",
+    "SceneGraph",
+    "SceneNode",
+    "scene_graph_from_scop_depth_row",
+]

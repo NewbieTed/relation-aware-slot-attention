@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
-
+BoundingBox = tuple[float, float, float, float]
 RelationType = Literal[
     "left_of",
     "right_of",
@@ -16,59 +16,53 @@ RelationType = Literal[
 ]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class SceneNode:
-    """Object-centric node in a prompt scene graph."""
+    """A grounded object node extracted from one SCOP-Depth example."""
 
-    id: int
-    text: str
-    head: str
-    attributes: tuple[str, ...] = ()
+    id: str
+    label: str
+    annotation_id: int | None = None
+    category_id: int | None = None
+    bbox: BoundingBox | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class SceneEdge:
-    """Directed relation between two scene-graph nodes."""
+    """A directed relation between two scene nodes."""
 
-    source: int
-    target: int
+    source_id: str
+    target_id: str
     relation: RelationType
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class SceneGraph:
-    """Prompt-derived scene graph used by the slot-conditioning path."""
+    """Minimal scene-graph container used by the future graph-conditioning code."""
 
     nodes: tuple[SceneNode, ...]
     edges: tuple[SceneEdge, ...]
-    prompt: str | None = None
-    metadata: dict[str, str] = field(default_factory=dict)
+    prompt: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
 
-    def node_ids(self) -> tuple[int, ...]:
-        return tuple(node.id for node in self.nodes)
-
-    def validate(self) -> None:
-        """
-        Validate graph integrity.
-
-        Raises:
-            ValueError: if node IDs are duplicated or an edge references a
-                non-existent node.
-        """
-        node_ids = self.node_ids()
-        node_id_set = set(node_ids)
-
-        if len(node_ids) != len(node_id_set):
-            raise ValueError("SceneGraph contains duplicate node IDs")
-
-        for edge in self.edges:
-            if edge.source not in node_id_set:
-                raise ValueError(f"Edge source {edge.source} is not a valid node ID")
-            if edge.target not in node_id_set:
-                raise ValueError(f"Edge target {edge.target} is not a valid node ID")
+    def node_ids(self) -> set[str]:
+        return {node.id for node in self.nodes}
 
     def num_nodes(self) -> int:
         return len(self.nodes)
 
     def num_edges(self) -> int:
         return len(self.edges)
+
+    def validate(self) -> None:
+        ids = self.node_ids()
+        if len(ids) != len(self.nodes):
+            raise ValueError("SceneGraph contains duplicate node ids")
+
+        for edge in self.edges:
+            if edge.source_id not in ids:
+                raise ValueError(f"Unknown source node id: {edge.source_id}")
+            if edge.target_id not in ids:
+                raise ValueError(f"Unknown target node id: {edge.target_id}")
