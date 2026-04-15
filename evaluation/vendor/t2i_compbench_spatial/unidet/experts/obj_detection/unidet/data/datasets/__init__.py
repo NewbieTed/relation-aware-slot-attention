@@ -1,0 +1,1 @@
+"""Vendored UniDet dataset registrations."""

@@ -21,6 +21,8 @@ dist/
 # Local datasets and generated pipeline artifacts
 data/
 outputs/
+!evaluation/vendor/t2i_compbench_spatial/unidet/experts/obj_detection/unidet/data/
+!evaluation/vendor/t2i_compbench_spatial/unidet/experts/obj_detection/unidet/data/**
 
 # Local benchmark checkouts
 T2I-CompBench/
