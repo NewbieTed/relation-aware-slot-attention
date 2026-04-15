@@ -23,6 +23,8 @@ data/
 outputs/
 !evaluation/vendor/t2i_compbench_spatial/unidet/experts/obj_detection/unidet/data/
 !evaluation/vendor/t2i_compbench_spatial/unidet/experts/obj_detection/unidet/data/**
+evaluation/vendor/t2i_compbench_spatial/unidet/experts/obj_detection/unidet/data/**/__pycache__/
+evaluation/vendor/t2i_compbench_spatial/unidet/experts/obj_detection/unidet/data/**/*.pyc
 
 # Local benchmark checkouts
 T2I-CompBench/
