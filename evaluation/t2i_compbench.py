@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_VENDOR_ROOT = REPO_ROOT / "evaluation" / "vendor" / "t2i_compbench_spatial" / "unidet"
+DEFAULT_T2I_ROOT = REPO_ROOT / "external" / "T2I-CompBench"
 
 BENCHMARK_SPECS = {
     "spatial": {
@@ -30,15 +30,15 @@ BENCHMARK_SPECS = {
 
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run vendored T2I-CompBench spatial evaluation on an existing generated samples directory."
+        description="Run T2I-CompBench spatial evaluation on an existing generated samples directory."
     )
     parser.add_argument(
         "--t2i-compbench-root",
         type=Path,
-        default=DEFAULT_VENDOR_ROOT,
+        default=DEFAULT_T2I_ROOT,
         help=(
-            "Path to the vendored T2I-CompBench UniDet_eval root. "
-            "Defaults to evaluation/vendor/t2i_compbench_spatial/unidet."
+            "Path to a T2I-CompBench checkout or directly to its UniDet_eval directory. "
+            "Defaults to external/T2I-CompBench."
         ),
     )
     parser.add_argument(
@@ -71,6 +71,21 @@ def make_parser() -> argparse.ArgumentParser:
         help="Copy generated samples into the vendored examples/samples instead of symlinking.",
     )
     return parser
+
+
+def resolve_benchmark_root(t2i_compbench_root: Path) -> Path:
+    root = t2i_compbench_root.resolve()
+    if (root / "2D_spatial_eval.py").exists():
+        return root
+
+    candidate = root / "UniDet_eval"
+    if candidate.exists():
+        return candidate
+
+    raise FileNotFoundError(
+        "Could not locate the T2I-CompBench UniDet_eval directory under "
+        f"{t2i_compbench_root}"
+    )
 
 
 def prepare_examples_dir(
@@ -130,7 +145,7 @@ def run_benchmark(
 
 def main() -> int:
     args = make_parser().parse_args()
-    benchmark_root = args.t2i_compbench_root.resolve()
+    benchmark_root = resolve_benchmark_root(args.t2i_compbench_root)
     generated_dir = args.generated_dir.resolve()
     prompt_file = args.prompt_file.resolve()
     generated_samples_dir = generated_dir / "samples"

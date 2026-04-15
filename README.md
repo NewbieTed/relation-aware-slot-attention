@@ -3,3 +3,12 @@
 This workspace currently contains `SCOP-Depth`, a depth-augmented variant of the SCOP data pipeline used to extract 2D, depth-order, and occlusion-style relations from COCO.
 
 The implementation lives in [scop_depth](/Users/newbieted/workspace/relation-aware-slot-attention/scop_depth), and the module path is `scop_depth`.
+
+For evaluation, this repo now keeps only our wrapper scripts and a lightweight
+override layer. External benchmark code such as T2I-CompBench should be prepared
+outside the tracked source tree with:
+
+```bash
+./scripts/benchmark/setup_t2i_compbench.sh
+./scripts/benchmark/setup_t2i_compbench_weights.sh
+```

@@ -3,7 +3,15 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-WEIGHTS_DIR="${WEIGHTS_DIR:-$ROOT_DIR/evaluation/vendor/t2i_compbench_spatial/unidet/experts/expert_weights}"
+T2I_ROOT="${T2I_ROOT:-$ROOT_DIR/external/T2I-CompBench}"
+
+if [[ -d "$T2I_ROOT/UniDet_eval" ]]; then
+  UNIDET_ROOT="$T2I_ROOT/UniDet_eval"
+else
+  UNIDET_ROOT="$T2I_ROOT"
+fi
+
+WEIGHTS_DIR="${WEIGHTS_DIR:-$UNIDET_ROOT/experts/expert_weights}"
 
 mkdir -p "$WEIGHTS_DIR"
 

@@ -1,1 +1,0 @@
-"""Vendored depth expert package."""
