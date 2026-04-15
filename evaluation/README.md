@@ -54,6 +54,9 @@ so if you need a specific interpreter you can override it:
 PYTHON_BIN=python3.10 ./scripts/setup/bootstrap_all.sh
 ```
 
+If an older bootstrap created `scripts/.venv`, delete that stale environment
+before rerunning the new setup flow.
+
 The official prompt files now come from the external benchmark checkout:
 
 - `external/T2I-CompBench/examples/dataset/spatial_val.txt`

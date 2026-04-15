@@ -2,12 +2,34 @@
 
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+PYTHON_BIN="${PYTHON_BIN:-}"
 VENV_DIR="${VENV_DIR:-$ROOT_DIR/.venv}"
 
-if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
-  echo "Could not find Python executable: $PYTHON_BIN"
+find_python() {
+  if [[ -n "${PYTHON_BIN}" ]]; then
+    if command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+      command -v "$PYTHON_BIN"
+      return 0
+    fi
+    echo "Requested PYTHON_BIN was not found on PATH: $PYTHON_BIN" >&2
+  fi
+
+  for candidate in python3.10 python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      command -v "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+PYTHON_BIN="$(find_python || true)"
+if [[ -z "$PYTHON_BIN" ]]; then
+  echo "Could not find a usable Python interpreter."
+  echo "Set PYTHON_BIN explicitly, for example:"
+  echo "  PYTHON_BIN=/full/path/to/python ./scripts/setup/bootstrap_all.sh"
   exit 1
 fi
 
@@ -37,6 +59,7 @@ if ! "$VENV_PYTHON" -c "import spacy; spacy.load('en_core_web_sm')" >/dev/null 2
 fi
 
 if [[ "$(uname -s)" == "Linux" ]]; then
+  "$VENV_PYTHON" -m pip install "Pillow==9.5.0"
   "$VENV_PYTHON" -m pip install --no-build-isolation \
     "git+https://github.com/facebookresearch/detectron2.git@5aeb252b194b93dc2879b4ac34bc51a31b5aee13"
 else

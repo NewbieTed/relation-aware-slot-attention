@@ -15,3 +15,6 @@ outside the tracked source tree with:
 This creates a local `.venv`, installs the repo and evaluation dependencies,
 prepares the external T2I-CompBench checkout, and downloads the benchmark
 weights.
+
+If you previously used an older bootstrap version that created
+`scripts/.venv`, remove that stale environment first.
