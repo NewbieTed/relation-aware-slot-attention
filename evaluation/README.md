@@ -14,25 +14,45 @@ Important paths:
 
 - generator: `evaluation/generate.py`
 - benchmark wrapper: `evaluation/t2i_compbench.py`
-- master benchmark bootstrap: `scripts/setup/bootstrap_benchmark.sh`
+- full onboarding bootstrap: `scripts/setup/bootstrap_all.sh`
+- environment bootstrap: `scripts/setup/bootstrap_env.sh`
+- benchmark-only bootstrap: `scripts/setup/bootstrap_benchmark.sh`
 - benchmark checkout helper: `scripts/setup/benchmark/setup_t2i_compbench_checkout.sh`
 - benchmark weights helper: `scripts/setup/benchmark/setup_t2i_compbench_weights.sh`
 
 ## Install
 
+Simplest onboarding path:
+
 ```bash
-python3 -m pip install -e ".[eval]"
+./scripts/setup/bootstrap_all.sh
 ```
 
-Then prepare the external T2I-CompBench checkout plus our local compatibility
-overrides:
+This will:
+
+- create `.venv`
+- install the repo in editable mode with evaluation extras
+- install the extra benchmark Python packages we rely on
+- download the `en_core_web_sm` spaCy model
+- attempt Detectron2 installation on Linux
+- clone T2I-CompBench into `external/T2I-CompBench`
+- apply our compatibility overrides
+- download the benchmark weights
+
+If you want to run the setup in pieces instead, use:
 
 ```bash
+./scripts/setup/bootstrap_env.sh
 ./scripts/setup/bootstrap_benchmark.sh
 ```
 
 For local T2I-CompBench evaluation, it is often easiest to use a separate Python
-3.10 environment. If needed, point `--python-bin` at that interpreter.
+3.10 environment. The bootstrap script uses your current `python3` by default,
+so if you need a specific interpreter you can override it:
+
+```bash
+PYTHON_BIN=python3.10 ./scripts/setup/bootstrap_all.sh
+```
 
 The official prompt files now come from the external benchmark checkout:
 
@@ -105,3 +125,5 @@ These scripts support simple environment-variable overrides, for example:
 ```bash
 MODEL=sd21 DEVICE=cuda LIMIT_PROMPTS=10 ./scripts/benchmark/run_t2i_spatial_dryrun.sh
 ```
+
+If `.venv/bin/python` exists, the run scripts will use it automatically.

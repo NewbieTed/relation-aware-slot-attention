@@ -9,5 +9,9 @@ override layer. External benchmark code such as T2I-CompBench should be prepared
 outside the tracked source tree with:
 
 ```bash
-./scripts/setup/bootstrap_benchmark.sh
+./scripts/setup/bootstrap_all.sh
 ```
+
+This creates a local `.venv`, installs the repo and evaluation dependencies,
+prepares the external T2I-CompBench checkout, and downloads the benchmark
+weights.

@@ -9,5 +9,5 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 echo
 echo "Benchmark bootstrap complete."
-echo "Next, install Python dependencies if needed:"
-echo '  python3 -m pip install -e ".[eval]"'
+echo "If you have not created the repo environment yet, run:"
+echo "  ./scripts/setup/bootstrap_env.sh"
