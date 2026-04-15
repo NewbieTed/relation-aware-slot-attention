@@ -17,6 +17,7 @@ import PIL.Image as Image
 import glob
 import random
 import spacy
+from pathlib import Path
 
 try:
     import ruamel_yaml as yaml
@@ -32,6 +33,24 @@ import argparse
 from experts.depth.generate_dataset import Dataset as Dataset_depth
 
 obj_label_map = torch.load('dataset/detection_features.pt')['labels']
+
+
+def _depth_output_path(save_root: str, sample_path: str) -> str:
+    sample_name = os.path.basename(sample_path)
+    return os.path.join(save_root, "examples", "samples", sample_name.rsplit(".", 1)[0] + ".png")
+
+
+def _missing_depth_samples(data_path: str, save_root: str) -> list[str]:
+    samples_dir = Path(data_path) / "samples"
+    sample_paths = sorted(
+        (
+            str(path)
+            for path in samples_dir.iterdir()
+            if path.is_file() and not path.name.startswith(".")
+        ),
+        key=lambda path: int(Path(path).stem.rsplit("_", 1)[1]),
+    )
+    return [path for path in sample_paths if not os.path.exists(_depth_output_path(save_root, path))]
 
 def parse_args():
     parser = argparse.ArgumentParser(description="UniDet evaluation.")
@@ -163,7 +182,9 @@ def main():
     args = parse_args()
 
     #  get depth map
-    if not os.path.exists(f'{args.outpath}/labels/depth'):
+    depth_save_root = os.path.join(f'{args.outpath}/labels', 'depth')
+    missing_depth_samples = _missing_depth_samples(args.outpath, depth_save_root)
+    if missing_depth_samples:
         model, transform = load_expert_model(task='depth')
         accelerator = Accelerator(mixed_precision='fp16')
 
@@ -173,7 +194,7 @@ def main():
         save_path = os.path.join(save_path, 'depth')
 
         batch_size = 1
-        dataset = Dataset_depth(data_path, transform)
+        dataset = Dataset_depth(data_path, transform, sample_paths=missing_depth_samples)
         data_loader = torch.utils.data.DataLoader(
         dataset=dataset,
         batch_size=batch_size,
@@ -189,9 +210,9 @@ def main():
                 test_pred = model(test_data)
 
                 for k in range(len(test_pred)):
-                    img_path_split = img_path[k].split('/')
-                    ps = img_path[k].split('.')[-1]
-                    im_save_path = os.path.join(save_path, img_path_split[-3], img_path_split[-2])
+                    sample_path = img_path[k]
+                    ps = sample_path.split('.')[-1]
+                    im_save_path = os.path.join(save_path, 'examples', 'samples')
                     os.makedirs(im_save_path, exist_ok=True)
 
                     im_size = img_size[0][k].item(), img_size[1][k].item()
@@ -200,7 +221,7 @@ def main():
                     depth = torch.nn.functional.interpolate(depth.unsqueeze(0).unsqueeze(1), size=(im_size[1], im_size[0]),
                                                             mode='bilinear', align_corners=True)
                     depth_im = Image.fromarray(255 * depth[0, 0].detach().cpu().numpy()).convert('L')
-                    depth_im.save(os.path.join(im_save_path, img_path_split[-1].replace(f'.{ps}', '.png')))
+                    depth_im.save(os.path.join(im_save_path, os.path.basename(sample_path).replace(f'.{ps}', '.png')))
                     
         print('depth map saved in {}'.format(im_save_path))
     

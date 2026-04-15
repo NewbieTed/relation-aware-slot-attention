@@ -15,19 +15,24 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
 class Dataset(Dataset):
-    def __init__(self, data_path, transform):
+    def __init__(self, data_path, transform, sample_paths=None):
         self.data_path = data_path
         self.transform = transform
-        data_folders = glob.glob(f'{data_path}/*/')
 
-        # data_images = os.path.join(data_path, "images")
+        if sample_paths is not None:
+            self.data_list = list(sample_paths)
+            self.data_list.sort(
+                key=lambda path: int(os.path.splitext(os.path.basename(path))[0].rsplit("_", 1)[1])
+            )
+            return
+
         data_images = os.path.join(data_path, "samples")
         data_imgs = [
             name for name in os.listdir(data_images)
             if not name.startswith(".") and os.path.isfile(os.path.join(data_images, name))
         ]
         data_imgs.sort(key=lambda x: int(os.path.splitext(x)[0].rsplit("_", 1)[1]))
-        self.data_list = [os.path.join(data_images,data) for data in data_imgs]
+        self.data_list = [os.path.join(data_images, data) for data in data_imgs]
 
     def __len__(self):
         return len(self.data_list)
