@@ -9,6 +9,7 @@ __pycache__/
 # Virtual environments
 venv/
 .venv/
+.venv-*/
 env/
 
 # Build / packaging
@@ -19,6 +20,12 @@ dist/
 
 # Local datasets and generated pipeline artifacts
 data/
+outputs/
+
+# Local benchmark checkouts
+T2I-CompBench/
+evaluation/vendor/t2i_compbench_spatial/examples/
+evaluation/vendor/t2i_compbench_spatial/unidet/experts/expert_weights/
 
 # Notebook checkpoints
 .ipynb_checkpoints/

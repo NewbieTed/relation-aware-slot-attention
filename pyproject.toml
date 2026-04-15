@@ -17,8 +17,17 @@ dependencies = [
   "tqdm>=4.66.0",
 ]
 
+[project.optional-dependencies]
+eval = [
+  "accelerate>=0.34.0",
+  "diffusers>=0.30.0",
+  "safetensors>=0.4.5",
+]
+
 [project.scripts]
 scop-depth = "scop_depth.__main__:main"
 
 [tool.setuptools]
-packages = ["scop_depth"]
+
+[tool.setuptools.packages.find]
+include = ["scop_depth", "scop_depth.*", "evaluation", "evaluation.*"]
