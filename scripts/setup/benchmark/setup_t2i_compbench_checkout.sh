@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 T2I_ROOT="${T2I_ROOT:-$ROOT_DIR/external/T2I-CompBench}"
 OVERRIDES_DIR="$ROOT_DIR/scripts/benchmark/t2i_compbench_overrides"
 T2I_REPO_URL="${T2I_REPO_URL:-https://github.com/Karine-Huang/T2I-CompBench.git}"
@@ -42,6 +42,3 @@ done
 
 echo "T2I-CompBench checkout is ready at:"
 echo "  $T2I_ROOT"
-echo
-echo "Next:"
-echo "  ./scripts/benchmark/setup_t2i_compbench_weights.sh"

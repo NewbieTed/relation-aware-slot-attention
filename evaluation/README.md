@@ -14,8 +14,9 @@ Important paths:
 
 - generator: `evaluation/generate.py`
 - benchmark wrapper: `evaluation/t2i_compbench.py`
-- benchmark setup script: `scripts/benchmark/setup_t2i_compbench.sh`
-- benchmark weights script: `scripts/benchmark/setup_t2i_compbench_weights.sh`
+- master benchmark bootstrap: `scripts/setup/bootstrap_benchmark.sh`
+- benchmark checkout helper: `scripts/setup/benchmark/setup_t2i_compbench_checkout.sh`
+- benchmark weights helper: `scripts/setup/benchmark/setup_t2i_compbench_weights.sh`
 
 ## Install
 
@@ -27,13 +28,7 @@ Then prepare the external T2I-CompBench checkout plus our local compatibility
 overrides:
 
 ```bash
-./scripts/benchmark/setup_t2i_compbench.sh
-```
-
-Then download the benchmark weights:
-
-```bash
-./scripts/benchmark/setup_t2i_compbench_weights.sh
+./scripts/setup/bootstrap_benchmark.sh
 ```
 
 For local T2I-CompBench evaluation, it is often easiest to use a separate Python

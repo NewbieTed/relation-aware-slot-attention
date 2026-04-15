@@ -9,6 +9,5 @@ override layer. External benchmark code such as T2I-CompBench should be prepared
 outside the tracked source tree with:
 
 ```bash
-./scripts/benchmark/setup_t2i_compbench.sh
-./scripts/benchmark/setup_t2i_compbench_weights.sh
+./scripts/setup/bootstrap_benchmark.sh
 ```
