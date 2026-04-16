@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import random
 import sys
 from pathlib import Path
 from typing import Any
+import inspect
 
 import numpy as np
 import torch
@@ -157,6 +157,53 @@ def _build_lora_attn_procs(unet: Any, rank: int) -> dict[str, Any]:
     return lora_attn_procs
 
 
+def _manual_lora_supported() -> bool:
+    from diffusers.models.attention_processor import LoRAAttnProcessor2_0
+
+    signature = inspect.signature(LoRAAttnProcessor2_0.__init__)
+    return "hidden_size" in signature.parameters
+
+
+def _attach_lora_adapters(unet: Any, rank: int, learning_rate: float) -> torch.optim.Optimizer:
+    if hasattr(unet, "add_adapter"):
+        try:
+            from peft import LoraConfig
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "The training baseline now uses the PEFT LoRA path for compatibility "
+                "with this diffusers version. Install the training extras again so "
+                "`peft` is available: ./.venv/bin/python -m pip install -e '.[train]'"
+            ) from exc
+
+        target_modules = [
+            "to_q",
+            "to_k",
+            "to_v",
+            "to_out.0",
+        ]
+        lora_config = LoraConfig(
+            r=rank,
+            lora_alpha=rank,
+            init_lora_weights="gaussian",
+            target_modules=target_modules,
+        )
+        unet.add_adapter(lora_config)
+        trainable_parameters = [p for p in unet.parameters() if p.requires_grad]
+        return torch.optim.AdamW(trainable_parameters, lr=learning_rate)
+
+    if _manual_lora_supported():
+        from diffusers.loaders import AttnProcsLayers
+
+        unet.set_attn_processor(_build_lora_attn_procs(unet, rank))
+        lora_layers = AttnProcsLayers(unet.attn_processors)
+        lora_layers.to(device=next(unet.parameters()).device, dtype=torch.float32)
+        return torch.optim.AdamW(lora_layers.parameters(), lr=learning_rate)
+
+    raise RuntimeError(
+        "This diffusers installation does not expose a compatible LoRA attachment API."
+    )
+
+
 def _save_training_state(
     output_dir: Path,
     *,
@@ -289,7 +336,6 @@ def main() -> int:
     )
 
     from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
-    from diffusers.loaders import AttnProcsLayers
     from transformers import CLIPTextModel, CLIPTokenizer
 
     tokenizer = CLIPTokenizer.from_pretrained(args.model_id, subfolder="tokenizer")
@@ -317,11 +363,8 @@ def main() -> int:
     text_encoder.to(device)
     unet.to(device)
 
-    unet.set_attn_processor(_build_lora_attn_procs(unet, args.lora_rank))
+    optimizer = _attach_lora_adapters(unet, args.lora_rank, args.learning_rate)
     unet.to(device)
-    lora_layers = AttnProcsLayers(unet.attn_processors)
-    lora_layers.to(device=device, dtype=torch.float32)
-    optimizer = torch.optim.AdamW(lora_layers.parameters(), lr=args.learning_rate)
 
     start_step = _load_checkpoint_if_requested(
         args=args,
