@@ -18,3 +18,7 @@ echo "Optional extra setup:"
 echo "  ./scripts/setup/benchmark/setup_geneval_models.sh"
 echo "  ./scripts/setup/benchmark/setup_t2i_compbench_env.sh"
 echo "  ./scripts/setup/benchmark/setup_geneval_env.sh"
+echo
+echo "Recommended:"
+echo "  keep the repo code in .venv"
+echo "  keep T2I-CompBench compatibility packages in .venv-t2i"
