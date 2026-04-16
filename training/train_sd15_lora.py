@@ -196,6 +196,9 @@ def _attach_lora_adapters(unet: Any, rank: int, learning_rate: float) -> torch.o
         )
         unet.add_adapter(lora_config)
         trainable_parameters = [p for p in unet.parameters() if p.requires_grad]
+        for parameter in trainable_parameters:
+            if parameter.dtype != torch.float32:
+                parameter.data = parameter.data.to(torch.float32)
         return torch.optim.AdamW(trainable_parameters, lr=learning_rate)
 
     if _manual_lora_supported():
@@ -325,7 +328,10 @@ def main() -> int:
     weight_dtype = choose_weight_dtype(device, args.mixed_precision)
     set_seed(args.seed)
     os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-    scaler = torch.cuda.amp.GradScaler(enabled=device == "cuda" and args.mixed_precision == "fp16")
+    scaler = torch.amp.GradScaler(
+        "cuda",
+        enabled=device == "cuda" and args.mixed_precision == "fp16",
+    )
 
     dataset = SCOPDepthTextToImageDataset(
         args.dataset_dir,
