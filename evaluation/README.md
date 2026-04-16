@@ -71,6 +71,16 @@ Benchmark-specific Python extras can also be installed separately:
 ./scripts/setup/benchmark/setup_geneval_env.sh
 ```
 
+For GenEval, the script installs the lightweight Python extras by default and
+skips the legacy MMDetection/MMCV detector stack unless you explicitly opt in:
+
+```bash
+INSTALL_MMDET_STACK=1 ./scripts/setup/benchmark/setup_geneval_env.sh
+```
+
+That detector stack was designed around much older PyTorch/CUDA combinations,
+so it may require a more specialized environment than the repo's main `.venv`.
+
 For local T2I-CompBench evaluation, it is often easiest to use a separate Python
 3.10 environment. The bootstrap script uses your current `python3` by default,
 so if you need a specific interpreter you can override it:
