@@ -88,6 +88,15 @@ class SCOPDepthTextToImageDataset(Dataset[TrainingItem]):
     def __getitem__(self, index: int) -> TrainingItem:
         row = self.rows[index]
         image_path = self.dataset_dir / row["file_name"]
+        if not image_path.exists():
+            raise FileNotFoundError(
+                "Missing SCOP-Depth image file: "
+                f"{image_path}. "
+                "If metadata.jsonl exists but images were deleted or never materialized, "
+                "rebuild the subset with "
+                "`python -m training.materialize_images --dataset-dir <scop_depth_dir> "
+                "--coco-root <coco_root>`."
+            )
         image = Image.open(image_path).convert("RGB")
         image = _center_crop_to_square(image, self.image_size)
 
@@ -106,4 +115,3 @@ def collate_training_items(items: list[TrainingItem]) -> dict[str, Any]:
         "scene_graphs": [item.scene_graph for item in items],
         "metadata": [item.metadata for item in items],
     }
-

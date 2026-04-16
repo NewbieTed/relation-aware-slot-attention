@@ -436,15 +436,21 @@ def export_dataset(
 
     else:
         # No shared directory - use original behavior
-        images_outdir.mkdir(exist_ok=True, parents=True)
         if reader.coco_root:
-            # If using directory input, create symlink to original dataset
-            if not images_outdir.exists():
-                images_outdir.symlink_to(
-                    reader.coco_root / "train2017", target_is_directory=True
-                )
+            # If using directory input, materialize per-image symlinks so the export
+            # stays explicit and easier to recover if the original COCO tree moves.
+            images_outdir.mkdir(exist_ok=True, parents=True)
+            for image_id in tqdm(needed_image_ids, desc="Creating image symlinks"):
+                symlink_path = images_outdir / f"{image_id:012d}.jpg"
+                if not symlink_path.exists():
+                    rel_path = os.path.relpath(
+                        reader.coco_root / "train2017" / f"{image_id:012d}.jpg",
+                        images_outdir,
+                    )
+                    symlink_path.symlink_to(rel_path)
         else:
             # If using zip input, extract only needed images
+            images_outdir.mkdir(exist_ok=True, parents=True)
             for image_id in tqdm(needed_image_ids, desc="Extracting images"):
                 image_bytes = reader.get_image_bytes(image_id)
                 (images_outdir / f"{image_id:012d}.jpg").write_bytes(image_bytes)

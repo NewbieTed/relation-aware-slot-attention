@@ -50,3 +50,14 @@ MAX_TRAIN_STEPS=1000 \
 This baseline intentionally keeps the model text-only at conditioning time while
 still carrying scene-graph metadata through the dataloader so the next stage can
 replace or augment text conditioning with graph-aware slots.
+
+If `metadata.jsonl` exists but `data/scop_depth_full/images/` is missing because
+the original COCO tree was moved or deleted, you can rebuild just the referenced
+image subset without rerunning SCOP-Depth:
+
+```bash
+./.venv/bin/python -m training.materialize_images \
+  --dataset-dir /path/to/scop_depth_full \
+  --coco-root /path/to/coco2017 \
+  --mode symlink
+```
