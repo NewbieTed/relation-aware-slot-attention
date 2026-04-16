@@ -23,11 +23,17 @@ eval = [
   "diffusers>=0.30.0",
   "safetensors>=0.4.5",
 ]
+train = [
+  "accelerate>=0.34.0",
+  "diffusers>=0.30.0",
+  "safetensors>=0.4.5",
+]
 
 [project.scripts]
 scop-depth = "scop_depth.__main__:main"
+scop-depth-train-lora = "training.train_sd15_lora:main"
 
 [tool.setuptools]
 
 [tool.setuptools.packages.find]
-include = ["scop_depth", "scop_depth.*", "evaluation", "evaluation.*"]
+include = ["scop_depth", "scop_depth.*", "evaluation", "evaluation.*", "training", "training.*"]
