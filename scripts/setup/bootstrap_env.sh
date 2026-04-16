@@ -50,7 +50,7 @@ fi
 
 VENV_PYTHON="$VENV_DIR/bin/python"
 
-"$VENV_PYTHON" -m pip install --upgrade pip setuptools wheel
+"$VENV_PYTHON" -m pip install --upgrade pip "setuptools<82" wheel
 "$VENV_PYTHON" -m pip install -e ".[eval]"
 "$VENV_PYTHON" -m pip install "ruamel.yaml==0.17.32" spacy gdown
 
