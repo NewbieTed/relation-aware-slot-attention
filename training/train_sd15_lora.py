@@ -52,6 +52,13 @@ def choose_weight_dtype(device: str, mixed_precision: str) -> torch.dtype:
     return torch.float32
 
 
+def build_autocast_context(device: str, mixed_precision: str):
+    if device == "cuda" and mixed_precision in {"fp16", "bf16"}:
+        dtype = torch.float16 if mixed_precision == "fp16" else torch.bfloat16
+        return torch.autocast(device_type="cuda", dtype=dtype)
+    return torch.autocast(device_type="cpu", enabled=False)
+
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -318,6 +325,7 @@ def main() -> int:
     weight_dtype = choose_weight_dtype(device, args.mixed_precision)
     set_seed(args.seed)
     os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+    scaler = torch.cuda.amp.GradScaler(enabled=device == "cuda" and args.mixed_precision == "fp16")
 
     dataset = SCOPDepthTextToImageDataset(
         args.dataset_dir,
@@ -417,28 +425,41 @@ def main() -> int:
                     attention_mask=text_inputs.attention_mask.to(device),
                 )[0]
 
-            model_pred = unet(
-                noisy_latents,
-                timesteps,
-                encoder_hidden_states=encoder_hidden_states,
-            ).sample
+            with build_autocast_context(device, args.mixed_precision):
+                model_pred = unet(
+                    noisy_latents,
+                    timesteps,
+                    encoder_hidden_states=encoder_hidden_states,
+                ).sample
 
-            if noise_scheduler.config.prediction_type == "epsilon":
-                target = noise
-            elif noise_scheduler.config.prediction_type == "v_prediction":
-                target = noise_scheduler.get_velocity(latents, noise, timesteps)
-            else:
-                raise ValueError(
-                    f"Unsupported prediction type: {noise_scheduler.config.prediction_type}"
+                if noise_scheduler.config.prediction_type == "epsilon":
+                    target = noise
+                elif noise_scheduler.config.prediction_type == "v_prediction":
+                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
+                else:
+                    raise ValueError(
+                        f"Unsupported prediction type: {noise_scheduler.config.prediction_type}"
+                    )
+
+                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+            if not torch.isfinite(loss):
+                raise FloatingPointError(
+                    "Encountered a non-finite training loss. "
+                    "Try rerunning with MIXED_PRECISION=no or a smaller learning rate."
                 )
-
-            loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
             loss = loss / args.gradient_accumulation_steps
-            loss.backward()
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
             micro_step += 1
 
             if micro_step % args.gradient_accumulation_steps == 0:
-                optimizer.step()
+                if scaler.is_enabled():
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
                 global_step += 1

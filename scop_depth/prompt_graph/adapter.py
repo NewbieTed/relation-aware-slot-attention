@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 from ..models import CocoInstanceAnnotation
@@ -50,6 +49,24 @@ def _normalize_relation(raw_relation: str) -> str:
         raise ValueError(f"Unsupported relation string: {raw_relation}") from exc
 
 
+def _expand_relation_string(raw_relation: str) -> tuple[str, ...]:
+    """Expand compound SCOP relation strings into atomic graph relations."""
+
+    if raw_relation in DATASET_RELATION_TO_GRAPH:
+        return (raw_relation,)
+
+    pieces = tuple(part.strip() for part in raw_relation.split(" and ") if part.strip())
+    if not pieces:
+        raise ValueError(f"Unsupported relation string: {raw_relation}")
+
+    normalized: list[str] = []
+    for piece in pieces:
+        if piece not in DATASET_RELATION_TO_GRAPH:
+            raise ValueError(f"Unsupported relation string: {raw_relation}")
+        normalized.append(piece)
+    return tuple(normalized)
+
+
 def _make_node(index: int, label: str, annot: CocoInstanceAnnotation) -> SceneNode:
     return SceneNode(
         id=f"obj{index}",
@@ -94,15 +111,22 @@ def scene_graph_from_scop_depth_row(row: dict[str, Any]) -> SceneGraph:
         _make_node(1, node_labels_in_order[1], example.annots[1]),
     )
 
-    edges = tuple(
-        SceneEdge(
-            source_id=label_to_node_id[subj],
-            target_id=label_to_node_id[obj],
-            relation=_normalize_relation(rel),  # type: ignore[arg-type]
-            metadata={"raw_relation": rel},
-        )
-        for subj, rel, obj in example.oros
-    )
+    edges_list: list[SceneEdge] = []
+    for subj, rel, obj in example.oros:
+        atomic_relations = _expand_relation_string(rel)
+        for atomic_relation in atomic_relations:
+            edges_list.append(
+                SceneEdge(
+                    source_id=label_to_node_id[subj],
+                    target_id=label_to_node_id[obj],
+                    relation=_normalize_relation(atomic_relation),  # type: ignore[arg-type]
+                    metadata={
+                        "raw_relation": rel,
+                        "atomic_relation": atomic_relation,
+                    },
+                )
+            )
+    edges = tuple(edges_list)
 
     graph = SceneGraph(
         nodes=nodes,
@@ -116,4 +140,3 @@ def scene_graph_from_scop_depth_row(row: dict[str, Any]) -> SceneGraph:
     )
     graph.validate()
     return graph
-
