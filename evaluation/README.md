@@ -71,6 +71,12 @@ Benchmark-specific Python extras can also be installed separately:
 ./scripts/setup/benchmark/setup_geneval_env.sh
 ```
 
+`setup_t2i_compbench_env.sh` creates a dedicated `.venv-t2i` by default so the
+older T2I-CompBench dependencies do not conflict with the repo's main `.venv`.
+That dedicated environment also pins older benchmark-compatible versions such as
+`transformers==4.30.2`, `timm==0.4.12`, and `Pillow==9.5.0`, which should not be
+installed into the main repo environment.
+
 For GenEval, the script installs the lightweight Python extras by default and
 skips the legacy MMDetection/MMCV detector stack unless you explicitly opt in:
 
@@ -87,6 +93,12 @@ so if you need a specific interpreter you can override it:
 
 ```bash
 PYTHON_BIN=python3.10 ./scripts/setup/bootstrap_all.sh
+```
+
+To build the benchmark-only compatibility environment explicitly:
+
+```bash
+PYTHON_BIN=python3.10 ./scripts/setup/benchmark/setup_t2i_compbench_env.sh
 ```
 
 If an older bootstrap created `scripts/.venv`, delete that stale environment
