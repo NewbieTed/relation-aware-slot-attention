@@ -47,7 +47,7 @@ def load_prompt_lines(path: Path) -> list[str]:
     return prompts
 
 
-def build_pipeline(model_name: str, device: str):
+def build_pipeline(model_name: str, device: str, lora_path: Path | None = None):
     from diffusers import StableDiffusionPipeline
 
     os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
@@ -59,6 +59,10 @@ def build_pipeline(model_name: str, device: str):
         safety_checker=None,
     )
     pipeline = pipeline.to(device)
+    if lora_path is not None:
+        if not lora_path.exists():
+            raise FileNotFoundError(f"Missing LoRA adapter path: {lora_path}")
+        pipeline.load_lora_weights(str(lora_path))
     pipeline.set_progress_bar_config(disable=False)
     return pipeline
 
@@ -68,6 +72,7 @@ def save_run_config(
     *,
     model_key: str,
     model_name: str,
+    lora_path: Path | None,
     prompt_file: Path,
     device: str,
     seed: int,
@@ -80,6 +85,7 @@ def save_run_config(
     payload = {
         "model_key": model_key,
         "model_name": model_name,
+        "lora_path": str(lora_path) if lora_path is not None else None,
         "prompt_file": str(prompt_file),
         "device": device,
         "seed": seed,
@@ -125,6 +131,12 @@ def make_parser() -> argparse.ArgumentParser:
         choices=("auto", "cpu", "mps", "cuda"),
         default="auto",
         help="Torch device for generation (default: auto).",
+    )
+    parser.add_argument(
+        "--lora-path",
+        type=Path,
+        default=None,
+        help="Optional LoRA adapter directory to load on top of the base model.",
     )
     parser.add_argument(
         "--seed",
@@ -185,11 +197,12 @@ def main() -> int:
     samples_dir = args.output_dir / "samples"
     samples_dir.mkdir(parents=True, exist_ok=True)
 
-    pipeline = build_pipeline(model_name, device)
+    pipeline = build_pipeline(model_name, device, args.lora_path)
     save_run_config(
         args.output_dir,
         model_key=args.model,
         model_name=model_name,
+        lora_path=args.lora_path,
         prompt_file=args.prompts_file,
         device=device,
         seed=args.seed,
