@@ -244,7 +244,11 @@ def _save_checkpoint(
 ) -> Path:
     checkpoint_dir = output_dir / f"checkpoint-{step:06d}"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    unet.save_attn_procs(checkpoint_dir / "lora")
+    lora_dir = checkpoint_dir / "lora"
+    if hasattr(unet, "save_lora_adapter"):
+        unet.save_lora_adapter(lora_dir, adapter_name="default")
+    else:
+        unet.save_attn_procs(lora_dir)
     torch.save(optimizer.state_dict(), checkpoint_dir / "optimizer.pt")
     return checkpoint_dir
 
@@ -513,7 +517,10 @@ def main() -> int:
 
     final_dir = args.output_dir / "final"
     final_dir.mkdir(parents=True, exist_ok=True)
-    unet.save_attn_procs(final_dir / "lora")
+    if hasattr(unet, "save_lora_adapter"):
+        unet.save_lora_adapter(final_dir / "lora", adapter_name="default")
+    else:
+        unet.save_attn_procs(final_dir / "lora")
     _save_training_state(args.output_dir, step=global_step, args=args, prompts=validation_prompts)
     print(f"Training finished at step {global_step}. Final LoRA weights saved to {final_dir / 'lora'}")
     return 0
