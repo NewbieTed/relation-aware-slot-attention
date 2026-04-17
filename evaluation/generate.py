@@ -63,16 +63,20 @@ def build_pipeline(model_name: str, device: str, lora_path: Path | None = None):
         if not lora_path.exists():
             raise FileNotFoundError(f"Missing LoRA adapter path: {lora_path}")
         adapter_name = "scopdepth"
-        pipeline.load_lora_weights(str(lora_path), adapter_name=adapter_name)
-        pipeline.set_adapters(adapter_name, 1.0)
-        active_adapters = pipeline.get_active_adapters()
+        pipeline.unet.load_lora_adapter(
+            str(lora_path),
+            prefix=None,
+            adapter_name=adapter_name,
+        )
+        pipeline.unet.set_adapters(adapter_name)
+        active_adapters = list(pipeline.unet.active_adapters())
         if adapter_name not in active_adapters:
             raise RuntimeError(
                 f"LoRA adapter was loaded from {lora_path} but is not active. "
                 f"Active adapters: {active_adapters}"
             )
         print(f"Evaluation: loaded LoRA adapter from {lora_path}")
-        print(f"Evaluation: active adapters = {active_adapters}")
+        print(f"Evaluation: active UNet adapters = {active_adapters}")
     pipeline.set_progress_bar_config(disable=False)
     return pipeline
 
