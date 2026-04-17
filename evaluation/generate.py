@@ -47,6 +47,24 @@ def load_prompt_lines(path: Path) -> list[str]:
     return prompts
 
 
+def resolve_lora_weight_name(lora_path: Path) -> str | None:
+    """Pick an explicit weight filename when the adapter directory uses non-default naming."""
+
+    if lora_path.is_file():
+        return lora_path.name
+
+    candidate_names = (
+        "pytorch_lora_weights.safetensors",
+        "pytorch_lora_weights.bin",
+        "adapter_model.safetensors",
+        "adapter_model.bin",
+    )
+    for candidate in candidate_names:
+        if (lora_path / candidate).exists():
+            return candidate
+    return None
+
+
 def build_pipeline(model_name: str, device: str, lora_path: Path | None = None):
     from diffusers import StableDiffusionPipeline
 
@@ -63,10 +81,12 @@ def build_pipeline(model_name: str, device: str, lora_path: Path | None = None):
         if not lora_path.exists():
             raise FileNotFoundError(f"Missing LoRA adapter path: {lora_path}")
         adapter_name = "scopdepth"
+        weight_name = resolve_lora_weight_name(lora_path)
         pipeline.unet.load_lora_adapter(
             str(lora_path),
             prefix=None,
             adapter_name=adapter_name,
+            weight_name=weight_name,
         )
         pipeline.unet.set_adapters(adapter_name)
         active_adapters = list(pipeline.unet.active_adapters())
@@ -76,6 +96,8 @@ def build_pipeline(model_name: str, device: str, lora_path: Path | None = None):
                 f"Active adapters: {active_adapters}"
             )
         print(f"Evaluation: loaded LoRA adapter from {lora_path}")
+        if weight_name is not None:
+            print(f"Evaluation: LoRA weight file = {weight_name}")
         print(f"Evaluation: active UNet adapters = {active_adapters}")
     pipeline.set_progress_bar_config(disable=False)
     return pipeline
