@@ -52,6 +52,7 @@ class TrainingItem:
     prompt: str
     scene_graph: dict[str, Any]
     metadata: dict[str, Any]
+    image_size: tuple[int, int]
 
 
 class SCOPDepthTextToImageDataset(Dataset[TrainingItem]):
@@ -98,6 +99,7 @@ class SCOPDepthTextToImageDataset(Dataset[TrainingItem]):
                 "--coco-root <coco_root>`."
             )
         image = Image.open(image_path).convert("RGB")
+        original_image_size = image.size
         image = _center_crop_to_square(image, self.image_size)
 
         return TrainingItem(
@@ -105,6 +107,7 @@ class SCOPDepthTextToImageDataset(Dataset[TrainingItem]):
             prompt=prompt_from_scop_depth_row(row, prefix=self.prompt_prefix),
             scene_graph=scene_graph_payload_from_row(row),
             metadata=row,
+            image_size=original_image_size,
         )
 
 
@@ -114,4 +117,5 @@ def collate_training_items(items: list[TrainingItem]) -> dict[str, Any]:
         "prompts": [item.prompt for item in items],
         "scene_graphs": [item.scene_graph for item in items],
         "metadata": [item.metadata for item in items],
+        "image_sizes": [item.image_size for item in items],
     }
