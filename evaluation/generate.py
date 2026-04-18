@@ -47,7 +47,25 @@ def load_prompt_lines(path: Path) -> list[str]:
     return prompts
 
 
-def build_pipeline(model_name: str, device: str):
+def resolve_lora_weight_name(lora_path: Path) -> str | None:
+    """Pick an explicit weight filename when the adapter directory uses non-default naming."""
+
+    if lora_path.is_file():
+        return lora_path.name
+
+    candidate_names = (
+        "pytorch_lora_weights.safetensors",
+        "pytorch_lora_weights.bin",
+        "adapter_model.safetensors",
+        "adapter_model.bin",
+    )
+    for candidate in candidate_names:
+        if (lora_path / candidate).exists():
+            return candidate
+    return None
+
+
+def build_pipeline(model_name: str, device: str, lora_path: Path | None = None):
     from diffusers import StableDiffusionPipeline
 
     os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
@@ -59,6 +77,28 @@ def build_pipeline(model_name: str, device: str):
         safety_checker=None,
     )
     pipeline = pipeline.to(device)
+    if lora_path is not None:
+        if not lora_path.exists():
+            raise FileNotFoundError(f"Missing LoRA adapter path: {lora_path}")
+        adapter_name = "scopdepth"
+        weight_name = resolve_lora_weight_name(lora_path)
+        pipeline.unet.load_lora_adapter(
+            str(lora_path),
+            prefix=None,
+            adapter_name=adapter_name,
+            weight_name=weight_name,
+        )
+        pipeline.unet.set_adapters(adapter_name)
+        active_adapters = list(pipeline.unet.active_adapters())
+        if adapter_name not in active_adapters:
+            raise RuntimeError(
+                f"LoRA adapter was loaded from {lora_path} but is not active. "
+                f"Active adapters: {active_adapters}"
+            )
+        print(f"Evaluation: loaded LoRA adapter from {lora_path}")
+        if weight_name is not None:
+            print(f"Evaluation: LoRA weight file = {weight_name}")
+        print(f"Evaluation: active UNet adapters = {active_adapters}")
     pipeline.set_progress_bar_config(disable=False)
     return pipeline
 
@@ -68,6 +108,7 @@ def save_run_config(
     *,
     model_key: str,
     model_name: str,
+    lora_path: Path | None,
     prompt_file: Path,
     device: str,
     seed: int,
@@ -80,6 +121,7 @@ def save_run_config(
     payload = {
         "model_key": model_key,
         "model_name": model_name,
+        "lora_path": str(lora_path) if lora_path is not None else None,
         "prompt_file": str(prompt_file),
         "device": device,
         "seed": seed,
@@ -125,6 +167,12 @@ def make_parser() -> argparse.ArgumentParser:
         choices=("auto", "cpu", "mps", "cuda"),
         default="auto",
         help="Torch device for generation (default: auto).",
+    )
+    parser.add_argument(
+        "--lora-path",
+        type=Path,
+        default=None,
+        help="Optional LoRA adapter directory to load on top of the base model.",
     )
     parser.add_argument(
         "--seed",
@@ -185,11 +233,12 @@ def main() -> int:
     samples_dir = args.output_dir / "samples"
     samples_dir.mkdir(parents=True, exist_ok=True)
 
-    pipeline = build_pipeline(model_name, device)
+    pipeline = build_pipeline(model_name, device, args.lora_path)
     save_run_config(
         args.output_dir,
         model_key=args.model,
         model_name=model_name,
+        lora_path=args.lora_path,
         prompt_file=args.prompts_file,
         device=device,
         seed=args.seed,

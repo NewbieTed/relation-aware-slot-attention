@@ -17,6 +17,7 @@ fi
 CATEGORY="${CATEGORY:-spatial}"
 MODEL="${MODEL:-sd15}"
 DEVICE="${DEVICE:-auto}"
+LORA_PATH="${LORA_PATH:-}"
 NUM_IMAGES_PER_PROMPT="${NUM_IMAGES_PER_PROMPT:-1}"
 START_INDEX="${START_INDEX:-0}"
 PYTHON_BIN="${PYTHON_BIN:-$DEFAULT_PYTHON}"
@@ -35,14 +36,24 @@ esac
 
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/eval/${MODEL}_t2i_compbench_${CATEGORY}_val}"
 
-"$PYTHON_BIN" -m evaluation.generate \
-  --model "$MODEL" \
-  --prompts-file "$PROMPTS_FILE" \
-  --output-dir "$OUTPUT_DIR" \
-  --num-images-per-prompt "$NUM_IMAGES_PER_PROMPT" \
-  --start-index "$START_INDEX" \
-  --device "$DEVICE"
-
+if [[ -n "$LORA_PATH" ]]; then
+  "$PYTHON_BIN" -m evaluation.generate \
+    --model "$MODEL" \
+    --prompts-file "$PROMPTS_FILE" \
+    --output-dir "$OUTPUT_DIR" \
+    --num-images-per-prompt "$NUM_IMAGES_PER_PROMPT" \
+    --start-index "$START_INDEX" \
+    --device "$DEVICE" \
+    --lora-path "$LORA_PATH"
+else
+  "$PYTHON_BIN" -m evaluation.generate \
+    --model "$MODEL" \
+    --prompts-file "$PROMPTS_FILE" \
+    --output-dir "$OUTPUT_DIR" \
+    --num-images-per-prompt "$NUM_IMAGES_PER_PROMPT" \
+    --start-index "$START_INDEX" \
+    --device "$DEVICE"
+fi
 "$PYTHON_BIN" -m evaluation.t2i_compbench \
   --benchmark "$CATEGORY" \
   --t2i-compbench-root "$T2I_ROOT" \
