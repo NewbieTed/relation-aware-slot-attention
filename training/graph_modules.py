@@ -151,12 +151,13 @@ def build_slot_conditioning(
 ) -> GraphConditioningOutput:
     batch_size = len(scene_graph_batch.node_labels)
     max_nodes = scene_graph_batch.position_targets.shape[1]
+    graph_dtype = graph_encoder.node_proj.weight.dtype
     pooled = torch.zeros(
         batch_size,
         max_nodes,
         text_encoder.config.hidden_size,
         device=device,
-        dtype=text_encoder.dtype,
+        dtype=graph_dtype,
     )
 
     for batch_index, labels in enumerate(scene_graph_batch.node_labels):
@@ -176,7 +177,7 @@ def build_slot_conditioning(
         pooled[batch_index, : len(labels)] = mean_pool_hidden(
             encoded,
             text_inputs.attention_mask.to(device),
-        )
+        ).to(dtype=graph_dtype)
 
     return graph_encoder(pooled, scene_graph_batch)
 
@@ -213,4 +214,3 @@ def relation_loss(
     if not losses:
         return slot_positions.new_tensor(0.0)
     return torch.stack(losses).mean()
-
