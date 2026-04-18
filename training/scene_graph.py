@@ -16,6 +16,17 @@ RELATION_VOCAB = {
     "hidden_by": 7,
 }
 
+INVERSE_RELATION = {
+    "left_of": "right_of",
+    "right_of": "left_of",
+    "above": "below",
+    "below": "above",
+    "on": "below",
+    "in_front_of": "behind",
+    "behind": "in_front_of",
+    "hidden_by": "in_front_of",
+}
+
 
 @dataclass(frozen=True)
 class BatchedSceneGraphs:
@@ -42,6 +53,22 @@ def _relation_triplets(scene_graph: dict[str, Any]) -> list[tuple[int, int, str]
     return triplets
 
 
+def _message_passing_triplets(
+    triplets: list[tuple[int, int, str]],
+) -> list[tuple[int, int, str]]:
+    expanded: list[tuple[int, int, str]] = []
+    seen: set[tuple[int, int, str]] = set()
+    for src, dst, relation in triplets:
+        for triplet in (
+            (src, dst, relation),
+            (dst, src, INVERSE_RELATION[relation]),
+        ):
+            if triplet not in seen:
+                expanded.append(triplet)
+                seen.add(triplet)
+    return expanded
+
+
 def build_batched_scene_graphs(
     scene_graphs: list[dict[str, Any]],
     slot_targets: torch.Tensor,
@@ -61,12 +88,19 @@ def build_batched_scene_graphs(
 
         triplets = _relation_triplets(scene_graph)
         relation_triplets.append(triplets)
-        if triplets:
+        message_passing_triplets = _message_passing_triplets(triplets)
+        if message_passing_triplets:
             edge_index.append(
-                torch.tensor([[src, dst] for src, dst, _ in triplets], dtype=torch.long)
+                torch.tensor(
+                    [[src, dst] for src, dst, _ in message_passing_triplets],
+                    dtype=torch.long,
+                )
             )
             edge_types.append(
-                torch.tensor([RELATION_VOCAB[relation] for _, _, relation in triplets], dtype=torch.long)
+                torch.tensor(
+                    [RELATION_VOCAB[relation] for _, _, relation in message_passing_triplets],
+                    dtype=torch.long,
+                )
             )
         else:
             edge_index.append(torch.zeros((0, 2), dtype=torch.long))
@@ -81,4 +115,3 @@ def build_batched_scene_graphs(
         position_mask=slot_mask,
         relation_triplets=relation_triplets,
     )
-
