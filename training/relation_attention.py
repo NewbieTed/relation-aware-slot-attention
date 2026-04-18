@@ -47,6 +47,9 @@ class RelationAwareAttnProcessor2_0(nn.Module):
         encoder_hidden_states: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         temb: torch.Tensor | None = None,
+        slot_positions: torch.Tensor | None = None,
+        slot_mask: torch.Tensor | None = None,
+        text_token_count: int | None = None,
         *args,
         **kwargs,
     ) -> torch.Tensor:
@@ -89,10 +92,6 @@ class RelationAwareAttnProcessor2_0(nn.Module):
             query = attn.norm_q(query)
         if attn.norm_k is not None:
             key = attn.norm_k(key)
-
-        slot_positions = kwargs.get("slot_positions")
-        slot_mask = kwargs.get("slot_mask")
-        text_token_count = kwargs.get("text_token_count")
 
         if self.enable_bias and slot_positions is not None and slot_mask is not None and text_token_count is not None:
             slot_count = slot_positions.shape[1]
@@ -152,4 +151,3 @@ def install_relation_aware_processors(unet: Any) -> list[nn.Module]:
             trainable_processors.append(processor)
     unet.set_attn_processor(processors)
     return trainable_processors
-
