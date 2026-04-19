@@ -23,6 +23,7 @@ GRAPH_ENCODER_PATH="${GRAPH_ENCODER_PATH:-}"
 RELATION_ATTENTION_PATH="${RELATION_ATTENTION_PATH:-}"
 NUM_IMAGES_PER_PROMPT="${NUM_IMAGES_PER_PROMPT:-1}"
 START_INDEX="${START_INDEX:-0}"
+SEED="${SEED:-42}"
 PYTHON_BIN="${PYTHON_BIN:-$DEFAULT_PYTHON}"
 EVAL_PYTHON_BIN="${EVAL_PYTHON_BIN:-$DEFAULT_T2I_EVAL_PYTHON}"
 T2I_ROOT="${T2I_ROOT:-$ROOT_DIR/external/T2I-CompBench}"
@@ -46,6 +47,7 @@ if [[ -n "$RELATION_AWARE_DIR" || -n "$GRAPH_ENCODER_PATH" || -n "$RELATION_ATTE
     --prompts-file "$PROMPTS_FILE"
     --output-dir "$OUTPUT_DIR"
     --num-images-per-prompt "$NUM_IMAGES_PER_PROMPT"
+    --seed "$SEED"
     --start-index "$START_INDEX"
     --device "$DEVICE"
   )
@@ -68,6 +70,7 @@ elif [[ -n "$LORA_PATH" ]]; then
     --prompts-file "$PROMPTS_FILE" \
     --output-dir "$OUTPUT_DIR" \
     --num-images-per-prompt "$NUM_IMAGES_PER_PROMPT" \
+    --seed "$SEED" \
     --start-index "$START_INDEX" \
     --device "$DEVICE" \
     --lora-path "$LORA_PATH"
@@ -77,6 +80,7 @@ else
     --prompts-file "$PROMPTS_FILE" \
     --output-dir "$OUTPUT_DIR" \
     --num-images-per-prompt "$NUM_IMAGES_PER_PROMPT" \
+    --seed "$SEED" \
     --start-index "$START_INDEX" \
     --device "$DEVICE"
 fi

@@ -182,6 +182,26 @@ Example full run for numeracy:
 CATEGORY=numeracy NUM_IMAGES_PER_PROMPT=5 DEVICE=cuda ./scripts/benchmark/run_t2i_category_full.sh
 ```
 
+Repeated seeded runs with summary aggregation:
+
+```bash
+CATEGORY=spatial RUNS=5 NUM_IMAGES_PER_PROMPT=5 DEVICE=cuda ./scripts/benchmark/run_t2i_category_repeats.sh
+```
+
+This writes one subdirectory per run, such as `run_000`, `run_001`, ..., and then
+creates `t2i_compbench_<category>_repeats_summary.json` under the repeat root with:
+
+- per-run scores
+- mean score
+- standard deviation
+- min/max score
+
+You can re-run the aggregation step without regenerating images:
+
+```bash
+CATEGORY=spatial OUTPUT_ROOT=/path/to/repeat_root ./scripts/benchmark/summarize_t2i_repeats.sh
+```
+
 The original T2I-CompBench "overall" score is an aggregate over:
 
 - `color`
