@@ -202,6 +202,16 @@ You can re-run the aggregation step without regenerating images:
 CATEGORY=spatial OUTPUT_ROOT=/path/to/repeat_root ./scripts/benchmark/summarize_t2i_repeats.sh
 ```
 
+To limit storage usage during repeated runs, you can prune samples immediately after
+each successful evaluation while keeping a small random audit set:
+
+```bash
+CATEGORY=spatial RUNS=5 NUM_IMAGES_PER_PROMPT=5 PRUNE_SAMPLES_KEEP=10 DEVICE=cuda ./scripts/benchmark/run_t2i_category_repeats.sh
+```
+
+This cleanup happens per run, right after the score JSON is written. The run metadata
+and benchmark results remain intact; only the `samples/` directory is reduced.
+
 The original T2I-CompBench "overall" score is an aggregate over:
 
 - `color`

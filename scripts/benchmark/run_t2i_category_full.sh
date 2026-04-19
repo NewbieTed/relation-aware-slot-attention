@@ -24,6 +24,8 @@ RELATION_ATTENTION_PATH="${RELATION_ATTENTION_PATH:-}"
 NUM_IMAGES_PER_PROMPT="${NUM_IMAGES_PER_PROMPT:-1}"
 START_INDEX="${START_INDEX:-0}"
 SEED="${SEED:-42}"
+PRUNE_SAMPLES_KEEP="${PRUNE_SAMPLES_KEEP:-}"
+PRUNE_SAMPLES_SEED="${PRUNE_SAMPLES_SEED:-$SEED}"
 PYTHON_BIN="${PYTHON_BIN:-$DEFAULT_PYTHON}"
 EVAL_PYTHON_BIN="${EVAL_PYTHON_BIN:-$DEFAULT_T2I_EVAL_PYTHON}"
 T2I_ROOT="${T2I_ROOT:-$ROOT_DIR/external/T2I-CompBench}"
@@ -84,9 +86,17 @@ else
     --start-index "$START_INDEX" \
     --device "$DEVICE"
 fi
-"$PYTHON_BIN" -m evaluation.t2i_compbench \
-  --benchmark "$CATEGORY" \
-  --t2i-compbench-root "$T2I_ROOT" \
-  --generated-dir "$OUTPUT_DIR" \
-  --prompt-file "$PROMPTS_FILE" \
+
+EVAL_CMD=(
+  "$PYTHON_BIN" -m evaluation.t2i_compbench
+  --benchmark "$CATEGORY"
+  --t2i-compbench-root "$T2I_ROOT"
+  --generated-dir "$OUTPUT_DIR"
+  --prompt-file "$PROMPTS_FILE"
   --python-bin "$EVAL_PYTHON_BIN"
+)
+if [[ -n "$PRUNE_SAMPLES_KEEP" ]]; then
+  EVAL_CMD+=(--prune-samples-keep "$PRUNE_SAMPLES_KEEP")
+  EVAL_CMD+=(--prune-samples-seed "$PRUNE_SAMPLES_SEED")
+fi
+"${EVAL_CMD[@]}"

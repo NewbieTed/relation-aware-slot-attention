@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import shutil
 import subprocess
 import sys
@@ -73,6 +74,29 @@ def count_sample_images(samples_dir: Path) -> int:
     )
 
 
+def list_sample_images(samples_dir: Path) -> list[Path]:
+    valid_suffixes = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+    return sorted(
+        path
+        for path in samples_dir.iterdir()
+        if path.is_file() and path.suffix.lower() in valid_suffixes
+    )
+
+
+def prune_sample_images(samples_dir: Path, *, keep_count: int, seed: int) -> tuple[int, int]:
+    sample_paths = list_sample_images(samples_dir)
+    original_count = len(sample_paths)
+    if original_count <= keep_count:
+        return original_count, original_count
+
+    rng = random.Random(seed)
+    keep_paths = set(rng.sample(sample_paths, k=keep_count))
+    for sample_path in sample_paths:
+        if sample_path not in keep_paths:
+            sample_path.unlink()
+    return original_count, keep_count
+
+
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run T2I-CompBench evaluation on an existing generated samples directory."
@@ -111,6 +135,21 @@ def make_parser() -> argparse.ArgumentParser:
         "--copy-instead-of-symlink",
         action="store_true",
         help="Copy generated samples into examples/samples instead of symlinking.",
+    )
+    parser.add_argument(
+        "--prune-samples-keep",
+        type=int,
+        default=None,
+        help=(
+            "After a successful evaluation, keep only this many randomly selected sample "
+            "images in generated-dir/samples. Metadata and score files are preserved."
+        ),
+    )
+    parser.add_argument(
+        "--prune-samples-seed",
+        type=int,
+        default=42,
+        help="Random seed used when pruning samples after a successful evaluation.",
     )
     return parser
 
@@ -339,6 +378,20 @@ def main() -> int:
             f"See {spec['error_file']} for the captured stdout/stderr."
         )
 
+    pruned_sample_count = None
+    if args.prune_samples_keep is not None:
+        original_count, kept_count = prune_sample_images(
+            generated_samples_dir,
+            keep_count=args.prune_samples_keep,
+            seed=args.prune_samples_seed,
+        )
+        sample_count = kept_count
+        pruned_sample_count = {
+            "original_count": original_count,
+            "kept_count": kept_count,
+            "seed": args.prune_samples_seed,
+        }
+
     score_summary = {
         "benchmark": args.benchmark,
         "generated_dir": str(generated_dir),
@@ -348,6 +401,7 @@ def main() -> int:
         "label_output": spec["label_output"],
         "label_results_count": len(label_results) if label_results is not None else None,
         "average_score": average_score,
+        "pruned_samples": pruned_sample_count,
         "stdout": stdout,
         "stderr": stderr,
     }
