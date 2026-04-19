@@ -18,6 +18,9 @@ CATEGORY="${CATEGORY:-spatial}"
 MODEL="${MODEL:-sd15}"
 DEVICE="${DEVICE:-auto}"
 LORA_PATH="${LORA_PATH:-}"
+RELATION_AWARE_DIR="${RELATION_AWARE_DIR:-}"
+GRAPH_ENCODER_PATH="${GRAPH_ENCODER_PATH:-}"
+RELATION_ATTENTION_PATH="${RELATION_ATTENTION_PATH:-}"
 NUM_IMAGES_PER_PROMPT="${NUM_IMAGES_PER_PROMPT:-1}"
 START_INDEX="${START_INDEX:-0}"
 PYTHON_BIN="${PYTHON_BIN:-$DEFAULT_PYTHON}"
@@ -36,7 +39,30 @@ esac
 
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/eval/${MODEL}_t2i_compbench_${CATEGORY}_val}"
 
-if [[ -n "$LORA_PATH" ]]; then
+if [[ -n "$RELATION_AWARE_DIR" || -n "$GRAPH_ENCODER_PATH" || -n "$RELATION_ATTENTION_PATH" ]]; then
+  CMD=(
+    "$PYTHON_BIN" -m evaluation.generate
+    --model "$MODEL"
+    --prompts-file "$PROMPTS_FILE"
+    --output-dir "$OUTPUT_DIR"
+    --num-images-per-prompt "$NUM_IMAGES_PER_PROMPT"
+    --start-index "$START_INDEX"
+    --device "$DEVICE"
+  )
+  if [[ -n "$RELATION_AWARE_DIR" ]]; then
+    CMD+=(--relation-aware-dir "$RELATION_AWARE_DIR")
+  fi
+  if [[ -n "$GRAPH_ENCODER_PATH" ]]; then
+    CMD+=(--graph-encoder-path "$GRAPH_ENCODER_PATH")
+  fi
+  if [[ -n "$RELATION_ATTENTION_PATH" ]]; then
+    CMD+=(--relation-attention-path "$RELATION_ATTENTION_PATH")
+  fi
+  if [[ -n "$LORA_PATH" ]]; then
+    CMD+=(--lora-path "$LORA_PATH")
+  fi
+  "${CMD[@]}"
+elif [[ -n "$LORA_PATH" ]]; then
   "$PYTHON_BIN" -m evaluation.generate \
     --model "$MODEL" \
     --prompts-file "$PROMPTS_FILE" \

@@ -33,6 +33,17 @@ def _query_grid(
     return grid.expand(batch_size, -1, -1)
 
 
+def _repeat_batch(tensor: torch.Tensor, target_batch: int) -> torch.Tensor:
+    if tensor.shape[0] == target_batch:
+        return tensor
+    if target_batch % tensor.shape[0] != 0:
+        raise ValueError(
+            f"Cannot broadcast batch of size {tensor.shape[0]} to {target_batch} in relation-aware attention"
+        )
+    repeat_factor = target_batch // tensor.shape[0]
+    return tensor.repeat_interleave(repeat_factor, dim=0)
+
+
 class RelationAwareAttnProcessor2_0(nn.Module):
     def __init__(self, enable_bias: bool) -> None:
         super().__init__()
@@ -94,6 +105,8 @@ class RelationAwareAttnProcessor2_0(nn.Module):
             key = attn.norm_k(key)
 
         if self.enable_bias and slot_positions is not None and slot_mask is not None and text_token_count is not None:
+            slot_positions = _repeat_batch(slot_positions.to(query.device), batch_size)
+            slot_mask = _repeat_batch(slot_mask.to(query.device), batch_size)
             slot_count = slot_positions.shape[1]
             grid = _query_grid(
                 batch_size=batch_size,
@@ -140,14 +153,11 @@ class RelationAwareAttnProcessor2_0(nn.Module):
         return hidden_states
 
 
-def install_relation_aware_processors(unet: Any) -> list[nn.Module]:
+def install_relation_aware_processors(unet: Any) -> dict[str, nn.Module]:
     processors: dict[str, nn.Module] = {}
-    trainable_processors: list[nn.Module] = []
     for name in unet.attn_processors.keys():
         enable_bias = not name.endswith("attn1.processor")
         processor = RelationAwareAttnProcessor2_0(enable_bias=enable_bias)
         processors[name] = processor
-        if enable_bias:
-            trainable_processors.append(processor)
     unet.set_attn_processor(processors)
-    return trainable_processors
+    return processors

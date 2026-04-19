@@ -76,6 +76,9 @@ def _save_state(
         "model_id": args.model_id,
         "learning_rate": args.learning_rate,
         "graph_learning_rate": args.graph_learning_rate,
+        "lora_rank": args.lora_rank,
+        "slot_dim": args.slot_dim,
+        "gnn_layers": args.gnn_layers,
         "aux_loss_weight": args.aux_loss_weight,
         "relation_loss_weight": args.relation_loss_weight,
         "validation_prompts": validation_prompts,
@@ -90,6 +93,7 @@ def _save_modules(
     graph_encoder: GraphSlotEncoder,
     unet: Any,
     optimizer: torch.optim.Optimizer,
+    relation_attention_processors: dict[str, torch.nn.Module],
 ) -> Path:
     checkpoint_dir = output_dir / f"checkpoint-{step:06d}"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -98,6 +102,10 @@ def _save_modules(
     else:
         unet.save_attn_procs(checkpoint_dir / "lora")
     torch.save(graph_encoder.state_dict(), checkpoint_dir / "graph_encoder.pt")
+    torch.save(
+        {name: module.state_dict() for name, module in relation_attention_processors.items()},
+        checkpoint_dir / "relation_attention.pt",
+    )
     torch.save(optimizer.state_dict(), checkpoint_dir / "optimizer.pt")
     return checkpoint_dir
 
@@ -192,7 +200,7 @@ def main() -> int:
     text_encoder.to(device)
     unet.to(device)
 
-    relation_attention_modules = install_relation_aware_processors(unet)
+    relation_attention_processors = install_relation_aware_processors(unet)
     lora_optimizer = _attach_lora_adapters(unet, args.lora_rank, args.learning_rate)
 
     graph_encoder = GraphSlotEncoder(
@@ -202,7 +210,9 @@ def main() -> int:
     ).to(device)
 
     relation_params = []
-    for module in relation_attention_modules:
+    for name, module in relation_attention_processors.items():
+        if name.endswith("attn1.processor"):
+            continue
         relation_params.extend(list(module.parameters()))
 
     optimizer = torch.optim.AdamW(
@@ -348,6 +358,7 @@ def main() -> int:
                         graph_encoder=graph_encoder,
                         unet=unet,
                         optimizer=optimizer,
+                        relation_attention_processors=relation_attention_processors,
                     )
                     _save_state(
                         args.output_dir,
@@ -370,6 +381,10 @@ def main() -> int:
     else:
         unet.save_attn_procs(final_dir / "lora")
     torch.save(graph_encoder.state_dict(), final_dir / "graph_encoder.pt")
+    torch.save(
+        {name: module.state_dict() for name, module in relation_attention_processors.items()},
+        final_dir / "relation_attention.pt",
+    )
     _save_state(args.output_dir, step=global_step, args=args, validation_prompts=validation_prompts)
     print(f"Relation-aware training finished at step {global_step}.")
     return 0
