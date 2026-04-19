@@ -64,6 +64,15 @@ BENCHMARK_SPECS = {
 }
 
 
+def count_sample_images(samples_dir: Path) -> int:
+    valid_suffixes = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+    return sum(
+        1
+        for path in samples_dir.iterdir()
+        if path.is_file() and path.suffix.lower() in valid_suffixes
+    )
+
+
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run T2I-CompBench evaluation on an existing generated samples directory."
@@ -139,6 +148,12 @@ def prepare_examples_dir(
         shutil.copytree(generated_samples_dir, target_samples_dir)
     else:
         os.symlink(generated_samples_dir.resolve(), target_samples_dir)
+
+
+def clear_label_output(t2i_root: Path, relative_path: str) -> None:
+    label_file = t2i_root / relative_path
+    if label_file.exists():
+        label_file.unlink()
 
 
 def read_label_output(t2i_root: Path, relative_path: str) -> list[dict] | None:
@@ -286,6 +301,12 @@ def main() -> int:
     generated_samples_dir = generated_dir / "samples"
     if not generated_samples_dir.exists():
         raise FileNotFoundError(f"Missing generated samples dir: {generated_samples_dir}")
+    sample_count = count_sample_images(generated_samples_dir)
+    if sample_count == 0:
+        raise RuntimeError(
+            "Refusing to run T2I-CompBench evaluation because the generated samples directory is empty: "
+            f"{generated_samples_dir}"
+        )
 
     prepare_examples_dir(
         t2i_root,
@@ -294,8 +315,9 @@ def main() -> int:
         copy_instead_of_symlink=args.copy_instead_of_symlink,
     )
 
-    completions = run_benchmark(t2i_root, args.benchmark, args.python_bin)
     spec = BENCHMARK_SPECS[args.benchmark]
+    clear_label_output(t2i_root, spec["label_output"])
+    completions = run_benchmark(t2i_root, args.benchmark, args.python_bin)
     label_results = read_label_output(t2i_root, spec["label_output"])
     average_score = compute_average_score(label_results)
     returncode, stdout, stderr = summarize_completed_processes(completions)
@@ -306,6 +328,7 @@ def main() -> int:
             "generated_dir": str(generated_dir),
             "prompt_file": str(prompt_file),
             "t2i_compbench_root": str(t2i_root),
+            "sample_count": sample_count,
             "returncode": returncode,
             "stdout": stdout,
             "stderr": stderr,
@@ -321,6 +344,7 @@ def main() -> int:
         "generated_dir": str(generated_dir),
         "prompt_file": str(prompt_file),
         "t2i_compbench_root": str(t2i_root),
+        "sample_count": sample_count,
         "label_output": spec["label_output"],
         "label_results_count": len(label_results) if label_results is not None else None,
         "average_score": average_score,
