@@ -120,6 +120,8 @@ def build_pipeline(
     device: str,
     lora_path: Path | None = None,
     relation_attention_path: Path | None = None,
+    *,
+    disable_progress_bar: bool = True,
 ):
     from diffusers import StableDiffusionPipeline
 
@@ -172,7 +174,7 @@ def build_pipeline(
             print(f"Evaluation: LoRA weight file = {weight_name}")
         print(f"Evaluation: active UNet adapters = {active_adapters}")
 
-    pipeline.set_progress_bar_config(disable=False)
+    pipeline.set_progress_bar_config(disable=disable_progress_bar)
     return pipeline
 
 
@@ -348,6 +350,11 @@ def make_parser() -> argparse.ArgumentParser:
         default=0,
         help="Starting global sample index used in output filenames (default: 0).",
     )
+    parser.add_argument(
+        "--show-progress-bar",
+        action="store_true",
+        help="Show the per-image diffusion progress bar during generation.",
+    )
     return parser
 
 
@@ -378,6 +385,7 @@ def main() -> int:
         device,
         lora_path=lora_path,
         relation_attention_path=relation_attention_path if relation_aware_enabled else None,
+        disable_progress_bar=not args.show_progress_bar,
     )
     graph_encoder: GraphSlotEncoder | None = None
     if relation_aware_enabled:
