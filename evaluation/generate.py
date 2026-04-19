@@ -246,6 +246,14 @@ def build_relation_aware_conditioning(
     )
 
 
+def describe_prompt_parse_support(prompt: str) -> tuple[bool, str | None]:
+    try:
+        parse_prompt_to_scene_graph(prompt)
+        return True, None
+    except ValueError as exc:
+        return False, str(exc)
+
+
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Generate images for a plain-text prompt file using vanilla or relation-aware Stable Diffusion."
@@ -402,51 +410,62 @@ def main() -> int:
 
     global_image_index = args.start_index
     do_classifier_free_guidance = args.guidance_scale > 1.0
+    fallback_count = 0
     for prompt_index, prompt in enumerate(prompts):
         cross_attention_kwargs: dict[str, Any] | None = None
         prompt_embeds = None
         negative_prompt_embeds = None
+        use_relation_aware_for_prompt = relation_aware_enabled
 
         if relation_aware_enabled:
-            assert graph_encoder is not None
-            prompt_embeds, negative_prompt_embeds = pipeline.encode_prompt(
-                prompt=prompt,
-                device=device,
-                num_images_per_prompt=args.num_images_per_prompt,
-                do_classifier_free_guidance=do_classifier_free_guidance,
-                negative_prompt=None,
-            )
-            text_token_count = int(prompt_embeds.shape[1])
-            slot_embeddings, slot_positions, _ = build_relation_aware_conditioning(
-                prompt=prompt,
-                pipeline=pipeline,
-                graph_encoder=graph_encoder,
-                device=device,
-            )
-            slot_embeddings = slot_embeddings.to(prompt_embeds.dtype).repeat_interleave(
-                args.num_images_per_prompt,
-                dim=0,
-            )
-            prompt_embeds = torch.cat([prompt_embeds, slot_embeddings], dim=1)
-            if negative_prompt_embeds is not None:
-                zero_slots = torch.zeros_like(slot_embeddings)
-                negative_prompt_embeds = torch.cat([negative_prompt_embeds, zero_slots], dim=1)
-            cross_attention_kwargs = {
-                "slot_positions": slot_positions.repeat_interleave(args.num_images_per_prompt, dim=0),
-                "slot_mask": torch.ones(
+            supported, reason = describe_prompt_parse_support(prompt)
+            if not supported:
+                fallback_count += 1
+                use_relation_aware_for_prompt = False
+                print(
+                    "Evaluation warning: falling back to vanilla prompt conditioning for "
+                    f"unsupported relation prompt: {prompt!r}. Reason: {reason}"
+                )
+            else:
+                assert graph_encoder is not None
+                prompt_embeds, negative_prompt_embeds = pipeline.encode_prompt(
+                    prompt=prompt,
+                    device=device,
+                    num_images_per_prompt=args.num_images_per_prompt,
+                    do_classifier_free_guidance=do_classifier_free_guidance,
+                    negative_prompt=None,
+                )
+                text_token_count = int(prompt_embeds.shape[1])
+                slot_embeddings, slot_positions, _ = build_relation_aware_conditioning(
+                    prompt=prompt,
+                    pipeline=pipeline,
+                    graph_encoder=graph_encoder,
+                    device=device,
+                )
+                slot_embeddings = slot_embeddings.to(prompt_embeds.dtype).repeat_interleave(
                     args.num_images_per_prompt,
-                    slot_positions.shape[1],
-                    dtype=torch.bool,
-                    device=slot_positions.device,
-                ),
-                "text_token_count": text_token_count,
-            }
+                    dim=0,
+                )
+                prompt_embeds = torch.cat([prompt_embeds, slot_embeddings], dim=1)
+                if negative_prompt_embeds is not None:
+                    zero_slots = torch.zeros_like(slot_embeddings)
+                    negative_prompt_embeds = torch.cat([negative_prompt_embeds, zero_slots], dim=1)
+                cross_attention_kwargs = {
+                    "slot_positions": slot_positions.repeat_interleave(args.num_images_per_prompt, dim=0),
+                    "slot_mask": torch.ones(
+                        args.num_images_per_prompt,
+                        slot_positions.shape[1],
+                        dtype=torch.bool,
+                        device=slot_positions.device,
+                    ),
+                    "text_token_count": text_token_count,
+                }
 
         for image_index in range(args.num_images_per_prompt):
             generator = torch.Generator(device="cpu").manual_seed(
                 args.seed + prompt_index * args.num_images_per_prompt + image_index
             )
-            if relation_aware_enabled:
+            if use_relation_aware_for_prompt:
                 image_prompt_embeds = prompt_embeds[image_index : image_index + 1]
                 image_negative_prompt_embeds = (
                     negative_prompt_embeds[image_index : image_index + 1]
@@ -482,6 +501,12 @@ def main() -> int:
             image.save(samples_dir / prompt_to_filename(prompt, global_image_index))
             global_image_index += 1
 
+    if relation_aware_enabled and fallback_count > 0:
+        print(
+            "Evaluation summary: "
+            f"{fallback_count} prompt(s) used vanilla fallback because the rule-based parser "
+            "does not yet support their relation wording."
+        )
     print(f"Generated {len(prompts)} prompts into {samples_dir}")
     return 0
 

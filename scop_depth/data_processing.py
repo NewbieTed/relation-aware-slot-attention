@@ -50,6 +50,52 @@ def _append_depth_relations(
             relative_positions.append([object_name1, "hidden by", object_name2])
 
 
+def _horizontal_gap_ratio(
+    bbox1: tuple[float, float, float, float],
+    bbox2: tuple[float, float, float, float],
+    *,
+    image_width: int,
+) -> float:
+    x1, _, w1, _ = bbox1
+    x2, _, w2, _ = bbox2
+
+    bbox1_left = x1
+    bbox1_right = x1 + w1
+    bbox2_left = x2
+    bbox2_right = x2 + w2
+
+    if bbox1_left <= bbox2_left:
+        left_object_right = bbox1_right
+        right_object_left = bbox2_left
+    else:
+        left_object_right = bbox2_right
+        right_object_left = bbox1_left
+
+    gap_pixels = max(0.0, right_object_left - left_object_right)
+    return gap_pixels / max(float(image_width), 1.0)
+
+
+def _should_append_next_to(
+    relative_positions: list[list[str]],
+    bbox1: tuple[float, float, float, float],
+    bbox2: tuple[float, float, float, float],
+    *,
+    image_width: int,
+    next_to_gap_ratio: float | None,
+) -> bool:
+    if next_to_gap_ratio is None:
+        return False
+
+    has_horizontal_relation = any(
+        rel in {"to the left of", "to the right of"} or "to the left of" in rel or "to the right of" in rel
+        for _, rel, _ in relative_positions
+    )
+    if not has_horizontal_relation:
+        return False
+
+    return _horizontal_gap_ratio(bbox1, bbox2, image_width=image_width) <= next_to_gap_ratio
+
+
 @dataclass(frozen=True, kw_only=True)
 class SCOPParameters:
     min_bbox_area: int = 32 * 32
@@ -67,6 +113,10 @@ class SCOPParameters:
 
     # \tau_s
     size_balance: float = 0.5
+
+    # Horizontal gap threshold (fraction of image width) for symmetric "next to"
+    # labels derived from left/right SCOP pairs.
+    next_to_gap_ratio: float | None = None
 
     @staticmethod
     def best_geneval() -> SCOPParameters:
@@ -279,6 +329,16 @@ def generate_object_relationships(
                     relative_positions.append([object_name1, r12, object_name2])
                 for r21 in rel21:
                     relative_positions.append([object_name2, r21, object_name1])
+
+                if _should_append_next_to(
+                    relative_positions,
+                    a1.bbox,
+                    a2.bbox,
+                    image_width=image_info["width"],
+                    next_to_gap_ratio=params.next_to_gap_ratio,
+                ):
+                    relative_positions.append([object_name1, "next to", object_name2])
+                    relative_positions.append([object_name2, "next to", object_name1])
 
                 if (
                     depth_summary is not None

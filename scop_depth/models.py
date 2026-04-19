@@ -6,7 +6,7 @@ from typing import Any, Literal
 
 BoundingBox = tuple[float, float, float, float]
 RelativePositionDescriptor = Literal[
-    "to the left of", "to the right of", "above", "below"
+    "to the left of", "to the right of", "above", "below", "next to"
 ]
 ARB = tuple[str, str, str]  # (Object1, RelativePosition, Object2)
 

@@ -199,6 +199,13 @@ def relation_loss(
                 sample_losses.append(F.relu(0.1 - delta[0]))
             elif relation == "right_of":
                 sample_losses.append(F.relu(0.1 + delta[0]))
+            elif relation == "next_to":
+                horizontal_proximity = F.relu(delta[0].abs() - 0.35)
+                vertical_alignment = F.relu(delta[1].abs() - 0.2)
+                depth_alignment = F.relu(delta[2].abs() - 0.2)
+                sample_losses.append(
+                    (horizontal_proximity + vertical_alignment + depth_alignment) / 3.0
+                )
             elif relation == "above":
                 sample_losses.append(F.relu(0.1 - delta[1]))
             elif relation == "below":

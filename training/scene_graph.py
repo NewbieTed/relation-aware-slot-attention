@@ -8,17 +8,19 @@ import torch
 RELATION_VOCAB = {
     "left_of": 0,
     "right_of": 1,
-    "above": 2,
-    "below": 3,
-    "on": 4,
-    "in_front_of": 5,
-    "behind": 6,
-    "hidden_by": 7,
+    "next_to": 2,
+    "above": 3,
+    "below": 4,
+    "on": 5,
+    "in_front_of": 6,
+    "behind": 7,
+    "hidden_by": 8,
 }
 
 INVERSE_RELATION = {
     "left_of": "right_of",
     "right_of": "left_of",
+    "next_to": "next_to",
     "above": "below",
     "below": "above",
     "on": "below",

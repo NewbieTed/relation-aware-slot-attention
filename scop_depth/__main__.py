@@ -100,6 +100,16 @@ def main() -> int:
     )
 
     parser.add_argument(
+        "--next-to-gap-ratio",
+        type=float,
+        default=None,
+        help=(
+            "Optional horizontal gap threshold as a fraction of image width for "
+            "adding symmetric 'next to' labels to left/right SCOP pairs"
+        ),
+    )
+
+    parser.add_argument(
         "--min-bbox-area",
         type=int,
         default=32 * 32,
@@ -230,6 +240,7 @@ def main() -> int:
             minimal_overlap=args.minimal_overlap,
             size_balance=args.size_balance,
             min_bbox_area=args.min_bbox_area,
+            next_to_gap_ratio=args.next_to_gap_ratio,
         )
         depth_config = None
         if args.use_depth_anything:
