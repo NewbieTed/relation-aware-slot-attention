@@ -141,23 +141,22 @@ class GraphSlotEncoder(nn.Module):
         )
 
 
-def build_slot_conditioning(
+def pooled_label_embeddings(
     *,
     tokenizer: Any,
     text_encoder: Any,
     scene_graph_batch: BatchedSceneGraphs,
-    graph_encoder: GraphSlotEncoder,
     device: str,
-) -> GraphConditioningOutput:
+    dtype: torch.dtype,
+) -> torch.Tensor:
     batch_size = len(scene_graph_batch.node_labels)
     max_nodes = scene_graph_batch.position_targets.shape[1]
-    graph_dtype = graph_encoder.node_proj.weight.dtype
     pooled = torch.zeros(
         batch_size,
         max_nodes,
         text_encoder.config.hidden_size,
         device=device,
-        dtype=graph_dtype,
+        dtype=dtype,
     )
 
     for batch_index, labels in enumerate(scene_graph_batch.node_labels):
@@ -177,9 +176,41 @@ def build_slot_conditioning(
         pooled[batch_index, : len(labels)] = mean_pool_hidden(
             encoded,
             text_inputs.attention_mask.to(device),
-        ).to(dtype=graph_dtype)
+        ).to(dtype=dtype)
+    return pooled
 
+
+def build_slot_conditioning(
+    *,
+    tokenizer: Any,
+    text_encoder: Any,
+    scene_graph_batch: BatchedSceneGraphs,
+    graph_encoder: GraphSlotEncoder,
+    device: str,
+) -> GraphConditioningOutput:
+    graph_dtype = graph_encoder.node_proj.weight.dtype
+    pooled = pooled_label_embeddings(
+        tokenizer=tokenizer,
+        text_encoder=text_encoder,
+        scene_graph_batch=scene_graph_batch,
+        device=device,
+        dtype=graph_dtype,
+    )
     return graph_encoder(pooled, scene_graph_batch)
+
+
+def embedding_alignment_loss(
+    slot_embeddings: torch.Tensor,
+    pooled_label_embeddings: torch.Tensor,
+    slot_mask: torch.Tensor,
+) -> torch.Tensor:
+    if not slot_mask.any():
+        return slot_embeddings.new_tensor(0.0)
+    return 1.0 - F.cosine_similarity(
+        slot_embeddings[slot_mask],
+        pooled_label_embeddings[slot_mask].to(slot_embeddings.dtype),
+        dim=-1,
+    ).mean()
 
 
 def relation_loss(

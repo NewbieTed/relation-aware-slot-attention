@@ -11,12 +11,16 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from .dataset import SCOPDepthTextToImageDataset, collate_training_items
+from .dataset import build_dataset_splits, collate_training_items
 from .graph_modules import (
     GraphSlotEncoder,
     build_slot_conditioning,
+    embedding_alignment_loss,
+    pooled_label_embeddings,
     relation_loss,
 )
+from .graph_targets import bbox_centers_after_crop
+from .metrics import MetricsLogger, write_split_manifest
 from .relation_attention import install_relation_aware_processors
 from .scene_graph import build_batched_scene_graphs
 from .train_sd15_lora import (
@@ -29,39 +33,6 @@ from .train_sd15_lora import (
     resolve_torch_device,
     set_seed,
 )
-
-
-def _bbox_centers_after_crop(
-    metadata_rows: list[dict[str, Any]],
-    image_sizes: list[tuple[int, int]],
-    max_nodes: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    targets = torch.zeros(len(metadata_rows), max_nodes, 3, device=device)
-    mask = torch.zeros(len(metadata_rows), max_nodes, dtype=torch.bool, device=device)
-    for batch_index, (row, (width, height)) in enumerate(zip(metadata_rows, image_sizes)):
-        crop_size = min(width, height)
-        left = (width - crop_size) / 2.0
-        top = (height - crop_size) / 2.0
-        depth = row.get("depth")
-        depth_values = [
-            float(depth["bbox1"]["median"]) if depth else 0.0,
-            float(depth["bbox2"]["median"]) if depth else 0.0,
-        ]
-        for node_index, annot in enumerate(row["annots"][:max_nodes]):
-            x, y, w, h = annot["bbox"]
-            cx = ((x + w / 2.0) - left) / crop_size
-            cy = ((y + h / 2.0) - top) / crop_size
-            cx = max(0.0, min(1.0, cx))
-            cy = max(0.0, min(1.0, cy))
-            cz = depth_values[node_index] if node_index < len(depth_values) else 0.0
-            targets[batch_index, node_index] = torch.tensor(
-                [cx * 2 - 1, cy * 2 - 1, cz * 2 - 1],
-                device=device,
-            )
-            mask[batch_index, node_index] = True
-    return targets, mask
-
 
 def _save_state(
     output_dir: Path,
@@ -81,6 +52,8 @@ def _save_state(
         "gnn_layers": args.gnn_layers,
         "aux_loss_weight": args.aux_loss_weight,
         "relation_loss_weight": args.relation_loss_weight,
+        "embedding_loss_weight": args.embedding_loss_weight,
+        "init_graph_encoder": str(args.init_graph_encoder) if args.init_graph_encoder else None,
         "validation_prompts": validation_prompts,
     }
     (output_dir / "training_state.json").write_text(json.dumps(payload, indent=2))
@@ -137,10 +110,190 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--validation-prompts-file", type=Path, default=None)
     parser.add_argument("--num-validation-images", type=int, default=4)
     parser.add_argument("--validation-every", type=int, default=0)
+    parser.add_argument("--eval-every", type=int, default=250)
+    parser.add_argument("--eval-fraction", type=float, default=0.1)
+    parser.add_argument("--test-fraction", type=float, default=0.1)
     parser.add_argument("--aux-loss-weight", type=float, default=0.1)
     parser.add_argument("--relation-loss-weight", type=float, default=0.1)
+    parser.add_argument("--embedding-loss-weight", type=float, default=0.05)
+    parser.add_argument("--init-graph-encoder", type=Path, default=None)
     parser.add_argument("--disable-tqdm", action="store_true")
     return parser
+
+
+def _build_relation_aware_losses(
+    *,
+    batch: dict[str, Any],
+    tokenizer: Any,
+    text_encoder: Any,
+    graph_encoder: GraphSlotEncoder,
+    unet: Any,
+    vae: Any,
+    noise_scheduler: Any,
+    device: str,
+    weight_dtype: torch.dtype,
+    mixed_precision: str,
+    aux_loss_weight: float,
+    relation_loss_weight: float,
+    embedding_loss_weight: float,
+) -> dict[str, torch.Tensor]:
+    pixel_values = batch["pixel_values"].to(device=device, dtype=weight_dtype)
+    with torch.no_grad():
+        latents = vae.encode(pixel_values).latent_dist.sample()
+        latents = latents * vae.config.scaling_factor
+
+    noise = torch.randn_like(latents)
+    bsz = latents.shape[0]
+    timesteps = torch.randint(
+        0,
+        noise_scheduler.config.num_train_timesteps,
+        (bsz,),
+        device=latents.device,
+        dtype=torch.int64,
+    )
+    noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+    text_inputs = tokenizer(
+        batch["prompts"],
+        padding="max_length",
+        truncation=True,
+        max_length=tokenizer.model_max_length,
+        return_tensors="pt",
+    )
+    with torch.no_grad():
+        text_hidden_states = text_encoder(
+            text_inputs.input_ids.to(device),
+            attention_mask=text_inputs.attention_mask.to(device),
+        )[0]
+
+    max_nodes = max(len(graph["nodes"]) for graph in batch["scene_graphs"])
+    slot_targets, slot_mask = bbox_centers_after_crop(
+        batch["metadata"],
+        batch["image_sizes"],
+        max_nodes=max_nodes,
+        device=torch.device(device),
+    )
+    scene_graph_batch = build_batched_scene_graphs(
+        batch["scene_graphs"],
+        slot_targets=slot_targets,
+        slot_mask=slot_mask,
+    )
+    conditioning = build_slot_conditioning(
+        tokenizer=tokenizer,
+        text_encoder=text_encoder,
+        scene_graph_batch=scene_graph_batch,
+        graph_encoder=graph_encoder,
+        device=device,
+    )
+    pooled_embeddings = pooled_label_embeddings(
+        tokenizer=tokenizer,
+        text_encoder=text_encoder,
+        scene_graph_batch=scene_graph_batch,
+        device=device,
+        dtype=conditioning.slot_embeddings.dtype,
+    )
+    encoder_hidden_states = torch.cat(
+        [text_hidden_states, conditioning.slot_embeddings.to(text_hidden_states.dtype)],
+        dim=1,
+    )
+
+    with build_autocast_context(device, mixed_precision):
+        model_pred = unet(
+            noisy_latents,
+            timesteps,
+            encoder_hidden_states=encoder_hidden_states,
+            cross_attention_kwargs={
+                "slot_positions": conditioning.slot_positions,
+                "slot_mask": conditioning.slot_mask,
+                "text_token_count": text_hidden_states.shape[1],
+            },
+        ).sample
+        target = (
+            noise
+            if noise_scheduler.config.prediction_type == "epsilon"
+            else noise_scheduler.get_velocity(latents, noise, timesteps)
+        )
+        denoise_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+        geometry_loss = F.smooth_l1_loss(
+            conditioning.slot_positions[conditioning.slot_mask],
+            slot_targets[conditioning.slot_mask],
+        )
+        semantic_loss = embedding_alignment_loss(
+            conditioning.slot_embeddings,
+            pooled_embeddings,
+            conditioning.slot_mask,
+        )
+        edge_loss = relation_loss(
+            conditioning.relation_logits,
+            conditioning.slot_positions,
+            scene_graph_batch,
+        )
+        loss = (
+            denoise_loss
+            + aux_loss_weight * geometry_loss
+            + embedding_loss_weight * semantic_loss
+            + relation_loss_weight * edge_loss
+        )
+    return {
+        "loss": loss,
+        "denoise_loss": denoise_loss,
+        "geometry_loss": geometry_loss,
+        "relation_loss": edge_loss,
+        "embedding_loss": semantic_loss,
+    }
+
+
+@torch.no_grad()
+def _evaluate_relation_aware(
+    *,
+    dataloader: DataLoader,
+    tokenizer: Any,
+    text_encoder: Any,
+    graph_encoder: GraphSlotEncoder,
+    unet: Any,
+    vae: Any,
+    noise_scheduler: Any,
+    device: str,
+    weight_dtype: torch.dtype,
+    mixed_precision: str,
+    aux_loss_weight: float,
+    relation_loss_weight: float,
+    embedding_loss_weight: float,
+) -> dict[str, float]:
+    graph_encoder.eval()
+    unet.eval()
+    totals = {
+        "loss": 0.0,
+        "denoise_loss": 0.0,
+        "geometry_loss": 0.0,
+        "relation_loss": 0.0,
+        "embedding_loss": 0.0,
+    }
+    batch_count = 0
+    for batch in dataloader:
+        metrics = _build_relation_aware_losses(
+            batch=batch,
+            tokenizer=tokenizer,
+            text_encoder=text_encoder,
+            graph_encoder=graph_encoder,
+            unet=unet,
+            vae=vae,
+            noise_scheduler=noise_scheduler,
+            device=device,
+            weight_dtype=weight_dtype,
+            mixed_precision=mixed_precision,
+            aux_loss_weight=aux_loss_weight,
+            relation_loss_weight=relation_loss_weight,
+            embedding_loss_weight=embedding_loss_weight,
+        )
+        for key in totals:
+            totals[key] += float(metrics[key].item())
+        batch_count += 1
+    graph_encoder.train()
+    unet.train()
+    if batch_count == 0:
+        return {key: 0.0 for key in totals}
+    return {key: value / batch_count for key, value in totals.items()}
 
 
 def main() -> int:
@@ -156,18 +309,42 @@ def main() -> int:
         enabled=device == "cuda" and args.mixed_precision == "fp16",
     )
 
-    dataset = SCOPDepthTextToImageDataset(
+    datasets = build_dataset_splits(
         args.dataset_dir,
         image_size=args.image_size,
         prompt_prefix=args.prompt_prefix,
         limit_rows=args.limit_rows,
-        shuffle_rows=True,
         seed=args.seed,
+        eval_fraction=args.eval_fraction,
+        test_fraction=args.test_fraction,
     )
-    dataloader = DataLoader(
-        dataset,
+    write_split_manifest(
+        args.output_dir,
+        train_rows=datasets["train"].rows,
+        eval_rows=datasets["eval"].rows,
+        test_rows=datasets["test"].rows,
+        seed=args.seed,
+        eval_fraction=args.eval_fraction,
+        test_fraction=args.test_fraction,
+    )
+    train_dataloader = DataLoader(
+        datasets["train"],
         batch_size=args.batch_size,
         shuffle=True,
+        num_workers=args.num_workers,
+        collate_fn=collate_training_items,
+    )
+    eval_dataloader = DataLoader(
+        datasets["eval"],
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        collate_fn=collate_training_items,
+    )
+    test_dataloader = DataLoader(
+        datasets["test"],
+        batch_size=args.batch_size,
+        shuffle=False,
         num_workers=args.num_workers,
         collate_fn=collate_training_items,
     )
@@ -208,6 +385,10 @@ def main() -> int:
         slot_dim=args.slot_dim,
         num_layers=args.gnn_layers,
     ).to(device)
+    if args.init_graph_encoder is not None:
+        state_dict = torch.load(args.init_graph_encoder, map_location=device)
+        graph_encoder.load_state_dict(state_dict)
+        print(f"Loaded graph encoder warm start from {args.init_graph_encoder}")
 
     relation_params = []
     for name, module in relation_attention_processors.items():
@@ -223,8 +404,20 @@ def main() -> int:
         ]
     )
 
-    validation_prompts = _load_validation_prompts(dataset, args.validation_prompts_file)
+    validation_prompts = _load_validation_prompts(datasets["train"], args.validation_prompts_file)
     _save_state(args.output_dir, step=0, args=args, validation_prompts=validation_prompts)
+    metrics_logger = MetricsLogger(
+        args.output_dir,
+        fieldnames=[
+            "step",
+            "split",
+            "loss",
+            "denoise_loss",
+            "geometry_loss",
+            "relation_loss",
+            "embedding_loss",
+        ],
+    )
 
     progress_bar = tqdm(
         total=args.max_train_steps,
@@ -235,93 +428,33 @@ def main() -> int:
     global_step = 0
     micro_step = 0
     optimizer.zero_grad(set_to_none=True)
+    running = {
+        "loss": 0.0,
+        "denoise_loss": 0.0,
+        "geometry_loss": 0.0,
+        "relation_loss": 0.0,
+        "embedding_loss": 0.0,
+    }
+    running_updates = 0
 
     while global_step < args.max_train_steps:
-        for batch in dataloader:
-            pixel_values = batch["pixel_values"].to(device=device, dtype=weight_dtype)
-            with torch.no_grad():
-                latents = vae.encode(pixel_values).latent_dist.sample()
-                latents = latents * vae.config.scaling_factor
-
-            noise = torch.randn_like(latents)
-            bsz = latents.shape[0]
-            timesteps = torch.randint(
-                0,
-                noise_scheduler.config.num_train_timesteps,
-                (bsz,),
-                device=latents.device,
-                dtype=torch.int64,
-            )
-            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
-            text_inputs = tokenizer(
-                batch["prompts"],
-                padding="max_length",
-                truncation=True,
-                max_length=tokenizer.model_max_length,
-                return_tensors="pt",
-            )
-            with torch.no_grad():
-                text_hidden_states = text_encoder(
-                    text_inputs.input_ids.to(device),
-                    attention_mask=text_inputs.attention_mask.to(device),
-                )[0]
-
-            max_nodes = max(len(graph["nodes"]) for graph in batch["scene_graphs"])
-            slot_targets, slot_mask = _bbox_centers_after_crop(
-                batch["metadata"],
-                batch["image_sizes"],
-                max_nodes=max_nodes,
-                device=torch.device(device),
-            )
-            scene_graph_batch = build_batched_scene_graphs(
-                batch["scene_graphs"],
-                slot_targets=slot_targets,
-                slot_mask=slot_mask,
-            )
-            conditioning = build_slot_conditioning(
+        for batch in train_dataloader:
+            metrics = _build_relation_aware_losses(
+                batch=batch,
                 tokenizer=tokenizer,
                 text_encoder=text_encoder,
-                scene_graph_batch=scene_graph_batch,
                 graph_encoder=graph_encoder,
+                unet=unet,
+                vae=vae,
+                noise_scheduler=noise_scheduler,
                 device=device,
+                weight_dtype=weight_dtype,
+                mixed_precision=args.mixed_precision,
+                aux_loss_weight=args.aux_loss_weight,
+                relation_loss_weight=args.relation_loss_weight,
+                embedding_loss_weight=args.embedding_loss_weight,
             )
-            encoder_hidden_states = torch.cat(
-                [text_hidden_states, conditioning.slot_embeddings.to(text_hidden_states.dtype)],
-                dim=1,
-            )
-
-            with build_autocast_context(device, args.mixed_precision):
-                model_pred = unet(
-                    noisy_latents,
-                    timesteps,
-                    encoder_hidden_states=encoder_hidden_states,
-                    cross_attention_kwargs={
-                        "slot_positions": conditioning.slot_positions,
-                        "slot_mask": conditioning.slot_mask,
-                        "text_token_count": text_hidden_states.shape[1],
-                    },
-                ).sample
-                target = (
-                    noise
-                    if noise_scheduler.config.prediction_type == "epsilon"
-                    else noise_scheduler.get_velocity(latents, noise, timesteps)
-                )
-                denoise_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-                geometry_loss = F.smooth_l1_loss(
-                    conditioning.slot_positions[conditioning.slot_mask],
-                    slot_targets[conditioning.slot_mask],
-                )
-                edge_loss = relation_loss(
-                    conditioning.relation_logits,
-                    conditioning.slot_positions,
-                    scene_graph_batch,
-                )
-                loss = (
-                    denoise_loss
-                    + args.aux_loss_weight * geometry_loss
-                    + args.relation_loss_weight * edge_loss
-                )
+            loss = metrics["loss"]
 
             if not torch.isfinite(loss):
                 raise FloatingPointError(
@@ -333,6 +466,9 @@ def main() -> int:
             else:
                 scaled_loss.backward()
             micro_step += 1
+            for key in running:
+                running[key] += float(metrics[key].item())
+            running_updates += 1
 
             if micro_step % args.gradient_accumulation_steps == 0:
                 if scaler.is_enabled():
@@ -345,10 +481,53 @@ def main() -> int:
                 progress_bar.update(1)
 
                 if global_step % args.log_every == 0:
+                    train_log = {
+                        "step": global_step,
+                        "split": "train",
+                        "loss": running["loss"] / running_updates,
+                        "denoise_loss": running["denoise_loss"] / running_updates,
+                        "geometry_loss": running["geometry_loss"] / running_updates,
+                        "relation_loss": running["relation_loss"] / running_updates,
+                        "embedding_loss": running["embedding_loss"] / running_updates,
+                    }
+                    metrics_logger.log(train_log)
                     progress_bar.set_postfix(
-                        denoise=f"{denoise_loss.item():.4f}",
-                        geom=f"{geometry_loss.item():.4f}",
-                        rel=f"{edge_loss.item():.4f}",
+                        denoise=f"{train_log['denoise_loss']:.4f}",
+                        geom=f"{train_log['geometry_loss']:.4f}",
+                        sem=f"{train_log['embedding_loss']:.4f}",
+                        rel=f"{train_log['relation_loss']:.4f}",
+                    )
+                    running = {key: 0.0 for key in running}
+                    running_updates = 0
+
+                if len(datasets["eval"]) > 0 and args.eval_every > 0 and global_step % args.eval_every == 0:
+                    eval_log = {
+                        "step": global_step,
+                        "split": "eval",
+                        **_evaluate_relation_aware(
+                            dataloader=eval_dataloader,
+                            tokenizer=tokenizer,
+                            text_encoder=text_encoder,
+                            graph_encoder=graph_encoder,
+                            unet=unet,
+                            vae=vae,
+                            noise_scheduler=noise_scheduler,
+                            device=device,
+                            weight_dtype=weight_dtype,
+                            mixed_precision=args.mixed_precision,
+                            aux_loss_weight=args.aux_loss_weight,
+                            relation_loss_weight=args.relation_loss_weight,
+                            embedding_loss_weight=args.embedding_loss_weight,
+                        ),
+                    }
+                    metrics_logger.log(eval_log)
+                    print(
+                        "Eval at step "
+                        f"{global_step}: loss={eval_log['loss']:.4f}, "
+                        f"denoise={eval_log['denoise_loss']:.4f}, "
+                        f"geom={eval_log['geometry_loss']:.4f}, "
+                        f"rel={eval_log['relation_loss']:.4f}, "
+                        f"sem={eval_log['embedding_loss']:.4f}"
                     )
 
                 if global_step % args.save_every == 0:
@@ -385,6 +564,35 @@ def main() -> int:
         {name: module.state_dict() for name, module in relation_attention_processors.items()},
         final_dir / "relation_attention.pt",
     )
+    if len(datasets["test"]) > 0:
+        test_log = {
+            "step": global_step,
+            "split": "test",
+            **_evaluate_relation_aware(
+                dataloader=test_dataloader,
+                tokenizer=tokenizer,
+                text_encoder=text_encoder,
+                graph_encoder=graph_encoder,
+                unet=unet,
+                vae=vae,
+                noise_scheduler=noise_scheduler,
+                device=device,
+                weight_dtype=weight_dtype,
+                mixed_precision=args.mixed_precision,
+                aux_loss_weight=args.aux_loss_weight,
+                relation_loss_weight=args.relation_loss_weight,
+                embedding_loss_weight=args.embedding_loss_weight,
+            ),
+        }
+        metrics_logger.log(test_log)
+        print(
+            "Final test loss: "
+            f"{test_log['loss']:.4f} "
+            f"(denoise={test_log['denoise_loss']:.4f}, "
+            f"geom={test_log['geometry_loss']:.4f}, "
+            f"rel={test_log['relation_loss']:.4f}, "
+            f"sem={test_log['embedding_loss']:.4f})"
+        )
     _save_state(args.output_dir, step=global_step, args=args, validation_prompts=validation_prompts)
     print(f"Relation-aware training finished at step {global_step}.")
     return 0
