@@ -58,6 +58,32 @@ class RelationAwareAttnProcessor2_0(nn.Module):
         self.latest_slot_attention_map = None
         self.latest_query_hw = None
 
+    def __call__(
+        self,
+        attn: Any,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        temb: torch.Tensor | None = None,
+        slot_positions: torch.Tensor | None = None,
+        slot_mask: torch.Tensor | None = None,
+        text_token_count: int | None = None,
+        *args,
+        **kwargs,
+    ) -> torch.Tensor:
+        return super().__call__(
+            attn,
+            hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            attention_mask=attention_mask,
+            temb=temb,
+            slot_positions=slot_positions,
+            slot_mask=slot_mask,
+            text_token_count=text_token_count,
+            *args,
+            **kwargs,
+        )
+
     def forward(
         self,
         attn: Any,
