@@ -41,6 +41,7 @@ RELATION_LOSS_WEIGHT="${RELATION_LOSS_WEIGHT:-0.1}"
 EMBEDDING_LOSS_WEIGHT="${EMBEDDING_LOSS_WEIGHT:-0.05}"
 INIT_GRAPH_ENCODER="${INIT_GRAPH_ENCODER:-}"
 FREEZE_GRAPH_ENCODER="${FREEZE_GRAPH_ENCODER:-0}"
+FULL_UNET_FINETUNE="${FULL_UNET_FINETUNE:-0}"
 
 CMD=(
   "$PYTHON_BIN" -m training.train_relation_aware_sd15
@@ -86,6 +87,10 @@ fi
 
 if [[ "$FREEZE_GRAPH_ENCODER" == "1" ]]; then
   CMD+=(--freeze-graph-encoder)
+fi
+
+if [[ "$FULL_UNET_FINETUNE" == "1" ]]; then
+  CMD+=(--full-unet-finetune)
 fi
 
 "${CMD[@]}" "$@"

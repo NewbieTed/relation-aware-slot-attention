@@ -55,6 +55,7 @@ def _save_state(
         "embedding_loss_weight": args.embedding_loss_weight,
         "init_graph_encoder": str(args.init_graph_encoder) if args.init_graph_encoder else None,
         "freeze_graph_encoder": args.freeze_graph_encoder,
+        "full_unet_finetune": args.full_unet_finetune,
         "validation_prompts": validation_prompts,
     }
     (output_dir / "training_state.json").write_text(json.dumps(payload, indent=2))
@@ -68,13 +69,17 @@ def _save_modules(
     unet: Any,
     optimizer: torch.optim.Optimizer,
     relation_attention_processors: dict[str, torch.nn.Module],
+    full_unet_finetune: bool,
 ) -> Path:
     checkpoint_dir = output_dir / f"checkpoint-{step:06d}"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    if hasattr(unet, "save_lora_adapter"):
-        unet.save_lora_adapter(checkpoint_dir / "lora", adapter_name="default")
+    if full_unet_finetune:
+        unet.save_pretrained(checkpoint_dir / "unet")
     else:
-        unet.save_attn_procs(checkpoint_dir / "lora")
+        if hasattr(unet, "save_lora_adapter"):
+            unet.save_lora_adapter(checkpoint_dir / "lora", adapter_name="default")
+        else:
+            unet.save_attn_procs(checkpoint_dir / "lora")
     torch.save(graph_encoder.state_dict(), checkpoint_dir / "graph_encoder.pt")
     torch.save(
         {name: module.state_dict() for name, module in relation_attention_processors.items()},
@@ -119,6 +124,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--embedding-loss-weight", type=float, default=0.05)
     parser.add_argument("--init-graph-encoder", type=Path, default=None)
     parser.add_argument("--freeze-graph-encoder", action="store_true")
+    parser.add_argument("--full-unet-finetune", action="store_true")
     parser.add_argument("--disable-tqdm", action="store_true")
     return parser
 
@@ -380,7 +386,12 @@ def main() -> int:
     unet.to(device)
 
     relation_attention_processors = install_relation_aware_processors(unet)
-    lora_optimizer = _attach_lora_adapters(unet, args.lora_rank, args.learning_rate)
+    lora_optimizer = None
+    if args.full_unet_finetune:
+        unet.requires_grad_(True)
+        print("Full U-Net finetuning is enabled for this run.")
+    else:
+        lora_optimizer = _attach_lora_adapters(unet, args.lora_rank, args.learning_rate)
 
     graph_encoder = GraphSlotEncoder(
         text_hidden_dim=text_encoder.config.hidden_size,
@@ -401,13 +412,21 @@ def main() -> int:
             continue
         relation_params.extend(list(module.parameters()))
 
-    optimizer_param_groups = [
-        {"params": lora_optimizer.param_groups[0]["params"], "lr": args.learning_rate},
-        {"params": relation_params, "lr": args.graph_learning_rate},
-    ]
+    optimizer_param_groups = []
+    if args.full_unet_finetune:
+        optimizer_param_groups.append(
+            {"params": [p for p in unet.parameters() if p.requires_grad], "lr": args.learning_rate}
+        )
+    else:
+        optimizer_param_groups.extend(
+            [
+                {"params": lora_optimizer.param_groups[0]["params"], "lr": args.learning_rate},
+                {"params": relation_params, "lr": args.graph_learning_rate},
+            ]
+        )
     if not args.freeze_graph_encoder:
         optimizer_param_groups.insert(
-            1,
+            1 if optimizer_param_groups else 0,
             {"params": graph_encoder.parameters(), "lr": args.graph_learning_rate},
         )
 
@@ -547,6 +566,7 @@ def main() -> int:
                         unet=unet,
                         optimizer=optimizer,
                         relation_attention_processors=relation_attention_processors,
+                        full_unet_finetune=args.full_unet_finetune,
                     )
                     _save_state(
                         args.output_dir,
@@ -564,10 +584,13 @@ def main() -> int:
 
     final_dir = args.output_dir / "final"
     final_dir.mkdir(parents=True, exist_ok=True)
-    if hasattr(unet, "save_lora_adapter"):
-        unet.save_lora_adapter(final_dir / "lora", adapter_name="default")
+    if args.full_unet_finetune:
+        unet.save_pretrained(final_dir / "unet")
     else:
-        unet.save_attn_procs(final_dir / "lora")
+        if hasattr(unet, "save_lora_adapter"):
+            unet.save_lora_adapter(final_dir / "lora", adapter_name="default")
+        else:
+            unet.save_attn_procs(final_dir / "lora")
     torch.save(graph_encoder.state_dict(), final_dir / "graph_encoder.pt")
     torch.save(
         {name: module.state_dict() for name, module in relation_attention_processors.items()},
