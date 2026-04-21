@@ -102,28 +102,31 @@ def load_graph_encoder(
 def resolve_relation_aware_artifacts(
     *,
     relation_aware_dir: Path | None,
+    unet_path: Path | None,
     lora_path: Path | None,
     graph_encoder_path: Path | None,
     relation_attention_path: Path | None,
-) -> tuple[Path | None, Path | None, Path | None]:
+) -> tuple[Path | None, Path | None, Path | None, Path | None]:
     if relation_aware_dir is None:
-        return lora_path, graph_encoder_path, relation_attention_path
+        return unet_path, lora_path, graph_encoder_path, relation_attention_path
 
+    resolved_unet = unet_path or (relation_aware_dir / "unet")
     resolved_lora = lora_path or (relation_aware_dir / "lora")
     resolved_graph = graph_encoder_path or (relation_aware_dir / "graph_encoder.pt")
     resolved_attention = relation_attention_path or (relation_aware_dir / "relation_attention.pt")
-    return resolved_lora, resolved_graph, resolved_attention
+    return resolved_unet, resolved_lora, resolved_graph, resolved_attention
 
 
 def build_pipeline(
     model_name: str,
     device: str,
+    unet_path: Path | None = None,
     lora_path: Path | None = None,
     relation_attention_path: Path | None = None,
     *,
     disable_progress_bar: bool = True,
 ):
-    from diffusers import StableDiffusionPipeline
+    from diffusers import StableDiffusionPipeline, UNet2DConditionModel
 
     os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
     torch_dtype = torch.float16 if device in {"cuda", "mps"} else torch.float32
@@ -133,6 +136,14 @@ def build_pipeline(
         torch_dtype=torch_dtype,
         safety_checker=None,
     )
+    if unet_path is not None:
+        if not unet_path.exists():
+            raise FileNotFoundError(f"Missing UNet checkpoint path: {unet_path}")
+        pipeline.unet = UNet2DConditionModel.from_pretrained(
+            unet_path,
+            torch_dtype=torch_dtype,
+        )
+        print(f"Evaluation: loaded full UNet weights from {unet_path}")
     pipeline = pipeline.to(device)
 
     relation_attention_processors: dict[str, torch.nn.Module] | None = None
@@ -183,6 +194,7 @@ def save_run_config(
     *,
     model_key: str,
     model_name: str,
+    unet_path: Path | None,
     lora_path: Path | None,
     graph_encoder_path: Path | None,
     relation_attention_path: Path | None,
@@ -198,6 +210,7 @@ def save_run_config(
     payload = {
         "model_key": model_key,
         "model_name": model_name,
+        "unet_path": str(unet_path) if unet_path is not None else None,
         "lora_path": str(lora_path) if lora_path is not None else None,
         "graph_encoder_path": str(graph_encoder_path) if graph_encoder_path is not None else None,
         "relation_attention_path": str(relation_attention_path) if relation_attention_path is not None else None,
@@ -285,6 +298,12 @@ def make_parser() -> argparse.ArgumentParser:
         help="Torch device for generation (default: auto).",
     )
     parser.add_argument(
+        "--unet-path",
+        type=Path,
+        default=None,
+        help="Optional full UNet checkpoint directory to load on top of the base model.",
+    )
+    parser.add_argument(
         "--lora-path",
         type=Path,
         default=None,
@@ -368,8 +387,9 @@ def main() -> int:
     if not prompts:
         raise ValueError("No prompts found in prompt file")
 
-    lora_path, graph_encoder_path, relation_attention_path = resolve_relation_aware_artifacts(
+    unet_path, lora_path, graph_encoder_path, relation_attention_path = resolve_relation_aware_artifacts(
         relation_aware_dir=args.relation_aware_dir,
+        unet_path=args.unet_path,
         lora_path=args.lora_path,
         graph_encoder_path=args.graph_encoder_path,
         relation_attention_path=args.relation_attention_path,
@@ -383,6 +403,7 @@ def main() -> int:
     pipeline = build_pipeline(
         model_name,
         device,
+        unet_path=unet_path,
         lora_path=lora_path,
         relation_attention_path=relation_attention_path if relation_aware_enabled else None,
         disable_progress_bar=not args.show_progress_bar,
@@ -403,6 +424,7 @@ def main() -> int:
         args.output_dir,
         model_key=args.model,
         model_name=model_name,
+        unet_path=unet_path,
         lora_path=lora_path,
         graph_encoder_path=graph_encoder_path,
         relation_attention_path=relation_attention_path if relation_aware_enabled else None,

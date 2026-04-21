@@ -18,6 +18,7 @@ CATEGORY="${CATEGORY:-spatial}"
 MODEL="${MODEL:-sd15}"
 DEVICE="${DEVICE:-auto}"
 LORA_PATH="${LORA_PATH:-}"
+UNET_PATH="${UNET_PATH:-}"
 RELATION_AWARE_DIR="${RELATION_AWARE_DIR:-}"
 GRAPH_ENCODER_PATH="${GRAPH_ENCODER_PATH:-}"
 RELATION_ATTENTION_PATH="${RELATION_ATTENTION_PATH:-}"
@@ -42,7 +43,7 @@ esac
 
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/eval/${MODEL}_t2i_compbench_${CATEGORY}_val}"
 
-if [[ -n "$RELATION_AWARE_DIR" || -n "$GRAPH_ENCODER_PATH" || -n "$RELATION_ATTENTION_PATH" ]]; then
+if [[ -n "$RELATION_AWARE_DIR" || -n "$UNET_PATH" || -n "$GRAPH_ENCODER_PATH" || -n "$RELATION_ATTENTION_PATH" ]]; then
   CMD=(
     "$PYTHON_BIN" -m evaluation.generate
     --model "$MODEL"
@@ -55,6 +56,9 @@ if [[ -n "$RELATION_AWARE_DIR" || -n "$GRAPH_ENCODER_PATH" || -n "$RELATION_ATTE
   )
   if [[ -n "$RELATION_AWARE_DIR" ]]; then
     CMD+=(--relation-aware-dir "$RELATION_AWARE_DIR")
+  fi
+  if [[ -n "$UNET_PATH" ]]; then
+    CMD+=(--unet-path "$UNET_PATH")
   fi
   if [[ -n "$GRAPH_ENCODER_PATH" ]]; then
     CMD+=(--graph-encoder-path "$GRAPH_ENCODER_PATH")
