@@ -58,7 +58,7 @@ class RelationAwareAttnProcessor2_0(nn.Module):
         self.latest_slot_attention_map = None
         self.latest_query_hw = None
 
-    def __call__(
+    def forward(
         self,
         attn: Any,
         hidden_states: torch.Tensor,
