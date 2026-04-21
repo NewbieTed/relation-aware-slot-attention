@@ -202,5 +202,5 @@ def install_relation_aware_processors(unet: Any) -> dict[str, nn.Module]:
             capture_attention=capture_attention,
         )
         processors[name] = processor
-    unet.set_attn_processor(processors)
+    unet.set_attn_processor(processors.copy())
     return processors
