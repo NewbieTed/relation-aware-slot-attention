@@ -389,6 +389,9 @@ def main() -> int:
     lora_optimizer = None
     if args.full_unet_finetune:
         unet.requires_grad_(True)
+        for parameter in unet.parameters():
+            if parameter.requires_grad and parameter.dtype != torch.float32:
+                parameter.data = parameter.data.to(torch.float32)
         print("Full U-Net finetuning is enabled for this run.")
     else:
         lora_optimizer = _attach_lora_adapters(unet, args.lora_rank, args.learning_rate)
