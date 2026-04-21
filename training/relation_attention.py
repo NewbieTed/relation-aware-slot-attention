@@ -53,10 +53,35 @@ class RelationAwareAttnProcessor2_0(nn.Module):
         self.slot_logit_scale = nn.Parameter(torch.tensor(1.0))
         self.latest_slot_attention_map: torch.Tensor | None = None
         self.latest_query_hw: tuple[int, int] | None = None
+        self.reset_usage_stats()
 
     def clear_attention_cache(self) -> None:
         self.latest_slot_attention_map = None
         self.latest_query_hw = None
+
+    def reset_usage_stats(self) -> None:
+        self._usage_text_mass_sum = 0.0
+        self._usage_slot_mass_sum = 0.0
+        self._usage_query_count = 0
+        self._usage_call_count = 0
+        self._usage_slot_count_sum = 0
+
+    def usage_stats(self) -> dict[str, float | int]:
+        if self._usage_query_count == 0:
+            return {
+                "text_mass_mean": 0.0,
+                "slot_mass_mean": 0.0,
+                "query_count": 0,
+                "call_count": 0,
+                "slot_count_mean": 0.0,
+            }
+        return {
+            "text_mass_mean": self._usage_text_mass_sum / self._usage_query_count,
+            "slot_mass_mean": self._usage_slot_mass_sum / self._usage_query_count,
+            "query_count": self._usage_query_count,
+            "call_count": self._usage_call_count,
+            "slot_count_mean": self._usage_slot_count_sum / self._usage_call_count,
+        }
 
     def __call__(
         self,
@@ -172,6 +197,13 @@ class RelationAwareAttnProcessor2_0(nn.Module):
         if self.capture_attention and text_token_count is not None:
             self.latest_slot_attention_map = attention_probs.mean(dim=1)[..., text_token_count:]
             self.latest_query_hw = (height, width)
+            text_mass = attention_probs[..., :text_token_count].sum(dim=-1).mean().item()
+            slot_mass = attention_probs[..., text_token_count:].sum(dim=-1).mean().item()
+            self._usage_text_mass_sum += text_mass * batch_size * query_length
+            self._usage_slot_mass_sum += slot_mass * batch_size * query_length
+            self._usage_query_count += batch_size * query_length
+            self._usage_call_count += 1
+            self._usage_slot_count_sum += attention_probs.shape[-1] - text_token_count
         else:
             self.clear_attention_cache()
 
