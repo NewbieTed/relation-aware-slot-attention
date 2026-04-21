@@ -111,7 +111,11 @@ def resolve_relation_aware_artifacts(
         return unet_path, lora_path, graph_encoder_path, relation_attention_path
 
     resolved_unet = unet_path or (relation_aware_dir / "unet")
-    resolved_lora = lora_path or (relation_aware_dir / "lora")
+    if lora_path is not None:
+        resolved_lora = lora_path
+    else:
+        candidate_lora = relation_aware_dir / "lora"
+        resolved_lora = candidate_lora if candidate_lora.exists() else None
     resolved_graph = graph_encoder_path or (relation_aware_dir / "graph_encoder.pt")
     resolved_attention = relation_attention_path or (relation_aware_dir / "relation_attention.pt")
     return resolved_unet, resolved_lora, resolved_graph, resolved_attention
