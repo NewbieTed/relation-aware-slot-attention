@@ -45,11 +45,18 @@ def _repeat_batch(tensor: torch.Tensor, target_batch: int) -> torch.Tensor:
 
 
 class RelationAwareAttnProcessor2_0(nn.Module):
-    def __init__(self, enable_bias: bool) -> None:
+    def __init__(self, enable_bias: bool, capture_attention: bool = False) -> None:
         super().__init__()
         self.enable_bias = enable_bias
+        self.capture_attention = capture_attention
         self.spatial_scale = nn.Parameter(torch.tensor(2.0))
         self.slot_logit_scale = nn.Parameter(torch.tensor(1.0))
+        self.latest_slot_attention_map: torch.Tensor | None = None
+        self.latest_query_hw: tuple[int, int] | None = None
+
+    def clear_attention_cache(self) -> None:
+        self.latest_slot_attention_map = None
+        self.latest_query_hw = None
 
     def __call__(
         self,
@@ -69,6 +76,8 @@ class RelationAwareAttnProcessor2_0(nn.Module):
             hidden_states = attn.spatial_norm(hidden_states, temb)
 
         input_ndim = hidden_states.ndim
+        height = 1
+        width = hidden_states.shape[1]
         if input_ndim == 4:
             batch_size, channel, height, width = hidden_states.shape
             hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
@@ -129,14 +138,18 @@ class RelationAwareAttnProcessor2_0(nn.Module):
             full_bias = full_bias.unsqueeze(1).expand(-1, attn.heads, -1, -1)
             attention_mask = full_bias if attention_mask is None else attention_mask + full_bias
 
-        hidden_states = F.scaled_dot_product_attention(
-            query,
-            key,
-            value,
-            attn_mask=attention_mask,
-            dropout_p=0.0,
-            is_causal=False,
-        )
+        attention_scores = torch.matmul(query, key.transpose(-1, -2)) / math.sqrt(head_dim)
+        if attention_mask is not None:
+            attention_scores = attention_scores + attention_mask
+        attention_probs = torch.softmax(attention_scores.float(), dim=-1).to(query.dtype)
+
+        if self.capture_attention and text_token_count is not None and slot_positions is not None:
+            self.latest_slot_attention_map = attention_probs.mean(dim=1)[..., text_token_count:]
+            self.latest_query_hw = (height, width)
+        else:
+            self.clear_attention_cache()
+
+        hidden_states = torch.matmul(attention_probs, value)
 
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
         hidden_states = hidden_states.to(query.dtype)
@@ -157,7 +170,13 @@ def install_relation_aware_processors(unet: Any) -> dict[str, nn.Module]:
     processors: dict[str, nn.Module] = {}
     for name in unet.attn_processors.keys():
         enable_bias = not name.endswith("attn1.processor")
-        processor = RelationAwareAttnProcessor2_0(enable_bias=enable_bias)
+        capture_attention = enable_bias and (
+            name.startswith("mid_block") or name.startswith("up_blocks")
+        )
+        processor = RelationAwareAttnProcessor2_0(
+            enable_bias=enable_bias,
+            capture_attention=capture_attention,
+        )
         processors[name] = processor
     unet.set_attn_processor(processors)
     return processors

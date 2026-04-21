@@ -11,6 +11,11 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
+from .attention_supervision import (
+    clear_attention_cache,
+    collect_slot_attention_maps,
+    compute_slot_attention_losses,
+)
 from .dataset import build_dataset_splits, collate_training_items
 from .graph_modules import (
     GraphSlotEncoder,
@@ -53,6 +58,8 @@ def _save_state(
         "aux_loss_weight": args.aux_loss_weight,
         "relation_loss_weight": args.relation_loss_weight,
         "embedding_loss_weight": args.embedding_loss_weight,
+        "attention_token_loss_weight": args.attention_token_loss_weight,
+        "attention_pixel_loss_weight": args.attention_pixel_loss_weight,
         "init_graph_encoder": str(args.init_graph_encoder) if args.init_graph_encoder else None,
         "freeze_graph_encoder": args.freeze_graph_encoder,
         "full_unet_finetune": args.full_unet_finetune,
@@ -122,6 +129,8 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--aux-loss-weight", type=float, default=0.1)
     parser.add_argument("--relation-loss-weight", type=float, default=0.1)
     parser.add_argument("--embedding-loss-weight", type=float, default=0.05)
+    parser.add_argument("--attention-token-loss-weight", type=float, default=0.0)
+    parser.add_argument("--attention-pixel-loss-weight", type=float, default=0.0)
     parser.add_argument("--init-graph-encoder", type=Path, default=None)
     parser.add_argument("--freeze-graph-encoder", action="store_true")
     parser.add_argument("--full-unet-finetune", action="store_true")
@@ -144,7 +153,11 @@ def _build_relation_aware_losses(
     aux_loss_weight: float,
     relation_loss_weight: float,
     embedding_loss_weight: float,
+    attention_token_loss_weight: float,
+    attention_pixel_loss_weight: float,
+    relation_attention_processors: dict[str, torch.nn.Module],
 ) -> dict[str, torch.Tensor]:
+    clear_attention_cache(relation_attention_processors)
     pixel_values = batch["pixel_values"].to(device=device, dtype=weight_dtype)
     with torch.no_grad():
         latents = vae.encode(pixel_values).latent_dist.sample()
@@ -231,6 +244,14 @@ def _build_relation_aware_losses(
             pooled_embeddings,
             conditioning.slot_mask,
         )
+        attention_maps = collect_slot_attention_maps(relation_attention_processors)
+        attention_token_loss, attention_pixel_loss = compute_slot_attention_losses(
+            attention_maps=attention_maps,
+            metadata=batch["metadata"],
+            image_sizes=batch["image_sizes"],
+            slot_mask=conditioning.slot_mask,
+            device=torch.device(device),
+        )
         edge_loss = relation_loss(
             conditioning.relation_logits,
             conditioning.slot_positions,
@@ -241,6 +262,8 @@ def _build_relation_aware_losses(
             + aux_loss_weight * geometry_loss
             + embedding_loss_weight * semantic_loss
             + relation_loss_weight * edge_loss
+            + attention_token_loss_weight * attention_token_loss
+            + attention_pixel_loss_weight * attention_pixel_loss
         )
     return {
         "loss": loss,
@@ -248,6 +271,8 @@ def _build_relation_aware_losses(
         "geometry_loss": geometry_loss,
         "relation_loss": edge_loss,
         "embedding_loss": semantic_loss,
+        "attention_token_loss": attention_token_loss,
+        "attention_pixel_loss": attention_pixel_loss,
     }
 
 
@@ -267,6 +292,9 @@ def _evaluate_relation_aware(
     aux_loss_weight: float,
     relation_loss_weight: float,
     embedding_loss_weight: float,
+    attention_token_loss_weight: float,
+    attention_pixel_loss_weight: float,
+    relation_attention_processors: dict[str, torch.nn.Module],
 ) -> dict[str, float]:
     graph_encoder.eval()
     unet.eval()
@@ -276,6 +304,8 @@ def _evaluate_relation_aware(
         "geometry_loss": 0.0,
         "relation_loss": 0.0,
         "embedding_loss": 0.0,
+        "attention_token_loss": 0.0,
+        "attention_pixel_loss": 0.0,
     }
     batch_count = 0
     for batch in dataloader:
@@ -293,6 +323,9 @@ def _evaluate_relation_aware(
             aux_loss_weight=aux_loss_weight,
             relation_loss_weight=relation_loss_weight,
             embedding_loss_weight=embedding_loss_weight,
+            attention_token_loss_weight=attention_token_loss_weight,
+            attention_pixel_loss_weight=attention_pixel_loss_weight,
+            relation_attention_processors=relation_attention_processors,
         )
         for key in totals:
             totals[key] += float(metrics[key].item())
@@ -447,6 +480,8 @@ def main() -> int:
             "geometry_loss",
             "relation_loss",
             "embedding_loss",
+            "attention_token_loss",
+            "attention_pixel_loss",
         ],
     )
 
@@ -465,6 +500,8 @@ def main() -> int:
         "geometry_loss": 0.0,
         "relation_loss": 0.0,
         "embedding_loss": 0.0,
+        "attention_token_loss": 0.0,
+        "attention_pixel_loss": 0.0,
     }
     running_updates = 0
 
@@ -484,6 +521,9 @@ def main() -> int:
                 aux_loss_weight=args.aux_loss_weight,
                 relation_loss_weight=args.relation_loss_weight,
                 embedding_loss_weight=args.embedding_loss_weight,
+                attention_token_loss_weight=args.attention_token_loss_weight,
+                attention_pixel_loss_weight=args.attention_pixel_loss_weight,
+                relation_attention_processors=relation_attention_processors,
             )
             loss = metrics["loss"]
 
@@ -520,6 +560,8 @@ def main() -> int:
                         "geometry_loss": running["geometry_loss"] / running_updates,
                         "relation_loss": running["relation_loss"] / running_updates,
                         "embedding_loss": running["embedding_loss"] / running_updates,
+                        "attention_token_loss": running["attention_token_loss"] / running_updates,
+                        "attention_pixel_loss": running["attention_pixel_loss"] / running_updates,
                     }
                     metrics_logger.log(train_log)
                     progress_bar.set_postfix(
@@ -527,6 +569,7 @@ def main() -> int:
                         geom=f"{train_log['geometry_loss']:.4f}",
                         sem=f"{train_log['embedding_loss']:.4f}",
                         rel=f"{train_log['relation_loss']:.4f}",
+                        attn=f"{train_log['attention_token_loss']:.4f}",
                     )
                     running = {key: 0.0 for key in running}
                     running_updates = 0
@@ -549,6 +592,9 @@ def main() -> int:
                             aux_loss_weight=args.aux_loss_weight,
                             relation_loss_weight=args.relation_loss_weight,
                             embedding_loss_weight=args.embedding_loss_weight,
+                            attention_token_loss_weight=args.attention_token_loss_weight,
+                            attention_pixel_loss_weight=args.attention_pixel_loss_weight,
+                            relation_attention_processors=relation_attention_processors,
                         ),
                     }
                     metrics_logger.log(eval_log)
@@ -558,7 +604,9 @@ def main() -> int:
                         f"denoise={eval_log['denoise_loss']:.4f}, "
                         f"geom={eval_log['geometry_loss']:.4f}, "
                         f"rel={eval_log['relation_loss']:.4f}, "
-                        f"sem={eval_log['embedding_loss']:.4f}"
+                        f"sem={eval_log['embedding_loss']:.4f}, "
+                        f"attn_token={eval_log['attention_token_loss']:.4f}, "
+                        f"attn_pixel={eval_log['attention_pixel_loss']:.4f}"
                     )
 
                 if global_step % args.save_every == 0:
@@ -617,6 +665,9 @@ def main() -> int:
                 aux_loss_weight=args.aux_loss_weight,
                 relation_loss_weight=args.relation_loss_weight,
                 embedding_loss_weight=args.embedding_loss_weight,
+                attention_token_loss_weight=args.attention_token_loss_weight,
+                attention_pixel_loss_weight=args.attention_pixel_loss_weight,
+                relation_attention_processors=relation_attention_processors,
             ),
         }
         metrics_logger.log(test_log)
@@ -626,7 +677,9 @@ def main() -> int:
             f"(denoise={test_log['denoise_loss']:.4f}, "
             f"geom={test_log['geometry_loss']:.4f}, "
             f"rel={test_log['relation_loss']:.4f}, "
-            f"sem={test_log['embedding_loss']:.4f})"
+            f"sem={test_log['embedding_loss']:.4f}, "
+            f"attn_token={test_log['attention_token_loss']:.4f}, "
+            f"attn_pixel={test_log['attention_pixel_loss']:.4f})"
         )
     _save_state(args.output_dir, step=global_step, args=args, validation_prompts=validation_prompts)
     print(f"Relation-aware training finished at step {global_step}.")
