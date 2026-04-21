@@ -245,6 +245,12 @@ def _build_relation_aware_losses(
             conditioning.slot_mask,
         )
         attention_maps = collect_slot_attention_maps(relation_attention_processors)
+        if (
+            attention_token_loss_weight > 0.0 or attention_pixel_loss_weight > 0.0
+        ) and not attention_maps:
+            raise RuntimeError(
+                "Attention supervision was enabled, but no slot attention maps were captured."
+            )
         attention_token_loss, attention_pixel_loss = compute_slot_attention_losses(
             attention_maps=attention_maps,
             metadata=batch["metadata"],

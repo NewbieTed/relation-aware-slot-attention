@@ -143,7 +143,7 @@ class RelationAwareAttnProcessor2_0(nn.Module):
             attention_scores = attention_scores + attention_mask
         attention_probs = torch.softmax(attention_scores.float(), dim=-1).to(query.dtype)
 
-        if self.capture_attention and text_token_count is not None and slot_positions is not None:
+        if self.capture_attention and text_token_count is not None:
             self.latest_slot_attention_map = attention_probs.mean(dim=1)[..., text_token_count:]
             self.latest_query_hw = (height, width)
         else:
@@ -170,9 +170,7 @@ def install_relation_aware_processors(unet: Any) -> dict[str, nn.Module]:
     processors: dict[str, nn.Module] = {}
     for name in unet.attn_processors.keys():
         enable_bias = not name.endswith("attn1.processor")
-        capture_attention = enable_bias and (
-            name.startswith("mid_block") or name.startswith("up_blocks")
-        )
+        capture_attention = enable_bias
         processor = RelationAwareAttnProcessor2_0(
             enable_bias=enable_bias,
             capture_attention=capture_attention,
