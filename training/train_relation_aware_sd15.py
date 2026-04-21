@@ -54,6 +54,7 @@ def _save_state(
         "relation_loss_weight": args.relation_loss_weight,
         "embedding_loss_weight": args.embedding_loss_weight,
         "init_graph_encoder": str(args.init_graph_encoder) if args.init_graph_encoder else None,
+        "freeze_graph_encoder": args.freeze_graph_encoder,
         "validation_prompts": validation_prompts,
     }
     (output_dir / "training_state.json").write_text(json.dumps(payload, indent=2))
@@ -117,6 +118,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--relation-loss-weight", type=float, default=0.1)
     parser.add_argument("--embedding-loss-weight", type=float, default=0.05)
     parser.add_argument("--init-graph-encoder", type=Path, default=None)
+    parser.add_argument("--freeze-graph-encoder", action="store_true")
     parser.add_argument("--disable-tqdm", action="store_true")
     return parser
 
@@ -389,6 +391,9 @@ def main() -> int:
         state_dict = torch.load(args.init_graph_encoder, map_location=device)
         graph_encoder.load_state_dict(state_dict)
         print(f"Loaded graph encoder warm start from {args.init_graph_encoder}")
+    if args.freeze_graph_encoder:
+        graph_encoder.requires_grad_(False)
+        print("Graph encoder is frozen for this run.")
 
     relation_params = []
     for name, module in relation_attention_processors.items():
@@ -396,13 +401,17 @@ def main() -> int:
             continue
         relation_params.extend(list(module.parameters()))
 
-    optimizer = torch.optim.AdamW(
-        [
-            {"params": lora_optimizer.param_groups[0]["params"], "lr": args.learning_rate},
+    optimizer_param_groups = [
+        {"params": lora_optimizer.param_groups[0]["params"], "lr": args.learning_rate},
+        {"params": relation_params, "lr": args.graph_learning_rate},
+    ]
+    if not args.freeze_graph_encoder:
+        optimizer_param_groups.insert(
+            1,
             {"params": graph_encoder.parameters(), "lr": args.graph_learning_rate},
-            {"params": relation_params, "lr": args.graph_learning_rate},
-        ]
-    )
+        )
+
+    optimizer = torch.optim.AdamW(optimizer_param_groups)
 
     validation_prompts = _load_validation_prompts(datasets["train"], args.validation_prompts_file)
     _save_state(args.output_dir, step=0, args=args, validation_prompts=validation_prompts)

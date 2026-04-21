@@ -29,3 +29,6 @@ evaluation/vendor/
 
 # Notebook checkpoints
 .ipynb_checkpoints/
+
+# Visualizations
+docs/
