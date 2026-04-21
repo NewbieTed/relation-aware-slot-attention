@@ -7,10 +7,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from scop_depth.geometry import segmentation_to_mask
-from scop_depth.models import CocoInstanceAnnotation
-
-
 def _square_crop_bounds(image_size: tuple[int, int]) -> tuple[int, int, int]:
     width, height = image_size
     crop_size = min(width, height)
@@ -39,13 +35,7 @@ def _annotation_mask(
     annot_dict: dict[str, Any],
     image_size: tuple[int, int],
 ) -> np.ndarray:
-    annot = CocoInstanceAnnotation.from_dict(annot_dict)
-    mask = segmentation_to_mask(annot, image_size[0], image_size[1])
-    if mask is None:
-        mask = _bbox_to_mask(annot.bbox, image_size)
-    else:
-        mask = mask.astype(np.float32)
-    return mask
+    return _bbox_to_mask(tuple(annot_dict["bbox"]), image_size)
 
 
 def _crop_and_resize_mask(
