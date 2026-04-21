@@ -163,7 +163,14 @@ def compute_slot_attention_losses(
 
         mean_attn = torch.stack([m.to(dtype=torch.float32) for m in maps_at_resolution], dim=0).mean(dim=0)
         mean_attn = mean_attn.permute(0, 3, 1, 2).clamp(min=eps, max=1.0 - eps)
-        pixel_losses.append(F.binary_cross_entropy(mean_attn[valid_mask], target_masks[valid_mask]))
+        pixel_input = mean_attn[valid_mask]
+        pixel_target = target_masks[valid_mask]
+        pixel_losses.append(
+            -(
+                pixel_target * torch.log(pixel_input)
+                + (1.0 - pixel_target) * torch.log(1.0 - pixel_input)
+            ).mean()
+        )
 
     token_loss = torch.stack(token_losses).mean() if token_losses else slot_mask.new_tensor(0.0, dtype=torch.float32)
     pixel_loss = torch.stack(pixel_losses).mean() if pixel_losses else slot_mask.new_tensor(0.0, dtype=torch.float32)
