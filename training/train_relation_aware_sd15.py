@@ -156,6 +156,7 @@ def _build_relation_aware_losses(
     attention_token_loss_weight: float,
     attention_pixel_loss_weight: float,
     relation_attention_processors: dict[str, torch.nn.Module],
+    debug_attention_supervision: bool = False,
 ) -> dict[str, torch.Tensor]:
     clear_attention_cache(relation_attention_processors)
     pixel_values = batch["pixel_values"].to(device=device, dtype=weight_dtype)
@@ -251,12 +252,13 @@ def _build_relation_aware_losses(
             raise RuntimeError(
                 "Attention supervision was enabled, but no slot attention maps were captured."
             )
-        attention_token_loss, attention_pixel_loss = compute_slot_attention_losses(
+        attention_token_loss, attention_pixel_loss, attention_debug = compute_slot_attention_losses(
             attention_maps=attention_maps,
             metadata=batch["metadata"],
             image_sizes=batch["image_sizes"],
             slot_mask=conditioning.slot_mask,
             device=torch.device(device),
+            return_debug=debug_attention_supervision,
         )
         edge_loss = relation_loss(
             conditioning.relation_logits,
@@ -279,6 +281,7 @@ def _build_relation_aware_losses(
         "embedding_loss": semantic_loss,
         "attention_token_loss": attention_token_loss,
         "attention_pixel_loss": attention_pixel_loss,
+        "attention_debug": attention_debug,
     }
 
 
@@ -510,6 +513,7 @@ def main() -> int:
         "attention_pixel_loss": 0.0,
     }
     running_updates = 0
+    attention_debug_printed = False
 
     while global_step < args.max_train_steps:
         for batch in train_dataloader:
@@ -530,6 +534,10 @@ def main() -> int:
                 attention_token_loss_weight=args.attention_token_loss_weight,
                 attention_pixel_loss_weight=args.attention_pixel_loss_weight,
                 relation_attention_processors=relation_attention_processors,
+                debug_attention_supervision=(
+                    not attention_debug_printed
+                    and (args.attention_token_loss_weight > 0.0 or args.attention_pixel_loss_weight > 0.0)
+                ),
             )
             loss = metrics["loss"]
 
@@ -546,6 +554,22 @@ def main() -> int:
             for key in running:
                 running[key] += float(metrics[key].item())
             running_updates += 1
+
+            if not attention_debug_printed and metrics.get("attention_debug") is not None:
+                debug = metrics["attention_debug"]
+                print(
+                    "Attention supervision debug: "
+                    f"valid_slots={debug['valid_slots']}, "
+                    f"num_attention_maps={debug['num_attention_maps']}, "
+                    f"resolutions={debug['resolutions']}, "
+                    f"mask_sum_mean={debug['mask_sum_mean']:.4f}, "
+                    f"mask_sum_min={debug['mask_sum_min']:.4f}, "
+                    f"mask_sum_max={debug['mask_sum_max']:.4f}, "
+                    f"attn_sum_mean={debug['attn_sum_mean']:.4f}, "
+                    f"attn_sum_min={debug['attn_sum_min']:.4f}, "
+                    f"attn_sum_max={debug['attn_sum_max']:.4f}"
+                )
+                attention_debug_printed = True
 
             if micro_step % args.gradient_accumulation_steps == 0:
                 if scaler.is_enabled():

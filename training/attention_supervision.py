@@ -116,13 +116,27 @@ def compute_slot_attention_losses(
     image_sizes: list[tuple[int, int]],
     slot_mask: torch.Tensor,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    return_debug: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any] | None]:
     if not attention_maps:
         zero = slot_mask.new_tensor(0.0, dtype=torch.float32)
-        return zero, zero
+        debug = {
+            "num_attention_maps": 0,
+            "resolutions": [],
+            "mask_sum_min": 0.0,
+            "mask_sum_max": 0.0,
+            "mask_sum_mean": 0.0,
+            "attn_sum_min": 0.0,
+            "attn_sum_max": 0.0,
+            "attn_sum_mean": 0.0,
+            "valid_slots": int(slot_mask.sum().item()),
+        } if return_debug else None
+        return zero, zero, debug
 
     token_losses: list[torch.Tensor] = []
     pixel_losses: list[torch.Tensor] = []
+    debug_mask_sums: list[torch.Tensor] = []
+    debug_attn_sums: list[torch.Tensor] = []
     eps = 1e-6
 
     for resolution, maps_at_resolution in attention_maps.items():
@@ -136,10 +150,12 @@ def compute_slot_attention_losses(
         valid_mask = slot_mask.to(device=device, dtype=torch.bool)
         if not valid_mask.any():
             continue
+        debug_mask_sums.append(target_masks[valid_mask].flatten(1).sum(dim=-1))
 
         for attn_map in maps_at_resolution:
             attn_map = attn_map.to(dtype=torch.float32)
             attn_by_slot = attn_map.permute(0, 3, 1, 2)
+            debug_attn_sums.append(attn_by_slot[valid_mask].flatten(1).sum(dim=-1))
             numerator = (attn_by_slot * target_masks).flatten(2).sum(dim=-1)
             denominator = attn_by_slot.flatten(2).sum(dim=-1).clamp_min(eps)
             inside_mass = numerator / denominator
@@ -151,4 +167,26 @@ def compute_slot_attention_losses(
 
     token_loss = torch.stack(token_losses).mean() if token_losses else slot_mask.new_tensor(0.0, dtype=torch.float32)
     pixel_loss = torch.stack(pixel_losses).mean() if pixel_losses else slot_mask.new_tensor(0.0, dtype=torch.float32)
-    return token_loss, pixel_loss
+
+    debug: dict[str, Any] | None = None
+    if return_debug:
+        if debug_mask_sums:
+            mask_sums = torch.cat(debug_mask_sums, dim=0)
+        else:
+            mask_sums = slot_mask.new_zeros((0,), dtype=torch.float32)
+        if debug_attn_sums:
+            attn_sums = torch.cat(debug_attn_sums, dim=0)
+        else:
+            attn_sums = slot_mask.new_zeros((0,), dtype=torch.float32)
+        debug = {
+            "num_attention_maps": sum(len(maps) for maps in attention_maps.values()),
+            "resolutions": [f"{height}x{width}" for height, width in sorted(attention_maps.keys())],
+            "mask_sum_min": float(mask_sums.min().item()) if mask_sums.numel() else 0.0,
+            "mask_sum_max": float(mask_sums.max().item()) if mask_sums.numel() else 0.0,
+            "mask_sum_mean": float(mask_sums.mean().item()) if mask_sums.numel() else 0.0,
+            "attn_sum_min": float(attn_sums.min().item()) if attn_sums.numel() else 0.0,
+            "attn_sum_max": float(attn_sums.max().item()) if attn_sums.numel() else 0.0,
+            "attn_sum_mean": float(attn_sums.mean().item()) if attn_sums.numel() else 0.0,
+            "valid_slots": int(slot_mask.sum().item()),
+        }
+    return token_loss, pixel_loss, debug
