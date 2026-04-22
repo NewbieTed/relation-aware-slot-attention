@@ -46,6 +46,13 @@ def _preview_vector(tensor: torch.Tensor, *, max_elements: int) -> str:
     return "[" + ", ".join(values) + suffix + "]"
 
 
+def _first_n_vector(tensor: torch.Tensor, *, n: int = 3) -> str:
+    flat = tensor.detach().cpu().to(torch.float32).flatten()
+    values = [f"{float(value):+.4f}" for value in flat[:n]]
+    suffix = ", ..." if flat.numel() > n else ""
+    return "[" + ", ".join(values) + suffix + "]"
+
+
 def _norm(tensor: torch.Tensor) -> float:
     return float(tensor.detach().cpu().to(torch.float32).norm().item())
 
@@ -297,7 +304,7 @@ def _render_text_report(payload: dict[str, Any], *, max_vector_elements: int) ->
         vector = torch.tensor(item["clip_embedding"])
         lines.append(
             f"  {item['label']}: norm={item['clip_embedding_norm']:.4f} "
-            f"{_preview_vector(vector, max_elements=max_vector_elements)}"
+            f"{_first_n_vector(vector)}"
         )
     lines.append("")
 
@@ -307,7 +314,7 @@ def _render_text_report(payload: dict[str, Any], *, max_vector_elements: int) ->
         lines.append(
             f"  {item['sender_label']} -> {item['receiver_label']} ({item['relation']}): "
             f"norm={item['relation_embedding_norm']:.4f} "
-            f"{_preview_vector(vector, max_elements=max_vector_elements)}"
+            f"{_first_n_vector(vector)}"
         )
     if payload["active_relation_angles"]:
         lines.append("  Angles between active relation embeddings:")
@@ -321,41 +328,68 @@ def _render_text_report(payload: dict[str, Any], *, max_vector_elements: int) ->
     lines.append("Projected node states before message passing:")
     for label, values in payload["projected_node_states"].items():
         lines.append(
-            f"  {label}: {_preview_vector(torch.tensor(values), max_elements=max_vector_elements)}"
+            f"  {label}: {_first_n_vector(torch.tensor(values))}"
         )
     lines.append("")
 
     for layer in payload["message_passing_layers"]:
         lines.append(f"Layer {layer['layer_index']}:")
         for message in layer["messages"]:
+            sender_state = torch.tensor(message["sender_state"])
+            relation_embedding = torch.tensor(message["relation_embedding"])
+            message_tensor = torch.tensor(message["message"])
             lines.append(
                 f"  Message {message['sender_label']} => {message['receiver_label']} "
-                f"via {message['relation']}: norm={message['message_norm']:.4f} "
-                f"{_preview_vector(torch.tensor(message['message']), max_elements=max_vector_elements)}"
+                f"via {message['relation']}:"
+            )
+            lines.append(
+                "    message_input = concat(sender_state, relation_embedding)"
+            )
+            lines.append(
+                f"      sender_state[{message['sender_label']}] = {_first_n_vector(sender_state)}"
+            )
+            lines.append(
+                f"      relation_embedding[{message['relation']}] = {_first_n_vector(relation_embedding)}"
+            )
+            lines.append(
+                "      message = MLP(message_input)"
+                f" = {_first_n_vector(message_tensor)} (norm={message['message_norm']:.4f})"
             )
         lines.append("  Aggregation:")
         for label, values in layer["aggregated_messages"].items():
             lines.append(
                 f"    aggregated[{label}] = "
-                f"{_preview_vector(torch.tensor(values), max_elements=max_vector_elements)}"
+                f"{_first_n_vector(torch.tensor(values))}"
             )
         lines.append("  Residual updates and new states:")
         for label, update_values in layer["residual_updates"].items():
+            before_values = torch.tensor(layer["states_before"][label])
+            aggregated_values = torch.tensor(layer["aggregated_messages"][label])
+            update_tensor = torch.tensor(update_values)
             after_values = layer["states_after"][label]
             lines.append(
-                f"    update[{label}] = "
-                f"{_preview_vector(torch.tensor(update_values), max_elements=max_vector_elements)}"
+                f"    update_input[{label}] = concat(old_state[{label}], aggregated[{label}])"
             )
             lines.append(
-                f"    new_state[{label}] = "
-                f"{_preview_vector(torch.tensor(after_values), max_elements=max_vector_elements)}"
+                f"      old_state[{label}] = {_first_n_vector(before_values)}"
+            )
+            lines.append(
+                f"      aggregated[{label}] = {_first_n_vector(aggregated_values)}"
+            )
+            lines.append(
+                f"      residual_update[{label}] = MLP(update_input) = {_first_n_vector(update_tensor)}"
+            )
+            lines.append(
+                f"      new_state[{label}] = old_state + residual_update"
+                f" = {_first_n_vector(before_values)} + {_first_n_vector(update_tensor)}"
+                f" = {_first_n_vector(torch.tensor(after_values))}"
             )
         lines.append("")
 
     lines.append("Final slot embeddings:")
     for label, values in payload["final_slot_embeddings"].items():
         lines.append(
-            f"  {label}: {_preview_vector(torch.tensor(values), max_elements=max_vector_elements)}"
+            f"  {label}: {_first_n_vector(torch.tensor(values))}"
         )
     lines.append("")
 
