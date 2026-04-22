@@ -129,23 +129,26 @@ def _build_debug_payload(
         )
 
     active_edge_info: list[dict[str, Any]] = []
-    for edge in scene_graph["edges"]:
-        source_index = next(i for i, node in enumerate(scene_graph["nodes"]) if node["id"] == edge["source_id"])
-        target_index = next(i for i, node in enumerate(scene_graph["nodes"]) if node["id"] == edge["target_id"])
-        relation_index = RELATION_VOCAB[str(edge["relation"])]
-        relation_vector = relation_embeddings_table[relation_index]
+    active_relations: list[str] = []
+    for (receiver_idx, sender_idx), relation_index in zip(
+        batched_graph.edge_index[0].tolist(),
+        batched_graph.edge_types[0].tolist(),
+    ):
+        relation_name = _relation_name_from_index(int(relation_index))
+        relation_vector = relation_embeddings_table[int(relation_index)]
         active_edge_info.append(
             {
-                "source_label": scene_graph["nodes"][source_index]["label"],
-                "target_label": scene_graph["nodes"][target_index]["label"],
-                "relation": edge["relation"],
+                "sender_label": node_labels[sender_idx],
+                "receiver_label": node_labels[receiver_idx],
+                "relation": relation_name,
                 "relation_embedding": _tensor_to_list(relation_vector),
                 "relation_embedding_norm": _norm(relation_vector),
             }
         )
+        if relation_name not in active_relations:
+            active_relations.append(relation_name)
 
     active_relation_angles: list[dict[str, Any]] = []
-    active_relations = list({str(edge["relation"]) for edge in scene_graph["edges"]})
     for i, relation_a in enumerate(active_relations):
         for relation_b in active_relations[i + 1 :]:
             cosine, angle_deg = _cosine_and_angle(
@@ -302,7 +305,7 @@ def _render_text_report(payload: dict[str, Any], *, max_vector_elements: int) ->
     for item in payload["active_relations"]:
         vector = torch.tensor(item["relation_embedding"])
         lines.append(
-            f"  {item['source_label']} -> {item['target_label']} ({item['relation']}): "
+            f"  {item['sender_label']} -> {item['receiver_label']} ({item['relation']}): "
             f"norm={item['relation_embedding_norm']:.4f} "
             f"{_preview_vector(vector, max_elements=max_vector_elements)}"
         )
