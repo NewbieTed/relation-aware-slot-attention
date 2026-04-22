@@ -299,6 +299,7 @@ def main() -> int:
         "position_loss": 0.0,
         "relation_loss": 0.0,
         "embedding_loss": 0.0,
+        "inverse_relation_loss": 0.0,
     }
     running_steps = 0
     while global_step < args.max_train_steps:
@@ -339,12 +340,14 @@ def main() -> int:
                     "position_loss": running["position_loss"] / running_steps,
                     "relation_loss": running["relation_loss"] / running_steps,
                     "embedding_loss": running["embedding_loss"] / running_steps,
+                    "inverse_relation_loss": running["inverse_relation_loss"] / running_steps,
                 }
                 metrics_logger.log(train_log)
                 progress_bar.set_postfix(
                     pos=f"{train_log['position_loss']:.4f}",
                     rel=f"{train_log['relation_loss']:.4f}",
                     sem=f"{train_log['embedding_loss']:.4f}",
+                    inv=f"{train_log['inverse_relation_loss']:.4f}",
                 )
                 running = {key: 0.0 for key in running}
                 running_steps = 0
@@ -371,7 +374,8 @@ def main() -> int:
                     f"{global_step}: loss={eval_log['loss']:.4f}, "
                     f"pos={eval_log['position_loss']:.4f}, "
                     f"rel={eval_log['relation_loss']:.4f}, "
-                    f"sem={eval_log['embedding_loss']:.4f}"
+                    f"sem={eval_log['embedding_loss']:.4f}, "
+                    f"inv={eval_log['inverse_relation_loss']:.4f}"
                 )
 
             if global_step % args.save_every == 0:
@@ -415,7 +419,8 @@ def main() -> int:
             f"{test_log['loss']:.4f} "
             f"(pos={test_log['position_loss']:.4f}, "
             f"rel={test_log['relation_loss']:.4f}, "
-            f"sem={test_log['embedding_loss']:.4f})"
+            f"sem={test_log['embedding_loss']:.4f}, "
+            f"inv={test_log['inverse_relation_loss']:.4f})"
         )
     _save_state(args.output_dir, step=global_step, args=args)
     print(f"Graph pretraining finished at step {global_step}.")
