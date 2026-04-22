@@ -32,6 +32,7 @@ TEST_FRACTION="${TEST_FRACTION:-0.1}"
 POSITION_LOSS_WEIGHT="${POSITION_LOSS_WEIGHT:-1.0}"
 RELATION_LOSS_WEIGHT="${RELATION_LOSS_WEIGHT:-1.0}"
 EMBEDDING_LOSS_WEIGHT="${EMBEDDING_LOSS_WEIGHT:-0.25}"
+INVERSE_RELATION_LOSS_WEIGHT="${INVERSE_RELATION_LOSS_WEIGHT:-0.0}"
 
 CMD=(
   "$PYTHON_BIN" -m training.pretrain_graph_encoder
@@ -55,6 +56,7 @@ CMD=(
   --position-loss-weight "$POSITION_LOSS_WEIGHT"
   --relation-loss-weight "$RELATION_LOSS_WEIGHT"
   --embedding-loss-weight "$EMBEDDING_LOSS_WEIGHT"
+  --inverse-relation-loss-weight "$INVERSE_RELATION_LOSS_WEIGHT"
 )
 
 if [[ -n "$LIMIT_ROWS" ]]; then

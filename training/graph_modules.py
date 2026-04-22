@@ -9,6 +9,12 @@ import torch.nn.functional as F
 
 from .scene_graph import BatchedSceneGraphs, RELATION_VOCAB
 
+INVERSE_RELATION_PAIRS = (
+    ("left_of", "right_of"),
+    ("above", "below"),
+    ("in_front_of", "behind"),
+)
+
 
 def mean_pool_hidden(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
     mask = attention_mask.unsqueeze(-1).to(last_hidden_state.dtype)
@@ -91,6 +97,22 @@ class GraphSlotEncoder(nn.Module):
             nn.SiLU(),
             nn.Linear(slot_dim, 3),
         )
+        self._initialize_relation_embeddings()
+
+    def _initialize_relation_embeddings(self) -> None:
+        with torch.no_grad():
+            nn.init.normal_(self.relation_embedding.weight, mean=0.0, std=0.02)
+            base_directions = {
+                "horizontal": F.normalize(torch.randn(self.relation_embedding.embedding_dim), dim=0),
+                "vertical": F.normalize(torch.randn(self.relation_embedding.embedding_dim), dim=0),
+                "depth": F.normalize(torch.randn(self.relation_embedding.embedding_dim), dim=0),
+            }
+            self.relation_embedding.weight[RELATION_VOCAB["left_of"]].copy_(-base_directions["horizontal"])
+            self.relation_embedding.weight[RELATION_VOCAB["right_of"]].copy_(base_directions["horizontal"])
+            self.relation_embedding.weight[RELATION_VOCAB["above"]].copy_(-base_directions["vertical"])
+            self.relation_embedding.weight[RELATION_VOCAB["below"]].copy_(base_directions["vertical"])
+            self.relation_embedding.weight[RELATION_VOCAB["in_front_of"]].copy_(base_directions["depth"])
+            self.relation_embedding.weight[RELATION_VOCAB["behind"]].copy_(-base_directions["depth"])
 
     def forward(
         self,
@@ -252,3 +274,15 @@ def relation_loss(
     if not losses:
         return slot_positions.new_tensor(0.0)
     return torch.stack(losses).mean()
+
+
+def inverse_relation_regularizer(graph_encoder: GraphSlotEncoder) -> torch.Tensor:
+    penalties: list[torch.Tensor] = []
+    for relation_a, relation_b in INVERSE_RELATION_PAIRS:
+        embedding_a = graph_encoder.relation_embedding.weight[RELATION_VOCAB[relation_a]]
+        embedding_b = graph_encoder.relation_embedding.weight[RELATION_VOCAB[relation_b]]
+        cosine = F.cosine_similarity(embedding_a.unsqueeze(0), embedding_b.unsqueeze(0), dim=-1)
+        penalties.append(1.0 + cosine.squeeze(0))
+    if not penalties:
+        return graph_encoder.relation_embedding.weight.new_tensor(0.0)
+    return torch.stack(penalties).mean()

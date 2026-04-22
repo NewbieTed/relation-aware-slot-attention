@@ -15,6 +15,7 @@ from .graph_modules import (
     GraphSlotEncoder,
     build_slot_conditioning,
     embedding_alignment_loss,
+    inverse_relation_regularizer,
     pooled_label_embeddings,
     relation_loss,
 )
@@ -41,6 +42,7 @@ def _save_state(output_dir: Path, *, step: int, args: argparse.Namespace) -> Non
         "position_loss_weight": args.position_loss_weight,
         "relation_loss_weight": args.relation_loss_weight,
         "embedding_loss_weight": args.embedding_loss_weight,
+        "inverse_relation_loss_weight": args.inverse_relation_loss_weight,
     }
     (output_dir / "training_state.json").write_text(json.dumps(payload, indent=2))
 
@@ -85,6 +87,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--position-loss-weight", type=float, default=1.0)
     parser.add_argument("--relation-loss-weight", type=float, default=1.0)
     parser.add_argument("--embedding-loss-weight", type=float, default=0.25)
+    parser.add_argument("--inverse-relation-loss-weight", type=float, default=0.0)
     parser.add_argument("--disable-tqdm", action="store_true")
     return parser
 
@@ -99,6 +102,7 @@ def _compute_graph_batch_losses(
     position_loss_weight: float,
     relation_loss_weight: float,
     embedding_loss_weight: float,
+    inverse_relation_loss_weight: float,
 ) -> dict[str, torch.Tensor]:
     max_nodes = max(len(graph["nodes"]) for graph in batch["scene_graphs"])  # type: ignore[index]
     slot_targets, slot_mask = bbox_centers_after_crop(
@@ -141,16 +145,19 @@ def _compute_graph_batch_losses(
         pooled_embeddings,
         conditioning.slot_mask,
     )
+    inverse_loss = inverse_relation_regularizer(graph_encoder)
     total_loss = (
         position_loss_weight * position_loss
         + relation_loss_weight * edge_loss
         + embedding_loss_weight * semantic_loss
+        + inverse_relation_loss_weight * inverse_loss
     )
     return {
         "loss": total_loss,
         "position_loss": position_loss,
         "relation_loss": edge_loss,
         "embedding_loss": semantic_loss,
+        "inverse_relation_loss": inverse_loss,
     }
 
 
@@ -165,6 +172,7 @@ def _evaluate_graph_encoder(
     position_loss_weight: float,
     relation_loss_weight: float,
     embedding_loss_weight: float,
+    inverse_relation_loss_weight: float,
 ) -> dict[str, float]:
     graph_encoder.eval()
     totals = {
@@ -172,6 +180,7 @@ def _evaluate_graph_encoder(
         "position_loss": 0.0,
         "relation_loss": 0.0,
         "embedding_loss": 0.0,
+        "inverse_relation_loss": 0.0,
     }
     batch_count = 0
     for batch in dataloader:
@@ -184,6 +193,7 @@ def _evaluate_graph_encoder(
             position_loss_weight=position_loss_weight,
             relation_loss_weight=relation_loss_weight,
             embedding_loss_weight=embedding_loss_weight,
+            inverse_relation_loss_weight=inverse_relation_loss_weight,
         )
         for key in totals:
             totals[key] += float(metrics[key].item())
@@ -274,6 +284,7 @@ def main() -> int:
             "position_loss",
             "relation_loss",
             "embedding_loss",
+            "inverse_relation_loss",
         ],
     )
     progress_bar = tqdm(
@@ -299,9 +310,10 @@ def main() -> int:
                 graph_encoder=graph_encoder,
                 device=device,
                 position_loss_weight=args.position_loss_weight,
-                relation_loss_weight=args.relation_loss_weight,
-                embedding_loss_weight=args.embedding_loss_weight,
-            )
+            relation_loss_weight=args.relation_loss_weight,
+            embedding_loss_weight=args.embedding_loss_weight,
+            inverse_relation_loss_weight=args.inverse_relation_loss_weight,
+        )
             loss = metrics["loss"]
 
             if not torch.isfinite(loss):
@@ -348,9 +360,10 @@ def main() -> int:
                         graph_encoder=graph_encoder,
                         device=device,
                         position_loss_weight=args.position_loss_weight,
-                        relation_loss_weight=args.relation_loss_weight,
-                        embedding_loss_weight=args.embedding_loss_weight,
-                    ),
+                            relation_loss_weight=args.relation_loss_weight,
+                            embedding_loss_weight=args.embedding_loss_weight,
+                            inverse_relation_loss_weight=args.inverse_relation_loss_weight,
+                        ),
                 }
                 metrics_logger.log(eval_log)
                 print(
@@ -393,6 +406,7 @@ def main() -> int:
                 position_loss_weight=args.position_loss_weight,
                 relation_loss_weight=args.relation_loss_weight,
                 embedding_loss_weight=args.embedding_loss_weight,
+                inverse_relation_loss_weight=args.inverse_relation_loss_weight,
             ),
         }
         metrics_logger.log(test_log)
