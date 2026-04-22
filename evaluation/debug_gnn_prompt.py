@@ -240,6 +240,17 @@ def _build_debug_payload(
     return {
         "prompt": prompt,
         "scene_graph": scene_graph,
+        "message_passing_edges": [
+            {
+                "receiver_label": node_labels[receiver_idx],
+                "sender_label": node_labels[sender_idx],
+                "relation": _relation_name_from_index(int(relation_index)),
+            }
+            for (receiver_idx, sender_idx), relation_index in zip(
+                batched_graph.edge_index[0].tolist(),
+                batched_graph.edge_types[0].tolist(),
+            )
+        ],
         "clip_label_embeddings": label_details,
         "projected_node_states": {
             node_labels[node_index]: _tensor_to_list(node_states[node_index])
@@ -270,6 +281,12 @@ def _render_text_report(payload: dict[str, Any], *, max_vector_elements: int) ->
         lines.append(f"  Node {node['id']}: {node['label']}")
     for edge in payload["scene_graph"]["edges"]:
         lines.append(f"  Edge: {edge['source_id']} -> {edge['target_id']} ({edge['relation']})")
+    lines.append("")
+    lines.append("Expanded message-passing edges:")
+    for edge in payload["message_passing_edges"]:
+        lines.append(
+            f"  {edge['sender_label']} -> {edge['receiver_label']} ({edge['relation']})"
+        )
     lines.append("")
 
     lines.append("CLIP pooled label embeddings:")
