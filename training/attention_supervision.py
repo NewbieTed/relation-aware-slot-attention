@@ -187,3 +187,17 @@ def compute_slot_attention_losses(
             "valid_slots": int(slot_mask.sum().item()),
         }
     return token_loss, pixel_loss, debug
+
+
+def compute_mean_slot_usage(attention_maps: dict[tuple[int, int], list[torch.Tensor]]) -> torch.Tensor:
+    slot_masses: list[torch.Tensor] = []
+    device: torch.device | None = None
+    for maps_at_resolution in attention_maps.values():
+        for attn_map in maps_at_resolution:
+            device = attn_map.device
+            slot_masses.append(attn_map.sum(dim=-1).reshape(-1))
+    if not slot_masses:
+        if device is None:
+            device = torch.device("cpu")
+        return torch.zeros((), device=device, dtype=torch.float32)
+    return torch.cat(slot_masses, dim=0).to(dtype=torch.float32).mean()

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,7 @@ from tqdm.auto import tqdm
 from .attention_supervision import (
     clear_attention_cache,
     collect_slot_attention_maps,
+    compute_mean_slot_usage,
     compute_slot_attention_losses,
 )
 from .dataset import build_dataset_splits, collate_training_items
@@ -60,6 +62,9 @@ def _save_state(
         "embedding_loss_weight": args.embedding_loss_weight,
         "attention_token_loss_weight": args.attention_token_loss_weight,
         "attention_pixel_loss_weight": args.attention_pixel_loss_weight,
+        "slot_usage_loss_weight": args.slot_usage_loss_weight,
+        "slot_usage_target": args.slot_usage_target,
+        "object_token_dropout_prob": args.object_token_dropout_prob,
         "init_graph_encoder": str(args.init_graph_encoder) if args.init_graph_encoder else None,
         "freeze_graph_encoder": args.freeze_graph_encoder,
         "full_unet_finetune": args.full_unet_finetune,
@@ -131,11 +136,50 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--embedding-loss-weight", type=float, default=0.05)
     parser.add_argument("--attention-token-loss-weight", type=float, default=0.0)
     parser.add_argument("--attention-pixel-loss-weight", type=float, default=0.0)
+    parser.add_argument("--slot-usage-loss-weight", type=float, default=0.0)
+    parser.add_argument("--slot-usage-target", type=float, default=0.02)
+    parser.add_argument("--object-token-dropout-prob", type=float, default=0.0)
     parser.add_argument("--init-graph-encoder", type=Path, default=None)
     parser.add_argument("--freeze-graph-encoder", action="store_true")
     parser.add_argument("--full-unet-finetune", action="store_true")
     parser.add_argument("--disable-tqdm", action="store_true")
     return parser
+
+
+def _drop_object_tokens_from_prompts(
+    prompts: list[str],
+    scene_graphs: list[dict[str, Any]],
+    probability: float,
+) -> list[str]:
+    if probability <= 0.0:
+        return prompts
+
+    placeholders = ["something", "something else", "another thing"]
+    dropped_prompts: list[str] = []
+    for prompt, scene_graph in zip(prompts, scene_graphs):
+        if torch.rand(1).item() >= probability:
+            dropped_prompts.append(prompt)
+            continue
+        updated_prompt = prompt
+        seen_labels: set[str] = set()
+        for label_index, node in enumerate(scene_graph.get("nodes", [])):
+            label = str(node.get("label", "")).strip()
+            if not label:
+                continue
+            label_key = label.lower()
+            if label_key in seen_labels:
+                continue
+            seen_labels.add(label_key)
+            placeholder = placeholders[min(label_index, len(placeholders) - 1)]
+            updated_prompt = re.sub(
+                rf"\b{re.escape(label)}\b",
+                placeholder,
+                updated_prompt,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+        dropped_prompts.append(" ".join(updated_prompt.split()))
+    return dropped_prompts
 
 
 def _build_relation_aware_losses(
@@ -155,7 +199,11 @@ def _build_relation_aware_losses(
     embedding_loss_weight: float,
     attention_token_loss_weight: float,
     attention_pixel_loss_weight: float,
+    slot_usage_loss_weight: float,
+    slot_usage_target: float,
     relation_attention_processors: dict[str, torch.nn.Module],
+    object_token_dropout_prob: float = 0.0,
+    apply_object_token_dropout: bool = False,
     debug_attention_supervision: bool = False,
 ) -> dict[str, torch.Tensor]:
     clear_attention_cache(relation_attention_processors)
@@ -175,8 +223,17 @@ def _build_relation_aware_losses(
     )
     noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
+    prompts = (
+        _drop_object_tokens_from_prompts(
+            batch["prompts"],
+            batch["scene_graphs"],
+            object_token_dropout_prob,
+        )
+        if apply_object_token_dropout
+        else batch["prompts"]
+    )
     text_inputs = tokenizer(
-        batch["prompts"],
+        prompts,
         padding="max_length",
         truncation=True,
         max_length=tokenizer.model_max_length,
@@ -247,11 +304,18 @@ def _build_relation_aware_losses(
         )
         attention_maps = collect_slot_attention_maps(relation_attention_processors)
         if (
-            attention_token_loss_weight > 0.0 or attention_pixel_loss_weight > 0.0
+            attention_token_loss_weight > 0.0
+            or attention_pixel_loss_weight > 0.0
+            or slot_usage_loss_weight > 0.0
         ) and not attention_maps:
             raise RuntimeError(
                 "Attention supervision was enabled, but no slot attention maps were captured."
             )
+        slot_usage = compute_mean_slot_usage(attention_maps)
+        slot_usage_loss = F.relu(
+            denoise_loss.new_tensor(slot_usage_target)
+            - slot_usage.to(device=denoise_loss.device, dtype=denoise_loss.dtype)
+        )
         attention_token_loss, attention_pixel_loss, attention_debug = compute_slot_attention_losses(
             attention_maps=attention_maps,
             metadata=batch["metadata"],
@@ -272,6 +336,7 @@ def _build_relation_aware_losses(
             + relation_loss_weight * edge_loss
             + attention_token_loss_weight * attention_token_loss
             + attention_pixel_loss_weight * attention_pixel_loss
+            + slot_usage_loss_weight * slot_usage_loss
         )
     return {
         "loss": loss,
@@ -281,6 +346,8 @@ def _build_relation_aware_losses(
         "embedding_loss": semantic_loss,
         "attention_token_loss": attention_token_loss,
         "attention_pixel_loss": attention_pixel_loss,
+        "slot_usage_loss": slot_usage_loss,
+        "slot_usage_pct": slot_usage * 100.0,
         "attention_debug": attention_debug,
     }
 
@@ -303,6 +370,8 @@ def _evaluate_relation_aware(
     embedding_loss_weight: float,
     attention_token_loss_weight: float,
     attention_pixel_loss_weight: float,
+    slot_usage_loss_weight: float,
+    slot_usage_target: float,
     relation_attention_processors: dict[str, torch.nn.Module],
 ) -> dict[str, float]:
     graph_encoder.eval()
@@ -315,6 +384,8 @@ def _evaluate_relation_aware(
         "embedding_loss": 0.0,
         "attention_token_loss": 0.0,
         "attention_pixel_loss": 0.0,
+        "slot_usage_loss": 0.0,
+        "slot_usage_pct": 0.0,
     }
     batch_count = 0
     for batch in dataloader:
@@ -334,6 +405,8 @@ def _evaluate_relation_aware(
             embedding_loss_weight=embedding_loss_weight,
             attention_token_loss_weight=attention_token_loss_weight,
             attention_pixel_loss_weight=attention_pixel_loss_weight,
+            slot_usage_loss_weight=slot_usage_loss_weight,
+            slot_usage_target=slot_usage_target,
             relation_attention_processors=relation_attention_processors,
         )
         for key in totals:
@@ -491,6 +564,8 @@ def main() -> int:
             "embedding_loss",
             "attention_token_loss",
             "attention_pixel_loss",
+            "slot_usage_loss",
+            "slot_usage_pct",
         ],
     )
 
@@ -511,6 +586,8 @@ def main() -> int:
         "embedding_loss": 0.0,
         "attention_token_loss": 0.0,
         "attention_pixel_loss": 0.0,
+        "slot_usage_loss": 0.0,
+        "slot_usage_pct": 0.0,
     }
     running_updates = 0
     attention_debug_printed = False
@@ -533,7 +610,11 @@ def main() -> int:
                 embedding_loss_weight=args.embedding_loss_weight,
                 attention_token_loss_weight=args.attention_token_loss_weight,
                 attention_pixel_loss_weight=args.attention_pixel_loss_weight,
+                slot_usage_loss_weight=args.slot_usage_loss_weight,
+                slot_usage_target=args.slot_usage_target,
                 relation_attention_processors=relation_attention_processors,
+                object_token_dropout_prob=args.object_token_dropout_prob,
+                apply_object_token_dropout=True,
                 debug_attention_supervision=(
                     not attention_debug_printed
                     and (args.attention_token_loss_weight > 0.0 or args.attention_pixel_loss_weight > 0.0)
@@ -592,14 +673,14 @@ def main() -> int:
                         "embedding_loss": running["embedding_loss"] / running_updates,
                         "attention_token_loss": running["attention_token_loss"] / running_updates,
                         "attention_pixel_loss": running["attention_pixel_loss"] / running_updates,
+                        "slot_usage_loss": running["slot_usage_loss"] / running_updates,
+                        "slot_usage_pct": running["slot_usage_pct"] / running_updates,
                     }
                     metrics_logger.log(train_log)
                     progress_bar.set_postfix(
                         denoise=f"{train_log['denoise_loss']:.4f}",
-                        geom=f"{train_log['geometry_loss']:.4f}",
-                        sem=f"{train_log['embedding_loss']:.4f}",
                         rel=f"{train_log['relation_loss']:.4f}",
-                        attn=f"{train_log['attention_token_loss']:.4f}",
+                        slot=f"{train_log['slot_usage_pct']:.2f}%",
                     )
                     running = {key: 0.0 for key in running}
                     running_updates = 0
@@ -624,6 +705,8 @@ def main() -> int:
                             embedding_loss_weight=args.embedding_loss_weight,
                             attention_token_loss_weight=args.attention_token_loss_weight,
                             attention_pixel_loss_weight=args.attention_pixel_loss_weight,
+                            slot_usage_loss_weight=args.slot_usage_loss_weight,
+                            slot_usage_target=args.slot_usage_target,
                             relation_attention_processors=relation_attention_processors,
                         ),
                     }
@@ -636,7 +719,8 @@ def main() -> int:
                         f"rel={eval_log['relation_loss']:.4f}, "
                         f"sem={eval_log['embedding_loss']:.4f}, "
                         f"attn_token={eval_log['attention_token_loss']:.4f}, "
-                        f"attn_pixel={eval_log['attention_pixel_loss']:.4f}"
+                        f"attn_pixel={eval_log['attention_pixel_loss']:.4f}, "
+                        f"slot_use={eval_log['slot_usage_pct']:.2f}%"
                     )
 
                 if global_step % args.save_every == 0:
@@ -697,6 +781,8 @@ def main() -> int:
                 embedding_loss_weight=args.embedding_loss_weight,
                 attention_token_loss_weight=args.attention_token_loss_weight,
                 attention_pixel_loss_weight=args.attention_pixel_loss_weight,
+                slot_usage_loss_weight=args.slot_usage_loss_weight,
+                slot_usage_target=args.slot_usage_target,
                 relation_attention_processors=relation_attention_processors,
             ),
         }
@@ -709,7 +795,8 @@ def main() -> int:
             f"rel={test_log['relation_loss']:.4f}, "
             f"sem={test_log['embedding_loss']:.4f}, "
             f"attn_token={test_log['attention_token_loss']:.4f}, "
-            f"attn_pixel={test_log['attention_pixel_loss']:.4f})"
+            f"attn_pixel={test_log['attention_pixel_loss']:.4f}, "
+            f"slot_use={test_log['slot_usage_pct']:.2f}%)"
         )
     _save_state(args.output_dir, step=global_step, args=args, validation_prompts=validation_prompts)
     print(f"Relation-aware training finished at step {global_step}.")
