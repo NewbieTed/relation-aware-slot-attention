@@ -52,6 +52,7 @@ class TrainingItem:
     prompt: str
     scene_graph: dict[str, Any]
     metadata: dict[str, Any]
+    image_size: tuple[int, int]
 
 
 class SCOPDepthTextToImageDataset(Dataset[TrainingItem]):
@@ -66,12 +67,14 @@ class SCOPDepthTextToImageDataset(Dataset[TrainingItem]):
         limit_rows: int | None = None,
         shuffle_rows: bool = False,
         seed: int = 42,
+        rows: list[dict[str, Any]] | None = None,
     ) -> None:
         self.dataset_dir = Path(dataset_dir)
         self.image_size = image_size
         self.prompt_prefix = prompt_prefix
 
-        rows = load_metadata_rows(self.dataset_dir)
+        if rows is None:
+            rows = load_metadata_rows(self.dataset_dir)
         if shuffle_rows:
             rng = random.Random(seed)
             rng.shuffle(rows)
@@ -98,6 +101,7 @@ class SCOPDepthTextToImageDataset(Dataset[TrainingItem]):
                 "--coco-root <coco_root>`."
             )
         image = Image.open(image_path).convert("RGB")
+        original_image_size = image.size
         image = _center_crop_to_square(image, self.image_size)
 
         return TrainingItem(
@@ -105,6 +109,7 @@ class SCOPDepthTextToImageDataset(Dataset[TrainingItem]):
             prompt=prompt_from_scop_depth_row(row, prefix=self.prompt_prefix),
             scene_graph=scene_graph_payload_from_row(row),
             metadata=row,
+            image_size=original_image_size,
         )
 
 
@@ -114,4 +119,90 @@ def collate_training_items(items: list[TrainingItem]) -> dict[str, Any]:
         "prompts": [item.prompt for item in items],
         "scene_graphs": [item.scene_graph for item in items],
         "metadata": [item.metadata for item in items],
+        "image_sizes": [item.image_size for item in items],
+    }
+
+
+def _compute_split_counts(
+    total_rows: int,
+    eval_fraction: float,
+    test_fraction: float,
+) -> tuple[int, int, int]:
+    if total_rows <= 0:
+        raise ValueError("Cannot split an empty dataset")
+    if not (0.0 <= eval_fraction < 1.0 and 0.0 <= test_fraction < 1.0):
+        raise ValueError("Eval/test fractions must lie in [0, 1)")
+    if eval_fraction + test_fraction >= 1.0:
+        raise ValueError("Eval/test fractions must sum to less than 1")
+
+    eval_count = int(round(total_rows * eval_fraction))
+    test_count = int(round(total_rows * test_fraction))
+
+    if eval_fraction > 0 and eval_count == 0 and total_rows >= 3:
+        eval_count = 1
+    if test_fraction > 0 and test_count == 0 and total_rows - eval_count >= 2:
+        test_count = 1
+
+    while eval_count + test_count >= total_rows:
+        if eval_count >= test_count and eval_count > 0:
+            eval_count -= 1
+        elif test_count > 0:
+            test_count -= 1
+        else:
+            break
+
+    train_count = total_rows - eval_count - test_count
+    if train_count <= 0:
+        raise ValueError("Split configuration left no rows for training")
+    return train_count, eval_count, test_count
+
+
+def build_dataset_splits(
+    dataset_dir: str | Path,
+    *,
+    image_size: int = 512,
+    prompt_prefix: str = "a photo of",
+    limit_rows: int | None = None,
+    seed: int = 42,
+    eval_fraction: float = 0.1,
+    test_fraction: float = 0.1,
+) -> dict[str, SCOPDepthTextToImageDataset]:
+    dataset_path = Path(dataset_dir)
+    rows = load_metadata_rows(dataset_path)
+    rng = random.Random(seed)
+    rng.shuffle(rows)
+    if limit_rows is not None:
+        rows = rows[:limit_rows]
+    if not rows:
+        raise ValueError("SCOP-Depth dataset is empty after applying row limits")
+
+    train_count, eval_count, test_count = _compute_split_counts(
+        len(rows),
+        eval_fraction=eval_fraction,
+        test_fraction=test_fraction,
+    )
+
+    train_rows = rows[:train_count]
+    eval_rows = rows[train_count : train_count + eval_count]
+    test_rows = rows[train_count + eval_count : train_count + eval_count + test_count]
+
+    return {
+        "train": SCOPDepthTextToImageDataset(
+            dataset_path,
+            image_size=image_size,
+            prompt_prefix=prompt_prefix,
+            rows=train_rows,
+        ),
+        "eval": SCOPDepthTextToImageDataset(
+            dataset_path,
+            image_size=image_size,
+            prompt_prefix=prompt_prefix,
+            rows=eval_rows,
+        ),
+        "test": SCOPDepthTextToImageDataset(
+            dataset_path,
+            image_size=image_size,
+            prompt_prefix=prompt_prefix,
+            rows=test_rows,
+        ),
     }

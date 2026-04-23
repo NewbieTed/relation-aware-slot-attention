@@ -9,6 +9,7 @@ from .schema import SceneEdge, SceneGraph, SceneNode
 DATASET_RELATION_TO_GRAPH = {
     "to the left of": "left_of",
     "to the right of": "right_of",
+    "next to": "next_to",
     "above": "above",
     "below": "below",
     "on": "on",

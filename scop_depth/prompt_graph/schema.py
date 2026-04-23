@@ -7,6 +7,7 @@ BoundingBox = tuple[float, float, float, float]
 RelationType = Literal[
     "left_of",
     "right_of",
+    "next_to",
     "above",
     "below",
     "on",

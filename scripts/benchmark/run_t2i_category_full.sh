@@ -18,8 +18,15 @@ CATEGORY="${CATEGORY:-spatial}"
 MODEL="${MODEL:-sd15}"
 DEVICE="${DEVICE:-auto}"
 LORA_PATH="${LORA_PATH:-}"
+UNET_PATH="${UNET_PATH:-}"
+RELATION_AWARE_DIR="${RELATION_AWARE_DIR:-}"
+GRAPH_ENCODER_PATH="${GRAPH_ENCODER_PATH:-}"
+RELATION_ATTENTION_PATH="${RELATION_ATTENTION_PATH:-}"
 NUM_IMAGES_PER_PROMPT="${NUM_IMAGES_PER_PROMPT:-1}"
 START_INDEX="${START_INDEX:-0}"
+SEED="${SEED:-42}"
+PRUNE_SAMPLES_KEEP="${PRUNE_SAMPLES_KEEP:-}"
+PRUNE_SAMPLES_SEED="${PRUNE_SAMPLES_SEED:-$SEED}"
 PYTHON_BIN="${PYTHON_BIN:-$DEFAULT_PYTHON}"
 EVAL_PYTHON_BIN="${EVAL_PYTHON_BIN:-$DEFAULT_T2I_EVAL_PYTHON}"
 T2I_ROOT="${T2I_ROOT:-$ROOT_DIR/external/T2I-CompBench}"
@@ -36,12 +43,40 @@ esac
 
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/eval/${MODEL}_t2i_compbench_${CATEGORY}_val}"
 
-if [[ -n "$LORA_PATH" ]]; then
+if [[ -n "$RELATION_AWARE_DIR" || -n "$UNET_PATH" || -n "$GRAPH_ENCODER_PATH" || -n "$RELATION_ATTENTION_PATH" ]]; then
+  CMD=(
+    "$PYTHON_BIN" -m evaluation.generate
+    --model "$MODEL"
+    --prompts-file "$PROMPTS_FILE"
+    --output-dir "$OUTPUT_DIR"
+    --num-images-per-prompt "$NUM_IMAGES_PER_PROMPT"
+    --seed "$SEED"
+    --start-index "$START_INDEX"
+    --device "$DEVICE"
+  )
+  if [[ -n "$RELATION_AWARE_DIR" ]]; then
+    CMD+=(--relation-aware-dir "$RELATION_AWARE_DIR")
+  fi
+  if [[ -n "$UNET_PATH" ]]; then
+    CMD+=(--unet-path "$UNET_PATH")
+  fi
+  if [[ -n "$GRAPH_ENCODER_PATH" ]]; then
+    CMD+=(--graph-encoder-path "$GRAPH_ENCODER_PATH")
+  fi
+  if [[ -n "$RELATION_ATTENTION_PATH" ]]; then
+    CMD+=(--relation-attention-path "$RELATION_ATTENTION_PATH")
+  fi
+  if [[ -n "$LORA_PATH" ]]; then
+    CMD+=(--lora-path "$LORA_PATH")
+  fi
+  "${CMD[@]}"
+elif [[ -n "$LORA_PATH" ]]; then
   "$PYTHON_BIN" -m evaluation.generate \
     --model "$MODEL" \
     --prompts-file "$PROMPTS_FILE" \
     --output-dir "$OUTPUT_DIR" \
     --num-images-per-prompt "$NUM_IMAGES_PER_PROMPT" \
+    --seed "$SEED" \
     --start-index "$START_INDEX" \
     --device "$DEVICE" \
     --lora-path "$LORA_PATH"
@@ -51,12 +86,21 @@ else
     --prompts-file "$PROMPTS_FILE" \
     --output-dir "$OUTPUT_DIR" \
     --num-images-per-prompt "$NUM_IMAGES_PER_PROMPT" \
+    --seed "$SEED" \
     --start-index "$START_INDEX" \
     --device "$DEVICE"
 fi
-"$PYTHON_BIN" -m evaluation.t2i_compbench \
-  --benchmark "$CATEGORY" \
-  --t2i-compbench-root "$T2I_ROOT" \
-  --generated-dir "$OUTPUT_DIR" \
-  --prompt-file "$PROMPTS_FILE" \
+
+EVAL_CMD=(
+  "$PYTHON_BIN" -m evaluation.t2i_compbench
+  --benchmark "$CATEGORY"
+  --t2i-compbench-root "$T2I_ROOT"
+  --generated-dir "$OUTPUT_DIR"
+  --prompt-file "$PROMPTS_FILE"
   --python-bin "$EVAL_PYTHON_BIN"
+)
+if [[ -n "$PRUNE_SAMPLES_KEEP" ]]; then
+  EVAL_CMD+=(--prune-samples-keep "$PRUNE_SAMPLES_KEEP")
+  EVAL_CMD+=(--prune-samples-seed "$PRUNE_SAMPLES_SEED")
+fi
+"${EVAL_CMD[@]}"
