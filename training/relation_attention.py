@@ -91,6 +91,7 @@ class RelationAwareAttnProcessor2_0(nn.Module):
         attention_mask: torch.Tensor | None = None,
         temb: torch.Tensor | None = None,
         slot_positions: torch.Tensor | None = None,
+        slot_log_sigmas: torch.Tensor | None = None,
         slot_mask: torch.Tensor | None = None,
         text_token_count: int | None = None,
         *args,
@@ -103,6 +104,7 @@ class RelationAwareAttnProcessor2_0(nn.Module):
             attention_mask=attention_mask,
             temb=temb,
             slot_positions=slot_positions,
+            slot_log_sigmas=slot_log_sigmas,
             slot_mask=slot_mask,
             text_token_count=text_token_count,
             *args,
@@ -117,6 +119,7 @@ class RelationAwareAttnProcessor2_0(nn.Module):
         attention_mask: torch.Tensor | None = None,
         temb: torch.Tensor | None = None,
         slot_positions: torch.Tensor | None = None,
+        slot_log_sigmas: torch.Tensor | None = None,
         slot_mask: torch.Tensor | None = None,
         text_token_count: int | None = None,
         *args,
@@ -175,8 +178,15 @@ class RelationAwareAttnProcessor2_0(nn.Module):
                 device=query.device,
             )
             xy_positions = slot_positions[..., :2].to(query.device)
-            dist2 = ((grid.unsqueeze(2) - xy_positions.unsqueeze(1)) ** 2).sum(dim=-1)
-            slot_bias = -self.spatial_scale.exp() * dist2
+            if slot_log_sigmas is not None:
+                slot_log_sigmas = _repeat_batch(slot_log_sigmas.to(query.device), batch_size)
+                sigmas = slot_log_sigmas.exp().clamp(min=0.03, max=2.0)
+                normalized_delta = (grid.unsqueeze(2) - xy_positions.unsqueeze(1)) / sigmas.unsqueeze(1)
+                dist2 = (normalized_delta**2).sum(dim=-1)
+                slot_bias = -0.5 * self.spatial_scale.exp() * dist2
+            else:
+                dist2 = ((grid.unsqueeze(2) - xy_positions.unsqueeze(1)) ** 2).sum(dim=-1)
+                slot_bias = -self.spatial_scale.exp() * dist2
             slot_bias = slot_bias.masked_fill(~slot_mask.unsqueeze(1), -1e4)
             full_bias = torch.zeros(
                 batch_size,

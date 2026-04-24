@@ -16,10 +16,11 @@ from .graph_modules import (
     build_slot_conditioning,
     embedding_alignment_loss,
     inverse_relation_regularizer,
+    log_sigma_loss,
     pooled_label_embeddings,
     relation_loss,
 )
-from .graph_targets import bbox_centers_after_crop
+from .graph_targets import bbox_centers_after_crop, bbox_log_sigmas_after_crop
 from .metrics import MetricsLogger, write_split_manifest
 from .scene_graph import build_batched_scene_graphs
 from .train_sd15_lora import (
@@ -43,6 +44,7 @@ def _save_state(output_dir: Path, *, step: int, args: argparse.Namespace) -> Non
         "relation_loss_weight": args.relation_loss_weight,
         "embedding_loss_weight": args.embedding_loss_weight,
         "inverse_relation_loss_weight": args.inverse_relation_loss_weight,
+        "box_loss_weight": args.box_loss_weight,
     }
     (output_dir / "training_state.json").write_text(json.dumps(payload, indent=2))
 
@@ -88,6 +90,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--relation-loss-weight", type=float, default=1.0)
     parser.add_argument("--embedding-loss-weight", type=float, default=0.25)
     parser.add_argument("--inverse-relation-loss-weight", type=float, default=0.0)
+    parser.add_argument("--box-loss-weight", type=float, default=0.0)
     parser.add_argument("--disable-tqdm", action="store_true")
     return parser
 
@@ -103,9 +106,16 @@ def _compute_graph_batch_losses(
     relation_loss_weight: float,
     embedding_loss_weight: float,
     inverse_relation_loss_weight: float,
+    box_loss_weight: float,
 ) -> dict[str, torch.Tensor]:
     max_nodes = max(len(graph["nodes"]) for graph in batch["scene_graphs"])  # type: ignore[index]
     slot_targets, slot_mask = bbox_centers_after_crop(
+        batch["metadata"],  # type: ignore[arg-type]
+        batch["image_sizes"],  # type: ignore[arg-type]
+        max_nodes=max_nodes,
+        device=torch.device(device),
+    )
+    log_sigma_targets, _ = bbox_log_sigmas_after_crop(
         batch["metadata"],  # type: ignore[arg-type]
         batch["image_sizes"],  # type: ignore[arg-type]
         max_nodes=max_nodes,
@@ -145,12 +155,18 @@ def _compute_graph_batch_losses(
         pooled_embeddings,
         conditioning.slot_mask,
     )
+    box_loss = log_sigma_loss(
+        conditioning.slot_log_sigmas,
+        log_sigma_targets,
+        conditioning.slot_mask,
+    )
     inverse_loss = inverse_relation_regularizer(graph_encoder)
     total_loss = (
         position_loss_weight * position_loss
         + relation_loss_weight * edge_loss
         + embedding_loss_weight * semantic_loss
         + inverse_relation_loss_weight * inverse_loss
+        + box_loss_weight * box_loss
     )
     return {
         "loss": total_loss,
@@ -158,6 +174,7 @@ def _compute_graph_batch_losses(
         "relation_loss": edge_loss,
         "embedding_loss": semantic_loss,
         "inverse_relation_loss": inverse_loss,
+        "box_loss": box_loss,
     }
 
 
@@ -173,6 +190,7 @@ def _evaluate_graph_encoder(
     relation_loss_weight: float,
     embedding_loss_weight: float,
     inverse_relation_loss_weight: float,
+    box_loss_weight: float,
 ) -> dict[str, float]:
     graph_encoder.eval()
     totals = {
@@ -181,6 +199,7 @@ def _evaluate_graph_encoder(
         "relation_loss": 0.0,
         "embedding_loss": 0.0,
         "inverse_relation_loss": 0.0,
+        "box_loss": 0.0,
     }
     batch_count = 0
     for batch in dataloader:
@@ -194,6 +213,7 @@ def _evaluate_graph_encoder(
             relation_loss_weight=relation_loss_weight,
             embedding_loss_weight=embedding_loss_weight,
             inverse_relation_loss_weight=inverse_relation_loss_weight,
+            box_loss_weight=box_loss_weight,
         )
         for key in totals:
             totals[key] += float(metrics[key].item())
@@ -285,6 +305,7 @@ def main() -> int:
             "relation_loss",
             "embedding_loss",
             "inverse_relation_loss",
+            "box_loss",
         ],
     )
     progress_bar = tqdm(
@@ -300,6 +321,7 @@ def main() -> int:
         "relation_loss": 0.0,
         "embedding_loss": 0.0,
         "inverse_relation_loss": 0.0,
+        "box_loss": 0.0,
     }
     running_steps = 0
     while global_step < args.max_train_steps:
@@ -311,10 +333,11 @@ def main() -> int:
                 graph_encoder=graph_encoder,
                 device=device,
                 position_loss_weight=args.position_loss_weight,
-            relation_loss_weight=args.relation_loss_weight,
-            embedding_loss_weight=args.embedding_loss_weight,
-            inverse_relation_loss_weight=args.inverse_relation_loss_weight,
-        )
+                relation_loss_weight=args.relation_loss_weight,
+                embedding_loss_weight=args.embedding_loss_weight,
+                inverse_relation_loss_weight=args.inverse_relation_loss_weight,
+                box_loss_weight=args.box_loss_weight,
+            )
             loss = metrics["loss"]
 
             if not torch.isfinite(loss):
@@ -341,6 +364,7 @@ def main() -> int:
                     "relation_loss": running["relation_loss"] / running_steps,
                     "embedding_loss": running["embedding_loss"] / running_steps,
                     "inverse_relation_loss": running["inverse_relation_loss"] / running_steps,
+                    "box_loss": running["box_loss"] / running_steps,
                 }
                 metrics_logger.log(train_log)
                 progress_bar.set_postfix(
@@ -348,6 +372,7 @@ def main() -> int:
                     rel=f"{train_log['relation_loss']:.4f}",
                     sem=f"{train_log['embedding_loss']:.4f}",
                     inv=f"{train_log['inverse_relation_loss']:.4f}",
+                    box=f"{train_log['box_loss']:.4f}",
                 )
                 running = {key: 0.0 for key in running}
                 running_steps = 0
@@ -363,10 +388,11 @@ def main() -> int:
                         graph_encoder=graph_encoder,
                         device=device,
                         position_loss_weight=args.position_loss_weight,
-                            relation_loss_weight=args.relation_loss_weight,
-                            embedding_loss_weight=args.embedding_loss_weight,
-                            inverse_relation_loss_weight=args.inverse_relation_loss_weight,
-                        ),
+                        relation_loss_weight=args.relation_loss_weight,
+                        embedding_loss_weight=args.embedding_loss_weight,
+                        inverse_relation_loss_weight=args.inverse_relation_loss_weight,
+                        box_loss_weight=args.box_loss_weight,
+                    ),
                 }
                 metrics_logger.log(eval_log)
                 print(
@@ -375,7 +401,8 @@ def main() -> int:
                     f"pos={eval_log['position_loss']:.4f}, "
                     f"rel={eval_log['relation_loss']:.4f}, "
                     f"sem={eval_log['embedding_loss']:.4f}, "
-                    f"inv={eval_log['inverse_relation_loss']:.4f}"
+                    f"inv={eval_log['inverse_relation_loss']:.4f}, "
+                    f"box={eval_log['box_loss']:.4f}"
                 )
 
             if global_step % args.save_every == 0:
@@ -411,6 +438,7 @@ def main() -> int:
                 relation_loss_weight=args.relation_loss_weight,
                 embedding_loss_weight=args.embedding_loss_weight,
                 inverse_relation_loss_weight=args.inverse_relation_loss_weight,
+                box_loss_weight=args.box_loss_weight,
             ),
         }
         metrics_logger.log(test_log)
@@ -420,7 +448,8 @@ def main() -> int:
             f"(pos={test_log['position_loss']:.4f}, "
             f"rel={test_log['relation_loss']:.4f}, "
             f"sem={test_log['embedding_loss']:.4f}, "
-            f"inv={test_log['inverse_relation_loss']:.4f})"
+            f"inv={test_log['inverse_relation_loss']:.4f}, "
+            f"box={test_log['box_loss']:.4f})"
         )
     _save_state(args.output_dir, step=global_step, args=args)
     print(f"Graph pretraining finished at step {global_step}.")

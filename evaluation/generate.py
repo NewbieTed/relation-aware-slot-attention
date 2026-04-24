@@ -241,7 +241,7 @@ def build_relation_aware_conditioning(
     pipeline: Any,
     graph_encoder: GraphSlotEncoder,
     device: str,
-) -> tuple[torch.Tensor, torch.Tensor, int]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
     scene_graph = parse_prompt_to_scene_graph(prompt)
     node_count = len(scene_graph["nodes"])
     slot_targets = torch.zeros(1, node_count, 3, device=device)
@@ -261,6 +261,7 @@ def build_relation_aware_conditioning(
     return (
         conditioning.slot_embeddings,
         conditioning.slot_positions,
+        conditioning.slot_log_sigmas,
         int(node_count),
     )
 
@@ -470,7 +471,7 @@ def main() -> int:
                     negative_prompt=None,
                 )
                 text_token_count = int(prompt_embeds.shape[1])
-                slot_embeddings, slot_positions, _ = build_relation_aware_conditioning(
+                slot_embeddings, slot_positions, slot_log_sigmas, _ = build_relation_aware_conditioning(
                     prompt=prompt,
                     pipeline=pipeline,
                     graph_encoder=graph_encoder,
@@ -486,6 +487,7 @@ def main() -> int:
                     negative_prompt_embeds = torch.cat([negative_prompt_embeds, zero_slots], dim=1)
                 cross_attention_kwargs = {
                     "slot_positions": slot_positions.repeat_interleave(args.num_images_per_prompt, dim=0),
+                    "slot_log_sigmas": slot_log_sigmas.repeat_interleave(args.num_images_per_prompt, dim=0),
                     "slot_mask": torch.ones(
                         args.num_images_per_prompt,
                         slot_positions.shape[1],

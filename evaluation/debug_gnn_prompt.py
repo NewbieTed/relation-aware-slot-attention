@@ -232,6 +232,7 @@ def _build_debug_payload(
 
     slot_embeddings = graph_encoder.slot_out(sample_states)
     slot_positions = graph_encoder.position_head(sample_states)
+    slot_log_sigmas = graph_encoder.log_sigma_head(sample_states).clamp(min=-4.0, max=1.0)
 
     predicted_relations: list[dict[str, Any]] = []
     for source_idx, target_idx, relation_name in batched_graph.relation_triplets[0]:
@@ -276,6 +277,14 @@ def _build_debug_payload(
         },
         "predicted_slot_positions": {
             node_labels[node_index]: _tensor_to_list(slot_positions[node_index])
+            for node_index in range(len(node_labels))
+        },
+        "predicted_slot_log_sigmas": {
+            node_labels[node_index]: _tensor_to_list(slot_log_sigmas[node_index])
+            for node_index in range(len(node_labels))
+        },
+        "predicted_slot_sigmas": {
+            node_labels[node_index]: _tensor_to_list(slot_log_sigmas[node_index].exp())
             for node_index in range(len(node_labels))
         },
         "predicted_relation_deltas": predicted_relations,
@@ -398,6 +407,16 @@ def _render_text_report(payload: dict[str, Any], *, max_vector_elements: int) ->
         tensor_values = torch.tensor(values)
         lines.append(
             f"  {label}: ({tensor_values[0]:+.4f}, {tensor_values[1]:+.4f}, {tensor_values[2]:+.4f})"
+        )
+    lines.append("")
+
+    lines.append("Predicted log-sigma and sigma spreads:")
+    for label, values in payload["predicted_slot_log_sigmas"].items():
+        log_values = torch.tensor(values)
+        sigma_values = torch.tensor(payload["predicted_slot_sigmas"][label])
+        lines.append(
+            f"  {label}: log_sigma=({log_values[0]:+.4f}, {log_values[1]:+.4f}), "
+            f"sigma=({sigma_values[0]:+.4f}, {sigma_values[1]:+.4f})"
         )
     lines.append("")
 

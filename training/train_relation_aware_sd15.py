@@ -24,10 +24,11 @@ from .graph_modules import (
     build_slot_conditioning,
     embedding_alignment_loss,
     inverse_relation_regularizer,
+    log_sigma_loss,
     pooled_label_embeddings,
     relation_loss,
 )
-from .graph_targets import bbox_centers_after_crop
+from .graph_targets import bbox_centers_after_crop, bbox_log_sigmas_after_crop
 from .metrics import MetricsLogger, write_split_manifest
 from .relation_attention import install_relation_aware_processors
 from .scene_graph import build_batched_scene_graphs
@@ -67,6 +68,7 @@ def _save_state(
         "slot_usage_target": args.slot_usage_target,
         "object_token_dropout_prob": args.object_token_dropout_prob,
         "inverse_relation_loss_weight": args.inverse_relation_loss_weight,
+        "box_loss_weight": args.box_loss_weight,
         "init_graph_encoder": str(args.init_graph_encoder) if args.init_graph_encoder else None,
         "freeze_graph_encoder": args.freeze_graph_encoder,
         "full_unet_finetune": args.full_unet_finetune,
@@ -142,6 +144,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--slot-usage-target", type=float, default=0.02)
     parser.add_argument("--object-token-dropout-prob", type=float, default=0.0)
     parser.add_argument("--inverse-relation-loss-weight", type=float, default=0.0)
+    parser.add_argument("--box-loss-weight", type=float, default=0.0)
     parser.add_argument("--init-graph-encoder", type=Path, default=None)
     parser.add_argument("--freeze-graph-encoder", action="store_true")
     parser.add_argument("--full-unet-finetune", action="store_true")
@@ -205,6 +208,7 @@ def _build_relation_aware_losses(
     slot_usage_loss_weight: float,
     slot_usage_target: float,
     inverse_relation_loss_weight: float,
+    box_loss_weight: float,
     relation_attention_processors: dict[str, torch.nn.Module],
     object_token_dropout_prob: float = 0.0,
     apply_object_token_dropout: bool = False,
@@ -256,6 +260,12 @@ def _build_relation_aware_losses(
         max_nodes=max_nodes,
         device=torch.device(device),
     )
+    log_sigma_targets, _ = bbox_log_sigmas_after_crop(
+        batch["metadata"],
+        batch["image_sizes"],
+        max_nodes=max_nodes,
+        device=torch.device(device),
+    )
     scene_graph_batch = build_batched_scene_graphs(
         batch["scene_graphs"],
         slot_targets=slot_targets,
@@ -287,6 +297,7 @@ def _build_relation_aware_losses(
             encoder_hidden_states=encoder_hidden_states,
             cross_attention_kwargs={
                 "slot_positions": conditioning.slot_positions,
+                "slot_log_sigmas": conditioning.slot_log_sigmas,
                 "slot_mask": conditioning.slot_mask,
                 "text_token_count": text_hidden_states.shape[1],
             },
@@ -304,6 +315,11 @@ def _build_relation_aware_losses(
         semantic_loss = embedding_alignment_loss(
             conditioning.slot_embeddings,
             pooled_embeddings,
+            conditioning.slot_mask,
+        )
+        box_loss = log_sigma_loss(
+            conditioning.slot_log_sigmas,
+            log_sigma_targets,
             conditioning.slot_mask,
         )
         inverse_relation_loss_value = inverse_relation_regularizer(graph_encoder)
@@ -343,6 +359,7 @@ def _build_relation_aware_losses(
             + attention_pixel_loss_weight * attention_pixel_loss
             + slot_usage_loss_weight * slot_usage_loss
             + inverse_relation_loss_weight * inverse_relation_loss_value
+            + box_loss_weight * box_loss
         )
     return {
         "loss": loss,
@@ -355,6 +372,7 @@ def _build_relation_aware_losses(
         "slot_usage_loss": slot_usage_loss,
         "slot_usage_pct": slot_usage * 100.0,
         "inverse_relation_loss": inverse_relation_loss_value,
+        "box_loss": box_loss,
         "attention_debug": attention_debug,
     }
 
@@ -380,6 +398,7 @@ def _evaluate_relation_aware(
     slot_usage_loss_weight: float,
     slot_usage_target: float,
     inverse_relation_loss_weight: float,
+    box_loss_weight: float,
     relation_attention_processors: dict[str, torch.nn.Module],
 ) -> dict[str, float]:
     graph_encoder.eval()
@@ -395,6 +414,7 @@ def _evaluate_relation_aware(
         "slot_usage_loss": 0.0,
         "slot_usage_pct": 0.0,
         "inverse_relation_loss": 0.0,
+        "box_loss": 0.0,
     }
     batch_count = 0
     for batch in dataloader:
@@ -417,6 +437,7 @@ def _evaluate_relation_aware(
             slot_usage_loss_weight=slot_usage_loss_weight,
             slot_usage_target=slot_usage_target,
             inverse_relation_loss_weight=inverse_relation_loss_weight,
+            box_loss_weight=box_loss_weight,
             relation_attention_processors=relation_attention_processors,
         )
         for key in totals:
@@ -577,6 +598,7 @@ def main() -> int:
             "slot_usage_loss",
             "slot_usage_pct",
             "inverse_relation_loss",
+            "box_loss",
         ],
     )
 
@@ -600,6 +622,7 @@ def main() -> int:
         "slot_usage_loss": 0.0,
         "slot_usage_pct": 0.0,
         "inverse_relation_loss": 0.0,
+        "box_loss": 0.0,
     }
     running_updates = 0
     attention_debug_printed = False
@@ -625,6 +648,7 @@ def main() -> int:
                 slot_usage_loss_weight=args.slot_usage_loss_weight,
                 slot_usage_target=args.slot_usage_target,
                 inverse_relation_loss_weight=args.inverse_relation_loss_weight,
+                box_loss_weight=args.box_loss_weight,
                 relation_attention_processors=relation_attention_processors,
                 object_token_dropout_prob=args.object_token_dropout_prob,
                 apply_object_token_dropout=True,
@@ -689,6 +713,7 @@ def main() -> int:
                         "slot_usage_loss": running["slot_usage_loss"] / running_updates,
                         "slot_usage_pct": running["slot_usage_pct"] / running_updates,
                         "inverse_relation_loss": running["inverse_relation_loss"] / running_updates,
+                        "box_loss": running["box_loss"] / running_updates,
                     }
                     metrics_logger.log(train_log)
                     progress_bar.set_postfix(
@@ -722,6 +747,7 @@ def main() -> int:
                             slot_usage_loss_weight=args.slot_usage_loss_weight,
                             slot_usage_target=args.slot_usage_target,
                             inverse_relation_loss_weight=args.inverse_relation_loss_weight,
+                            box_loss_weight=args.box_loss_weight,
                             relation_attention_processors=relation_attention_processors,
                         ),
                     }
@@ -736,7 +762,8 @@ def main() -> int:
                         f"attn_token={eval_log['attention_token_loss']:.4f}, "
                         f"attn_pixel={eval_log['attention_pixel_loss']:.4f}, "
                         f"slot_use={eval_log['slot_usage_pct']:.2f}%, "
-                        f"inv_rel={eval_log['inverse_relation_loss']:.4f}"
+                        f"inv_rel={eval_log['inverse_relation_loss']:.4f}, "
+                        f"box={eval_log['box_loss']:.4f}"
                     )
 
                 if global_step % args.save_every == 0:
@@ -800,6 +827,7 @@ def main() -> int:
                 slot_usage_loss_weight=args.slot_usage_loss_weight,
                 slot_usage_target=args.slot_usage_target,
                 inverse_relation_loss_weight=args.inverse_relation_loss_weight,
+                box_loss_weight=args.box_loss_weight,
                 relation_attention_processors=relation_attention_processors,
             ),
         }
@@ -814,7 +842,8 @@ def main() -> int:
             f"attn_token={test_log['attention_token_loss']:.4f}, "
             f"attn_pixel={test_log['attention_pixel_loss']:.4f}, "
             f"slot_use={test_log['slot_usage_pct']:.2f}%, "
-            f"inv_rel={test_log['inverse_relation_loss']:.4f})"
+            f"inv_rel={test_log['inverse_relation_loss']:.4f}, "
+            f"box={test_log['box_loss']:.4f})"
         )
     _save_state(args.output_dir, step=global_step, args=args, validation_prompts=validation_prompts)
     print(f"Relation-aware training finished at step {global_step}.")
