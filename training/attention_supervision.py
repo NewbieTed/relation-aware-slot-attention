@@ -201,3 +201,51 @@ def compute_mean_slot_usage(attention_maps: dict[tuple[int, int], list[torch.Ten
             device = torch.device("cpu")
         return torch.zeros((), device=device, dtype=torch.float32)
     return torch.cat(slot_masses, dim=0).to(dtype=torch.float32).mean()
+
+
+def compute_region_slot_loss(
+    *,
+    attention_maps: dict[tuple[int, int], list[torch.Tensor]],
+    metadata: list[dict[str, Any]],
+    image_sizes: list[tuple[int, int]],
+    slot_mask: torch.Tensor,
+    device: torch.device,
+    target_usage: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Encourage each object region to attend to its matching appended slot token.
+
+    Unlike global slot-usage regularization, this only measures attention inside
+    the object's target region. A slot is rewarded when pixels in its bbox assign
+    at least ``target_usage`` probability mass to that slot.
+    """
+    region_usages: list[torch.Tensor] = []
+    valid_slot_mask = slot_mask.to(device=device, dtype=torch.bool)
+    eps = 1e-6
+
+    for resolution, maps_at_resolution in attention_maps.items():
+        target_masks = build_slot_target_masks(
+            metadata=metadata,
+            image_sizes=image_sizes,
+            slot_mask=slot_mask,
+            resolution=resolution,
+            device=device,
+        )
+        mask_area = target_masks.flatten(2).sum(dim=-1)
+        valid_mask = valid_slot_mask & (mask_area > 0)
+        if not valid_mask.any():
+            continue
+
+        for attn_map in maps_at_resolution:
+            attn_by_slot = attn_map.to(dtype=torch.float32).permute(0, 3, 1, 2)
+            attention_inside_region = (attn_by_slot * target_masks).flatten(2).sum(dim=-1)
+            region_usage = attention_inside_region / mask_area.clamp_min(eps)
+            region_usages.append(region_usage[valid_mask])
+
+    if not region_usages:
+        zero = slot_mask.new_tensor(0.0, dtype=torch.float32)
+        return zero, zero
+
+    usage = torch.cat(region_usages, dim=0)
+    target = usage.new_tensor(target_usage)
+    loss = F.relu(target - usage).pow(2).mean()
+    return loss, usage.mean() * 100.0
