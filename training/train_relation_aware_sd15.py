@@ -322,8 +322,8 @@ def _build_relation_aware_losses(
             )
         region_slot_loss, region_slot_usage_pct = compute_region_slot_loss(
             attention_maps=attention_maps,
-            metadata=batch["metadata"],
-            image_sizes=batch["image_sizes"],
+            slot_centers=slot_targets,
+            slot_log_sigmas=log_sigma_targets,
             slot_mask=conditioning.slot_mask,
             device=torch.device(device),
             target_usage=region_slot_target,
