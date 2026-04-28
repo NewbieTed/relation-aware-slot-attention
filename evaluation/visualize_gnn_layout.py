@@ -404,10 +404,15 @@ def main() -> int:
 
     rows = load_metadata_rows(args.dataset_dir)
     row_index, row = _find_row(prompt=args.prompt, rows=rows, row_index=args.row_index)
-    prompt = args.prompt
+    prompt = prompt_from_scop_depth_row(row) if args.row_index is not None else args.prompt
     scene_graph = scene_graph_payload_from_row(row)
-    parsed_prompt_graph = parse_prompt_to_scene_graph(prompt)
-    if parsed_prompt_graph["edges"][0]["relation"] not in {
+    prompt_relation: str | None = None
+    try:
+        parsed_prompt_graph = parse_prompt_to_scene_graph(prompt)
+        prompt_relation = parsed_prompt_graph["edges"][0]["relation"]
+    except ValueError:
+        prompt_relation = None
+    if prompt_relation is not None and prompt_relation not in {
         edge["relation"] for edge in scene_graph["edges"]
     }:
         print(
