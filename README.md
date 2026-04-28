@@ -19,6 +19,15 @@ weights.
 If you previously used an older bootstrap version that created
 `scripts/.venv`, remove that stale environment first.
 
+## Evaluation Notes
+
+Do not run two evaluations into the same output directory at the same time.
+The T2I-CompBench wrappers write benchmark inputs, generated samples, and score
+files under the requested output path, so parallel 2D/3D jobs can overwrite each
+other if they share a folder. Use distinct output directories for every
+benchmark type, model checkpoint, and repeat group, for example one path ending
+in `_spatial_2d` and another ending in `_spatial_3d`.
+
 ## Training Baseline
 
 The repo now also contains a first training scaffold for a vanilla Stable
