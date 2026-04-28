@@ -51,9 +51,12 @@ This baseline intentionally keeps the model text-only at conditioning time while
 still carrying scene-graph metadata through the dataloader so the next stage can
 replace or augment text conditioning with graph-aware slots.
 
-If `metadata.jsonl` exists but `data/scop_depth_full/images/` is missing because
-the original COCO tree was moved or deleted, you can rebuild just the referenced
-image subset without rerunning SCOP-Depth:
+New SCOP-Depth exports create CoMPaSS-style pair crops by default, so each
+training row points to a crop around the selected object pair. If you explicitly
+used `--no-crop-pairs` and `metadata.jsonl` exists but
+`data/scop_depth_full/images/` is missing because the original COCO tree was
+moved or deleted, you can rebuild just the referenced full-image subset without
+rerunning SCOP-Depth:
 
 ```bash
 ./.venv/bin/python -m training.materialize_images \
