@@ -21,10 +21,12 @@ If you previously used an older bootstrap version that created
 
 ## Evaluation Notes
 
-Do not run two evaluations into the same output directory at the same time.
-The T2I-CompBench wrappers write benchmark inputs, generated samples, and score
-files under the requested output path, so parallel 2D/3D jobs can overwrite each
-other if they share a folder. Use distinct output directories for every
+Do not run two T2I-CompBench evaluations in parallel from the same checkout.
+Our wrappers point at a shared external T2I-CompBench workspace, and that
+benchmark code uses shared intermediate files/state while scoring. Because of
+that, concurrent 2D/3D jobs can corrupt or overwrite each other's benchmark
+state even if their final output directories are different. Run these
+evaluations serially, and still use distinct output directories for every
 benchmark type, model checkpoint, and repeat group, for example one path ending
 in `_spatial_2d` and another ending in `_spatial_3d`.
 
