@@ -263,12 +263,17 @@ def relation_loss(
                 sample_losses.append(F.relu(0.1 - delta[1]))
             elif relation == "below":
                 sample_losses.append(F.relu(0.1 + delta[1]))
-            elif relation in {"in_front_of", "hidden_by"}:
-                sample_losses.append(F.relu(0.05 - delta[2]))
-            elif relation == "behind":
+            elif relation == "in_front_of":
+                # Larger z = closer (inverse depth); A in_front_of B → A.z > B.z → delta[2] < 0
                 sample_losses.append(F.relu(0.05 + delta[2]))
+            elif relation in {"behind", "hidden_by"}:
+                # A behind/hidden_by B → B closer → B.z > A.z → delta[2] > 0
+                sample_losses.append(F.relu(0.05 - delta[2]))
             elif relation == "on":
-                sample_losses.append(F.relu(delta[1].abs() - 0.2))
+                # A on B → A above B (delta[1] > 0) and not too far above (delta[1] < 0.5)
+                sample_losses.append(
+                    (F.relu(0.1 - delta[1]) + F.relu(delta[1] - 0.5)) / 2.0
+                )
         if sample_losses:
             losses.append(torch.stack(sample_losses).mean())
     if not losses:
