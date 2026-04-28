@@ -29,6 +29,10 @@ INVERSE_RELATION = {
     "hidden_by": "in_front_of",
 }
 
+assert set(RELATION_VOCAB) <= set(INVERSE_RELATION), (
+    f"INVERSE_RELATION is missing entries for: {set(RELATION_VOCAB) - set(INVERSE_RELATION)}"
+)
+
 
 @dataclass(frozen=True)
 class BatchedSceneGraphs:
