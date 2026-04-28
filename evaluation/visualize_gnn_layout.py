@@ -16,7 +16,7 @@ from training.dataset import load_metadata_rows
 from training.graph_modules import build_slot_conditioning
 from training.graph_targets import bbox_centers_after_crop, bbox_log_sigmas_after_crop
 from training.prompts import prompt_from_scop_depth_row, scene_graph_payload_from_row
-from training.scene_graph import build_batched_scene_graphs
+from training.scene_graph import INVERSE_RELATION, build_batched_scene_graphs
 
 
 CANVAS_SIZE = 512
@@ -110,6 +110,34 @@ def _find_row(
         "Could not find an exact prompt match in metadata.jsonl. "
         "Pass --row-index to visualize a specific metadata row."
     )
+
+
+def _edges_with_inverses(scene_graph: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return raw graph edges plus the inverse edges used for message passing."""
+
+    edges: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for edge in scene_graph["edges"]:
+        forward = (edge["source_id"], edge["target_id"], edge["relation"])
+        inverse = (
+            edge["target_id"],
+            edge["source_id"],
+            INVERSE_RELATION[edge["relation"]],
+        )
+        for source_id, target_id, relation in (forward, inverse):
+            key = (source_id, target_id, relation)
+            if key in seen:
+                continue
+            seen.add(key)
+            edges.append(
+                {
+                    "source_id": source_id,
+                    "target_id": target_id,
+                    "relation": relation,
+                    "is_inverse": key == inverse,
+                }
+            )
+    return edges
 
 
 def _to_float_list(tensor: torch.Tensor) -> list[float]:
@@ -206,21 +234,23 @@ def _render_scene_graph(
         draw.text((x - 55, y - 12), str(node["label"]), font=font, fill=color)
         draw.text((x - 25, y + 18), str(node["id"]), font=small, fill="#334e68")
 
-    for edge in scene_graph["edges"]:
+    for edge_index, edge in enumerate(_edges_with_inverses(scene_graph)):
         src_idx = 0 if edge["source_id"] == nodes[0]["id"] else 1
         dst_idx = 0 if edge["target_id"] == nodes[0]["id"] else 1
         sx, sy = positions[src_idx]
         dx, dy = positions[dst_idx]
-        start = (sx + (80 if dx > sx else -80), sy)
-        end = (dx - (80 if dx > sx else -80), dy)
-        draw.line([start, end], fill="#111827", width=4)
+        curve_offset = -36 if edge_index % 2 == 0 else 36
+        start = (sx + (80 if dx > sx else -80), sy + curve_offset)
+        end = (dx - (80 if dx > sx else -80), dy + curve_offset)
+        line_color = "#111827" if not edge.get("is_inverse") else "#6b7280"
+        draw.line([start, end], fill=line_color, width=4)
         angle = math.atan2(end[1] - start[1], end[0] - start[0])
         arrow_len = 18
         for sign in (-1, 1):
             theta = angle + sign * 2.55
             arrow = (end[0] + arrow_len * math.cos(theta), end[1] + arrow_len * math.sin(theta))
-            draw.line([end, arrow], fill="#111827", width=4)
-        mid = ((start[0] + end[0]) // 2 - 70, (start[1] + end[1]) // 2 - 34)
+            draw.line([end, arrow], fill=line_color, width=4)
+        mid = ((start[0] + end[0]) // 2 - 86, (start[1] + end[1]) // 2 - 28)
         _draw_text_block(draw, [str(edge["relation"])], mid, small, background="#111827")
 
     image.save(output_path)
@@ -347,7 +377,13 @@ def _build_report(
     for node in scene_graph["nodes"]:
         lines.append(f"  Node {node['id']}: {node['label']}")
     for edge in scene_graph["edges"]:
-        lines.append(f"  Edge {edge['source_id']} -> {edge['target_id']}: {edge['relation']}")
+        lines.append(f"  Dataset edge {edge['source_id']} -> {edge['target_id']}: {edge['relation']}")
+    lines.append("Effective message-passing edges:")
+    for edge in _edges_with_inverses(scene_graph):
+        kind = "inverse" if edge["is_inverse"] else "forward"
+        lines.append(
+            f"  {kind} edge {edge['source_id']} -> {edge['target_id']}: {edge['relation']}"
+        )
     lines.append("")
     lines.append("Centers and sigmas use normalized image/latent coordinates.")
     lines.append("x,y are in [-1,1]. sigma values are normalized ellipse radii.")
