@@ -211,13 +211,19 @@ def compute_region_slot_loss(
     slot_mask: torch.Tensor,
     device: torch.device,
     target_usage: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Encourage each soft object region to attend to its matching appended slot.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Bind object regions to their matching appended slots.
 
-    Unlike global slot-usage regularization, this only measures attention inside
-    the object's target region. The region is a soft ellipse from the bbox-derived
-    center and sigma targets, matching the geometry used by the attention bias.
+    Inside object i's target ellipse, slot i should dominate over the other
+    slots. Outside that ellipse, slot i should not receive high attention. The
+    target_usage argument is kept for CLI/backward compatibility and is not used
+    by this contrastive objective.
     """
+    del target_usage
+
+    pos_losses: list[torch.Tensor] = []
+    neg_in_losses: list[torch.Tensor] = []
+    neg_out_losses: list[torch.Tensor] = []
     region_usages: list[torch.Tensor] = []
     valid_slot_mask = slot_mask.to(device=device, dtype=torch.bool)
     eps = 1e-6
@@ -236,21 +242,41 @@ def compute_region_slot_loss(
         target_regions = target_regions * valid_slot_mask[:, :, None, None].to(dtype=torch.float32)
 
         mask_area = target_regions.flatten(2).sum(dim=-1)
+        outside_regions = (1.0 - target_regions).clamp(min=0.0)
+        outside_regions = outside_regions * valid_slot_mask[:, :, None, None].to(dtype=torch.float32)
+        outside_area = outside_regions.flatten(2).sum(dim=-1)
         valid_mask = valid_slot_mask & (mask_area > 0)
         if not valid_mask.any():
             continue
 
         for attn_map in maps_at_resolution:
             attn_by_slot = attn_map.to(dtype=torch.float32).permute(0, 3, 1, 2)
-            attention_inside_region = (attn_by_slot * target_regions).flatten(2).sum(dim=-1)
-            region_usage = attention_inside_region / mask_area.clamp_min(eps)
-            region_usages.append(region_usage[valid_mask])
+            attn_by_slot = attn_by_slot * valid_slot_mask[:, :, None, None].to(dtype=torch.float32)
+            slot_prob = attn_by_slot / attn_by_slot.sum(dim=1, keepdim=True).clamp_min(eps)
 
-    if not region_usages:
+            correct_slot_prob = (slot_prob * target_regions).flatten(2).sum(dim=-1)
+            correct_slot_prob = correct_slot_prob / mask_area.clamp_min(eps)
+            pos_losses.append(-torch.log(correct_slot_prob[valid_mask].clamp_min(eps)).mean())
+            region_usages.append(correct_slot_prob[valid_mask])
+
+            total_slot_prob_inside = (slot_prob.sum(dim=1, keepdim=True) * target_regions).flatten(2).sum(dim=-1)
+            total_slot_prob_inside = total_slot_prob_inside / mask_area.clamp_min(eps)
+            other_slot_prob = (total_slot_prob_inside - correct_slot_prob).clamp_min(0.0)
+            neg_in_losses.append(other_slot_prob[valid_mask].mean())
+
+            attention_outside_region = (attn_by_slot * outside_regions).flatten(2).sum(dim=-1)
+            outside_usage = attention_outside_region / outside_area.clamp_min(eps)
+            valid_outside_mask = valid_mask & (outside_area > 0)
+            if valid_outside_mask.any():
+                neg_out_losses.append(outside_usage[valid_outside_mask].mean())
+
+    if not pos_losses:
         zero = slot_mask.new_tensor(0.0, dtype=torch.float32)
-        return zero, zero
+        return zero, zero, zero, zero, zero
 
-    usage = torch.cat(region_usages, dim=0)
-    target = usage.new_tensor(target_usage)
-    loss = F.relu(target - usage).pow(2).mean()
-    return loss, usage.mean() * 100.0
+    pos_loss = torch.stack(pos_losses).mean()
+    neg_in_loss = torch.stack(neg_in_losses).mean() if neg_in_losses else pos_loss.new_tensor(0.0)
+    neg_out_loss = torch.stack(neg_out_losses).mean() if neg_out_losses else pos_loss.new_tensor(0.0)
+    loss = pos_loss + 0.5 * neg_in_loss + 0.1 * neg_out_loss
+    usage = torch.cat(region_usages, dim=0).mean() * 100.0
+    return loss, usage, pos_loss, neg_in_loss, neg_out_loss

@@ -320,7 +320,13 @@ def _build_relation_aware_losses(
             raise RuntimeError(
                 "Attention supervision was enabled, but no slot attention maps were captured."
             )
-        region_slot_loss, region_slot_usage_pct = compute_region_slot_loss(
+        (
+            region_slot_loss,
+            region_slot_usage_pct,
+            region_slot_pos_loss,
+            region_slot_neg_in_loss,
+            region_slot_neg_out_loss,
+        ) = compute_region_slot_loss(
             attention_maps=attention_maps,
             slot_centers=slot_targets,
             slot_log_sigmas=log_sigma_targets,
@@ -350,6 +356,9 @@ def _build_relation_aware_losses(
         "embedding_loss": semantic_loss,
         "region_slot_loss": region_slot_loss,
         "region_slot_usage_pct": region_slot_usage_pct,
+        "region_slot_pos_loss": region_slot_pos_loss,
+        "region_slot_neg_in_loss": region_slot_neg_in_loss,
+        "region_slot_neg_out_loss": region_slot_neg_out_loss,
         "inverse_relation_loss": inverse_relation_loss_value,
         "box_loss": box_loss,
     }
@@ -387,6 +396,9 @@ def _evaluate_relation_aware(
         "embedding_loss": 0.0,
         "region_slot_loss": 0.0,
         "region_slot_usage_pct": 0.0,
+        "region_slot_pos_loss": 0.0,
+        "region_slot_neg_in_loss": 0.0,
+        "region_slot_neg_out_loss": 0.0,
         "inverse_relation_loss": 0.0,
         "box_loss": 0.0,
     }
@@ -567,6 +579,9 @@ def main() -> int:
             "embedding_loss",
             "region_slot_loss",
             "region_slot_usage_pct",
+            "region_slot_pos_loss",
+            "region_slot_neg_in_loss",
+            "region_slot_neg_out_loss",
             "inverse_relation_loss",
             "box_loss",
         ],
@@ -589,6 +604,9 @@ def main() -> int:
         "embedding_loss": 0.0,
         "region_slot_loss": 0.0,
         "region_slot_usage_pct": 0.0,
+        "region_slot_pos_loss": 0.0,
+        "region_slot_neg_in_loss": 0.0,
+        "region_slot_neg_out_loss": 0.0,
         "inverse_relation_loss": 0.0,
         "box_loss": 0.0,
     }
@@ -655,6 +673,9 @@ def main() -> int:
                         "embedding_loss": running["embedding_loss"] / running_updates,
                         "region_slot_loss": running["region_slot_loss"] / running_updates,
                         "region_slot_usage_pct": running["region_slot_usage_pct"] / running_updates,
+                        "region_slot_pos_loss": running["region_slot_pos_loss"] / running_updates,
+                        "region_slot_neg_in_loss": running["region_slot_neg_in_loss"] / running_updates,
+                        "region_slot_neg_out_loss": running["region_slot_neg_out_loss"] / running_updates,
                         "inverse_relation_loss": running["inverse_relation_loss"] / running_updates,
                         "box_loss": running["box_loss"] / running_updates,
                     }
@@ -702,6 +723,9 @@ def main() -> int:
                         f"sem={eval_log['embedding_loss']:.4f}, "
                         f"region_slot_loss={eval_log['region_slot_loss']:.4f}, "
                         f"region_slot={eval_log['region_slot_usage_pct']:.2f}%, "
+                        f"region_pos={eval_log['region_slot_pos_loss']:.4f}, "
+                        f"region_neg_in={eval_log['region_slot_neg_in_loss']:.4f}, "
+                        f"region_neg_out={eval_log['region_slot_neg_out_loss']:.4f}, "
                         f"inv_rel={eval_log['inverse_relation_loss']:.4f}, "
                         f"box={eval_log['box_loss']:.4f}"
                     )
@@ -779,6 +803,9 @@ def main() -> int:
             f"sem={test_log['embedding_loss']:.4f}, "
             f"region_slot_loss={test_log['region_slot_loss']:.4f}, "
             f"region_slot={test_log['region_slot_usage_pct']:.2f}%, "
+            f"region_pos={test_log['region_slot_pos_loss']:.4f}, "
+            f"region_neg_in={test_log['region_slot_neg_in_loss']:.4f}, "
+            f"region_neg_out={test_log['region_slot_neg_out_loss']:.4f}, "
             f"inv_rel={test_log['inverse_relation_loss']:.4f}, "
             f"box={test_log['box_loss']:.4f})"
         )
