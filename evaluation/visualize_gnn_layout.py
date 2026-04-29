@@ -35,6 +35,12 @@ def make_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--graph-encoder-path", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--overlay-image",
+        type=Path,
+        default=None,
+        help="Optional generated image to annotate with predicted GNN bbox/ellipse regions.",
+    )
     parser.add_argument("--row-index", type=int, default=None)
     parser.add_argument("--model", choices=sorted(MODEL_REGISTRY.keys()), default="sd15")
     parser.add_argument("--model-id", type=str, default=None)
@@ -371,6 +377,54 @@ def _draw_overlay_on_crop(
     combined.save(output_path)
 
 
+def _draw_prediction_overlay_on_image(
+    *,
+    image_path: Path,
+    labels: list[str],
+    pred_centers: list[list[float]],
+    pred_sigmas: list[list[float]],
+    output_path: Path,
+) -> None:
+    image = Image.open(image_path).convert("RGB").resize((CANVAS_SIZE, CANVAS_SIZE), Image.Resampling.BICUBIC)
+    draw = ImageDraw.Draw(image)
+    font = _load_font(19)
+    small = _load_font(15)
+    colors = ["#00d5ff", "#ff3366", "#2a9d8f", "#f77f00"]
+    draw.rectangle([0, 0, CANVAS_SIZE, 38], fill="black")
+    draw.text((10, 9), "GNN predicted bbox + ellipse", font=font, fill="white")
+
+    for index, (center, sigma, label) in enumerate(zip(pred_centers, pred_sigmas, labels)):
+        px, py = _coord_to_px(center[0], center[1])
+        rx, ry = _sigma_to_px(sigma[0], sigma[1])
+        color = colors[index % len(colors)]
+        box = [px - rx, py - ry, px + rx, py + ry]
+        draw.rectangle(box, outline=color, width=3)
+        for expand in (0, 5):
+            draw.ellipse(
+                [box[0] - expand, box[1] - expand, box[2] + expand, box[3] + expand],
+                outline=color,
+                width=2,
+            )
+        draw.ellipse([px - 5, py - 5, px + 5, py + 5], fill=color, outline="black")
+        label_lines = [
+            label,
+            f"c=({center[0]:+.2f},{center[1]:+.2f})",
+            f"s=({sigma[0]:.2f},{sigma[1]:.2f})",
+        ]
+        label_x = max(4, min(CANVAS_SIZE - 150, int(px + 8)))
+        label_y = max(42, min(CANVAS_SIZE - 72, int(py + 8)))
+        _draw_text_block(
+            draw,
+            label_lines,
+            (label_x, label_y),
+            small,
+            fill="white",
+            background="black",
+        )
+
+    image.save(output_path)
+
+
 def _render_summary_image(
     *,
     prompt: str,
@@ -696,6 +750,16 @@ def main() -> int:
             pred_sigmas=pred_sigmas,
             output_path=args.output_dir / "predicted_layout.png",
         )
+    if args.overlay_image is not None:
+        if not args.overlay_image.exists():
+            raise FileNotFoundError(f"Missing overlay image: {args.overlay_image}")
+        _draw_prediction_overlay_on_image(
+            image_path=args.overlay_image,
+            labels=labels,
+            pred_centers=pred_centers,
+            pred_sigmas=pred_sigmas,
+            output_path=args.output_dir / "generated_overlay_prediction.png",
+        )
     _render_summary_image(
         prompt=prompt,
         report_lines=table_lines,
@@ -709,6 +773,8 @@ def main() -> int:
         print(f"Saved crop overlay comparison to {args.output_dir / 'crop_overlay_comparison.png'}")
     else:
         print(f"Saved predicted layout to {args.output_dir / 'predicted_layout.png'}")
+    if args.overlay_image is not None:
+        print(f"Saved generated-image overlay to {args.output_dir / 'generated_overlay_prediction.png'}")
     print(f"Saved summary image to {args.output_dir / 'gnn_layout_summary.png'}")
     return 0
 
