@@ -19,6 +19,17 @@ weights.
 If you previously used an older bootstrap version that created
 `scripts/.venv`, remove that stale environment first.
 
+## Evaluation Notes
+
+Do not run two T2I-CompBench evaluations in parallel from the same checkout.
+Our wrappers point at a shared external T2I-CompBench workspace, and that
+benchmark code uses shared intermediate files/state while scoring. Because of
+that, concurrent 2D/3D jobs can corrupt or overwrite each other's benchmark
+state even if their final output directories are different. Run these
+evaluations serially, and still use distinct output directories for every
+benchmark type, model checkpoint, and repeat group, for example one path ending
+in `_spatial_2d` and another ending in `_spatial_3d`.
+
 ## Training Baseline
 
 The repo now also contains a first training scaffold for a vanilla Stable
@@ -51,9 +62,12 @@ This baseline intentionally keeps the model text-only at conditioning time while
 still carrying scene-graph metadata through the dataloader so the next stage can
 replace or augment text conditioning with graph-aware slots.
 
-If `metadata.jsonl` exists but `data/scop_depth_full/images/` is missing because
-the original COCO tree was moved or deleted, you can rebuild just the referenced
-image subset without rerunning SCOP-Depth:
+New SCOP-Depth exports create CoMPaSS-style pair crops by default, so each
+training row points to a crop around the selected object pair. If you explicitly
+used `--no-crop-pairs` and `metadata.jsonl` exists but
+`data/scop_depth_full/images/` is missing because the original COCO tree was
+moved or deleted, you can rebuild just the referenced full-image subset without
+rerunning SCOP-Depth:
 
 ```bash
 ./.venv/bin/python -m training.materialize_images \

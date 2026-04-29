@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 from evaluation.prompt_parser import parse_prompt_to_scene_graph
 from training.graph_modules import GraphSlotEncoder, build_slot_conditioning
@@ -19,6 +19,98 @@ MODEL_REGISTRY = {
     "sd15": "runwayml/stable-diffusion-v1-5",
     "sd21": "stabilityai/stable-diffusion-2-1",
 }
+
+
+def _load_font(size: int) -> ImageFont.ImageFont:
+    try:
+        return ImageFont.truetype("DejaVuSans.ttf", size)
+    except IOError:
+        return ImageFont.load_default()
+
+
+def _coord_to_px(x: float, y: float, size: int) -> tuple[float, float]:
+    return (x + 1.0) * 0.5 * size, (y + 1.0) * 0.5 * size
+
+
+def _sigma_to_px(sigma_x: float, sigma_y: float, size: int) -> tuple[float, float]:
+    return sigma_x * size * 0.5, sigma_y * size * 0.5
+
+
+def _draw_text_block(
+    draw: ImageDraw.ImageDraw,
+    lines: list[str],
+    xy: tuple[int, int],
+    font: ImageFont.ImageFont,
+) -> None:
+    x, y = xy
+    padding = 6
+    gap = 3
+    boxes = [draw.textbbox((0, 0), line, font=font) for line in lines]
+    widths = [right - left for left, top, right, bottom in boxes]
+    heights = [bottom - top for left, top, right, bottom in boxes]
+    block_w = max(widths) + padding * 2
+    block_h = sum(heights) + gap * (len(lines) - 1) + padding * 2
+    draw.rectangle([x, y, x + block_w, y + block_h], fill="black")
+    cursor_y = y + padding
+    for line, height in zip(lines, heights):
+        draw.text((x + padding, cursor_y), line, font=font, fill="white")
+        cursor_y += height + gap
+
+
+def save_gnn_overlay(
+    *,
+    image: Image.Image,
+    prompt: str,
+    slot_positions: torch.Tensor,
+    slot_log_sigmas: torch.Tensor,
+    output_path: Path,
+) -> None:
+    scene_graph = parse_prompt_to_scene_graph(prompt)
+    labels = [str(node["label"]) for node in scene_graph["nodes"]]
+    overlay = image.convert("RGB").copy()
+    width, height = overlay.size
+    if width != height:
+        side = min(width, height)
+        left = (width - side) // 2
+        top = (height - side) // 2
+        overlay = overlay.crop((left, top, left + side, top + side))
+    size = overlay.size[0]
+    draw = ImageDraw.Draw(overlay)
+    font = _load_font(18)
+    small = _load_font(14)
+    colors = ["#00d5ff", "#ff3366", "#2a9d8f", "#f77f00"]
+
+    draw.rectangle([0, 0, size, 38], fill="black")
+    draw.text((10, 9), "GNN predicted bbox + ellipse", font=font, fill="white")
+
+    centers = slot_positions[0].detach().cpu().to(torch.float32).tolist()
+    sigmas = slot_log_sigmas[0].detach().cpu().to(torch.float32).exp().tolist()
+    for index, (label, center, sigma) in enumerate(zip(labels, centers, sigmas)):
+        px, py = _coord_to_px(float(center[0]), float(center[1]), size)
+        rx, ry = _sigma_to_px(float(sigma[0]), float(sigma[1]), size)
+        color = colors[index % len(colors)]
+        box = [px - rx, py - ry, px + rx, py + ry]
+        draw.rectangle(box, outline=color, width=3)
+        for expand in (0, 5):
+            draw.ellipse(
+                [box[0] - expand, box[1] - expand, box[2] + expand, box[3] + expand],
+                outline=color,
+                width=2,
+            )
+        draw.ellipse([px - 5, py - 5, px + 5, py + 5], fill=color, outline="black")
+        label_x = max(4, min(size - 150, int(px + 8)))
+        label_y = max(42, min(size - 74, int(py + 8)))
+        _draw_text_block(
+            draw,
+            [
+                label,
+                f"c=({float(center[0]):+.2f},{float(center[1]):+.2f})",
+                f"s=({float(sigma[0]):.2f},{float(sigma[1]):.2f})",
+            ],
+            (label_x, label_y),
+            small,
+        )
+    overlay.save(output_path)
 
 
 def resolve_torch_device(device_preference: str = "auto") -> str:
@@ -110,7 +202,8 @@ def resolve_relation_aware_artifacts(
     if relation_aware_dir is None:
         return unet_path, lora_path, graph_encoder_path, relation_attention_path
 
-    resolved_unet = unet_path or (relation_aware_dir / "unet")
+    candidate_unet = relation_aware_dir / "unet"
+    resolved_unet = unet_path or (candidate_unet if candidate_unet.exists() else None)
     if lora_path is not None:
         resolved_lora = lora_path
     else:
@@ -210,6 +303,7 @@ def save_run_config(
     guidance_scale: float,
     image_size: int,
     prompt_count: int,
+    save_gnn_overlays: bool,
 ) -> None:
     payload = {
         "model_key": model_key,
@@ -226,6 +320,7 @@ def save_run_config(
         "guidance_scale": guidance_scale,
         "image_size": image_size,
         "prompt_count": prompt_count,
+        "save_gnn_overlays": save_gnn_overlays,
         "output_layout": "t2i-compbench-style",
     }
     (output_dir / "run_config.json").write_text(json.dumps(payload, indent=2))
@@ -241,7 +336,7 @@ def build_relation_aware_conditioning(
     pipeline: Any,
     graph_encoder: GraphSlotEncoder,
     device: str,
-) -> tuple[torch.Tensor, torch.Tensor, int]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
     scene_graph = parse_prompt_to_scene_graph(prompt)
     node_count = len(scene_graph["nodes"])
     slot_targets = torch.zeros(1, node_count, 3, device=device)
@@ -261,6 +356,7 @@ def build_relation_aware_conditioning(
     return (
         conditioning.slot_embeddings,
         conditioning.slot_positions,
+        conditioning.slot_log_sigmas,
         int(node_count),
     )
 
@@ -378,6 +474,11 @@ def make_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Show the per-image diffusion progress bar during generation.",
     )
+    parser.add_argument(
+        "--save-gnn-overlays",
+        action="store_true",
+        help="Save a matching overlay image with GNN-predicted bbox/ellipse regions for each generated image.",
+    )
     return parser
 
 
@@ -403,6 +504,9 @@ def main() -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     samples_dir = args.output_dir / "samples"
     samples_dir.mkdir(parents=True, exist_ok=True)
+    overlays_dir = args.output_dir / "overlays"
+    if args.save_gnn_overlays:
+        overlays_dir.mkdir(parents=True, exist_ok=True)
 
     pipeline = build_pipeline(
         model_name,
@@ -440,6 +544,7 @@ def main() -> int:
         guidance_scale=args.guidance_scale,
         image_size=args.image_size,
         prompt_count=len(prompts),
+        save_gnn_overlays=args.save_gnn_overlays,
     )
 
     global_image_index = args.start_index
@@ -449,6 +554,8 @@ def main() -> int:
         cross_attention_kwargs: dict[str, Any] | None = None
         prompt_embeds = None
         negative_prompt_embeds = None
+        prompt_slot_positions = None
+        prompt_slot_log_sigmas = None
         use_relation_aware_for_prompt = relation_aware_enabled
 
         if relation_aware_enabled:
@@ -470,12 +577,14 @@ def main() -> int:
                     negative_prompt=None,
                 )
                 text_token_count = int(prompt_embeds.shape[1])
-                slot_embeddings, slot_positions, _ = build_relation_aware_conditioning(
+                slot_embeddings, slot_positions, slot_log_sigmas, _ = build_relation_aware_conditioning(
                     prompt=prompt,
                     pipeline=pipeline,
                     graph_encoder=graph_encoder,
                     device=device,
                 )
+                prompt_slot_positions = slot_positions
+                prompt_slot_log_sigmas = slot_log_sigmas
                 slot_embeddings = slot_embeddings.to(prompt_embeds.dtype).repeat_interleave(
                     args.num_images_per_prompt,
                     dim=0,
@@ -486,6 +595,7 @@ def main() -> int:
                     negative_prompt_embeds = torch.cat([negative_prompt_embeds, zero_slots], dim=1)
                 cross_attention_kwargs = {
                     "slot_positions": slot_positions.repeat_interleave(args.num_images_per_prompt, dim=0),
+                    "slot_log_sigmas": slot_log_sigmas.repeat_interleave(args.num_images_per_prompt, dim=0),
                     "slot_mask": torch.ones(
                         args.num_images_per_prompt,
                         slot_positions.shape[1],
@@ -532,7 +642,18 @@ def main() -> int:
                     generator=generator,
                 )
             image: Image.Image = result.images[0]
-            image.save(samples_dir / prompt_to_filename(prompt, global_image_index))
+            image_name = prompt_to_filename(prompt, global_image_index)
+            image.save(samples_dir / image_name)
+            if args.save_gnn_overlays and use_relation_aware_for_prompt:
+                assert prompt_slot_positions is not None
+                assert prompt_slot_log_sigmas is not None
+                save_gnn_overlay(
+                    image=image,
+                    prompt=prompt,
+                    slot_positions=prompt_slot_positions,
+                    slot_log_sigmas=prompt_slot_log_sigmas,
+                    output_path=overlays_dir / image_name,
+                )
             global_image_index += 1
 
     if relation_aware_enabled and fallback_count > 0:
@@ -542,6 +663,8 @@ def main() -> int:
             "does not yet support their relation wording."
         )
     print(f"Generated {len(prompts)} prompts into {samples_dir}")
+    if args.save_gnn_overlays:
+        print(f"Saved GNN overlays into {overlays_dir}")
     return 0
 
 

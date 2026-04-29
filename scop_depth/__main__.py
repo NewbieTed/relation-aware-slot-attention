@@ -21,7 +21,7 @@ from .data_processing import (
 )
 from .dataset_reader import DatasetReader
 from .depth import DEFAULT_DEPTH_MODEL_ID, DepthConfig
-from .visualize import create_sample_visualization
+from .visualize import create_exported_sample_visualization, create_sample_visualization
 
 
 def main() -> int:
@@ -32,7 +32,23 @@ def main() -> int:
     parser.add_argument(
         "--shared-images-dir",
         type=Path,
-        help="Directory to store actual images, other outputs will use symlinks to this directory",
+        help=(
+            "Directory to store actual full images when --no-crop-pairs is used; "
+            "pair-crop exports write crop images directly to the output directory"
+        ),
+    )
+
+    parser.add_argument(
+        "--no-crop-pairs",
+        action="store_true",
+        help="Disable CoMPaSS-style pair crops and export symlinks/copies of full COCO images instead",
+    )
+
+    parser.add_argument(
+        "--crop-padding-ratio",
+        type=float,
+        default=0.15,
+        help="Padding around the two-object bbox union for pair crops (default: 0.15)",
     )
 
     # Create mutually exclusive group for input method
@@ -269,15 +285,22 @@ def main() -> int:
             image_id_to_relationships,
             args.output_dir,
             shared_images_dir=args.shared_images_dir,
+            crop_pairs=not args.no_crop_pairs,
+            crop_padding_ratio=args.crop_padding_ratio,
         )
 
         # Step 5: Create sample visualizations if requested
         if args.create_samples:
             print(f"Creating {args.num_samples} sample visualizations...")
             samples_dir = args.output_dir / "samples"
-            create_sample_visualization(
-                reader, image_id_to_relationships, samples_dir, args.num_samples
-            )
+            if args.no_crop_pairs:
+                create_sample_visualization(
+                    reader, image_id_to_relationships, samples_dir, args.num_samples
+                )
+            else:
+                create_exported_sample_visualization(
+                    args.output_dir, samples_dir, args.num_samples
+                )
 
         elapsed_time = time.time() - start_time
         print(f"SCOP-Depth processing completed in {elapsed_time:.2f} seconds")

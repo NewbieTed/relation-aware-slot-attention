@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import re
 from pathlib import Path
 from typing import Any
@@ -15,20 +16,26 @@ from tqdm.auto import tqdm
 from .attention_supervision import (
     clear_attention_cache,
     collect_slot_attention_maps,
-    compute_mean_slot_usage,
-    compute_slot_attention_losses,
+    compute_region_slot_loss,
 )
-from .dataset import build_dataset_splits, collate_training_items
+from .dataset import (
+    SCOPDepthTextToImageDataset,
+    build_dataset_splits,
+    collate_training_items,
+    load_metadata_rows,
+)
 from .graph_modules import (
     GraphSlotEncoder,
     build_slot_conditioning,
     embedding_alignment_loss,
     inverse_relation_regularizer,
+    log_sigma_loss,
     pooled_label_embeddings,
     relation_loss,
 )
-from .graph_targets import bbox_centers_after_crop
+from .graph_targets import bbox_centers_after_crop, bbox_log_sigmas_after_crop
 from .metrics import MetricsLogger, write_split_manifest
+from .prompts import prompt_from_scop_depth_row
 from .relation_attention import install_relation_aware_processors
 from .scene_graph import build_batched_scene_graphs
 from .train_sd15_lora import (
@@ -40,6 +47,11 @@ from .train_sd15_lora import (
     choose_weight_dtype,
     resolve_torch_device,
     set_seed,
+)
+from evaluation.generate import (
+    build_relation_aware_conditioning,
+    describe_prompt_parse_support,
+    save_gnn_overlay,
 )
 
 def _save_state(
@@ -61,15 +73,21 @@ def _save_state(
         "aux_loss_weight": args.aux_loss_weight,
         "relation_loss_weight": args.relation_loss_weight,
         "embedding_loss_weight": args.embedding_loss_weight,
-        "attention_token_loss_weight": args.attention_token_loss_weight,
-        "attention_pixel_loss_weight": args.attention_pixel_loss_weight,
-        "slot_usage_loss_weight": args.slot_usage_loss_weight,
-        "slot_usage_target": args.slot_usage_target,
+        "region_slot_loss_weight": args.region_slot_loss_weight,
+        "region_slot_target": args.region_slot_target,
         "object_token_dropout_prob": args.object_token_dropout_prob,
         "inverse_relation_loss_weight": args.inverse_relation_loss_weight,
+        "box_loss_weight": args.box_loss_weight,
         "init_graph_encoder": str(args.init_graph_encoder) if args.init_graph_encoder else None,
         "freeze_graph_encoder": args.freeze_graph_encoder,
         "full_unet_finetune": args.full_unet_finetune,
+        "overfit_row_indices": args.overfit_row_indices,
+        "overfit_num_rows": args.overfit_num_rows,
+        "eval_sample_images": args.eval_sample_images,
+        "eval_sample_prompts": args.eval_sample_prompts,
+        "eval_sample_source": args.eval_sample_source,
+        "eval_sample_inference_steps": args.eval_sample_inference_steps,
+        "eval_sample_guidance_scale": args.eval_sample_guidance_scale,
         "validation_prompts": validation_prompts,
     }
     (output_dir / "training_state.json").write_text(json.dumps(payload, indent=2))
@@ -126,27 +144,332 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--save-every", type=int, default=250)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--limit-rows", type=int, default=None)
+    parser.add_argument(
+        "--overfit-row-indices",
+        type=str,
+        default=None,
+        help="Comma-separated metadata row indices to overfit. Reuses these rows for train/eval/test.",
+    )
+    parser.add_argument(
+        "--overfit-num-rows",
+        type=int,
+        default=0,
+        help="Overfit the first N rows after applying --limit-rows. Ignored if --overfit-row-indices is set.",
+    )
     parser.add_argument("--prompt-prefix", type=str, default="a photo of")
     parser.add_argument("--validation-prompts-file", type=Path, default=None)
     parser.add_argument("--num-validation-images", type=int, default=4)
     parser.add_argument("--validation-every", type=int, default=0)
+    parser.add_argument(
+        "--eval-sample-images",
+        type=int,
+        default=0,
+        help="Generate this many validation images per prompt at each eval step, with GNN overlays.",
+    )
+    parser.add_argument(
+        "--eval-sample-prompts",
+        type=int,
+        default=4,
+        help="Randomly sample this many prompts from the selected eval-sample split at each eval step.",
+    )
+    parser.add_argument(
+        "--eval-sample-source",
+        choices=("eval", "train"),
+        default="eval",
+        help="Dataset split to sample eval images from during full training.",
+    )
+    parser.add_argument("--eval-sample-inference-steps", type=int, default=30)
+    parser.add_argument("--eval-sample-guidance-scale", type=float, default=7.5)
     parser.add_argument("--eval-every", type=int, default=250)
     parser.add_argument("--eval-fraction", type=float, default=0.1)
     parser.add_argument("--test-fraction", type=float, default=0.1)
     parser.add_argument("--aux-loss-weight", type=float, default=0.1)
     parser.add_argument("--relation-loss-weight", type=float, default=0.1)
     parser.add_argument("--embedding-loss-weight", type=float, default=0.05)
-    parser.add_argument("--attention-token-loss-weight", type=float, default=0.0)
-    parser.add_argument("--attention-pixel-loss-weight", type=float, default=0.0)
-    parser.add_argument("--slot-usage-loss-weight", type=float, default=0.0)
-    parser.add_argument("--slot-usage-target", type=float, default=0.02)
+    parser.add_argument("--region-slot-loss-weight", type=float, default=0.0)
+    parser.add_argument("--region-slot-target", type=float, default=0.05)
     parser.add_argument("--object-token-dropout-prob", type=float, default=0.0)
     parser.add_argument("--inverse-relation-loss-weight", type=float, default=0.0)
+    parser.add_argument("--box-loss-weight", type=float, default=0.0)
     parser.add_argument("--init-graph-encoder", type=Path, default=None)
     parser.add_argument("--freeze-graph-encoder", action="store_true")
     parser.add_argument("--full-unet-finetune", action="store_true")
     parser.add_argument("--disable-tqdm", action="store_true")
     return parser
+
+
+def _parse_overfit_row_indices(raw_indices: str | None) -> list[int] | None:
+    if raw_indices is None:
+        return None
+    indices: list[int] = []
+    for piece in raw_indices.split(","):
+        piece = piece.strip()
+        if not piece:
+            continue
+        index = int(piece)
+        if index < 0:
+            raise ValueError("--overfit-row-indices cannot contain negative indices")
+        indices.append(index)
+    if not indices:
+        raise ValueError("--overfit-row-indices was provided but no indices were parsed")
+    return indices
+
+
+def _build_overfit_dataset_splits(
+    *,
+    dataset_dir: Path,
+    image_size: int,
+    prompt_prefix: str,
+    limit_rows: int | None,
+    row_indices: list[int] | None,
+    num_rows: int,
+) -> dict[str, SCOPDepthTextToImageDataset] | None:
+    if row_indices is None and num_rows <= 0:
+        return None
+
+    rows = load_metadata_rows(dataset_dir)
+    if limit_rows is not None:
+        rows = rows[:limit_rows]
+
+    if row_indices is not None:
+        max_index = len(rows) - 1
+        missing = [index for index in row_indices if index > max_index]
+        if missing:
+            raise IndexError(
+                f"Overfit row indices outside available range 0..{max_index}: {missing}"
+            )
+        selected_rows = [rows[index] for index in row_indices]
+    else:
+        selected_rows = rows[:num_rows]
+
+    if not selected_rows:
+        raise ValueError("Overfit mode selected no rows")
+
+    datasets = {
+        split: SCOPDepthTextToImageDataset(
+            dataset_dir,
+            image_size=image_size,
+            prompt_prefix=prompt_prefix,
+            rows=list(selected_rows),
+        )
+        for split in ("train", "eval", "test")
+    }
+    return datasets
+
+
+def _write_and_print_overfit_prompts(
+    *,
+    output_dir: Path,
+    dataset: SCOPDepthTextToImageDataset,
+) -> list[str]:
+    prompts = [
+        prompt_from_scop_depth_row(row, prefix=dataset.prompt_prefix)
+        for row in dataset.rows
+    ]
+    lines = ["Overfit prompts:"]
+    for index, (row, prompt) in enumerate(zip(dataset.rows, prompts)):
+        row_seq = row.get("seq", "unknown")
+        file_name = row.get("file_name", "unknown")
+        lines.append(f"{index}: seq={row_seq} file={file_name} prompt={prompt}")
+    text = "\n".join(lines) + "\n"
+    print(text)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "overfit_prompts.txt").write_text(text)
+    (output_dir / "overfit_prompts.json").write_text(
+        json.dumps(
+            [
+                {
+                    "overfit_index": index,
+                    "seq": row.get("seq"),
+                    "file_name": row.get("file_name"),
+                    "prompt": prompt,
+                    "oros": row.get("oros"),
+                }
+                for index, (row, prompt) in enumerate(zip(dataset.rows, prompts))
+            ],
+            indent=2,
+        )
+    )
+    return prompts
+
+
+def _sample_eval_prompts(
+    *,
+    dataset: SCOPDepthTextToImageDataset,
+    prompt_count: int,
+    step: int,
+    seed: int,
+) -> list[str]:
+    if prompt_count <= 0:
+        return []
+    rows = list(dataset.rows)
+    if not rows:
+        return []
+    rng = random.Random(seed + step * 7919)
+    if prompt_count >= len(rows):
+        selected_rows = rows
+        rng.shuffle(selected_rows)
+    else:
+        selected_rows = rng.sample(rows, prompt_count)
+    return [
+        prompt_from_scop_depth_row(row, prefix=dataset.prompt_prefix)
+        for row in selected_rows
+    ]
+
+
+@torch.no_grad()
+def _run_relation_aware_eval_samples(
+    *,
+    args: argparse.Namespace,
+    output_dir: Path,
+    prompts: list[str],
+    device: str,
+    dtype: torch.dtype,
+    unet: Any,
+    vae: Any,
+    text_encoder: Any,
+    tokenizer: Any,
+    noise_scheduler: Any,
+    graph_encoder: GraphSlotEncoder,
+    step: int,
+) -> None:
+    if args.eval_sample_images <= 0:
+        return
+
+    from diffusers import StableDiffusionPipeline
+
+    sample_dir = output_dir / "validation" / f"step-{step:06d}" / "samples"
+    overlay_dir = output_dir / "validation" / f"step-{step:06d}" / "overlays"
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    overlay_dir.mkdir(parents=True, exist_ok=True)
+    (sample_dir.parent / "prompts.txt").write_text("\n".join(prompts) + "\n")
+
+    was_unet_training = unet.training
+    was_graph_training = graph_encoder.training
+    unet.eval()
+    graph_encoder.eval()
+
+    pipeline = StableDiffusionPipeline.from_pretrained(
+        args.model_id,
+        vae=vae,
+        text_encoder=text_encoder,
+        tokenizer=tokenizer,
+        unet=unet,
+        scheduler=noise_scheduler,
+        safety_checker=None,
+        torch_dtype=dtype,
+    ).to(device)
+    pipeline.set_progress_bar_config(disable=True)
+
+    do_classifier_free_guidance = args.eval_sample_guidance_scale > 1.0
+    for prompt_index, prompt in enumerate(prompts):
+        supported, reason = describe_prompt_parse_support(prompt)
+        prompt_embeds = None
+        negative_prompt_embeds = None
+        cross_attention_kwargs: dict[str, Any] | None = None
+        slot_positions = None
+        slot_log_sigmas = None
+        if supported:
+            prompt_embeds, negative_prompt_embeds = pipeline.encode_prompt(
+                prompt=prompt,
+                device=device,
+                num_images_per_prompt=args.eval_sample_images,
+                do_classifier_free_guidance=do_classifier_free_guidance,
+                negative_prompt=None,
+            )
+            text_token_count = int(prompt_embeds.shape[1])
+            slot_embeddings, slot_positions, slot_log_sigmas, _ = build_relation_aware_conditioning(
+                prompt=prompt,
+                pipeline=pipeline,
+                graph_encoder=graph_encoder,
+                device=device,
+            )
+            slot_embeddings = slot_embeddings.to(prompt_embeds.dtype).repeat_interleave(
+                args.eval_sample_images,
+                dim=0,
+            )
+            prompt_embeds = torch.cat([prompt_embeds, slot_embeddings], dim=1)
+            if negative_prompt_embeds is not None:
+                negative_prompt_embeds = torch.cat(
+                    [negative_prompt_embeds, torch.zeros_like(slot_embeddings)],
+                    dim=1,
+                )
+            cross_attention_kwargs = {
+                "slot_positions": slot_positions.repeat_interleave(args.eval_sample_images, dim=0),
+                "slot_log_sigmas": slot_log_sigmas.repeat_interleave(args.eval_sample_images, dim=0),
+                "slot_mask": torch.ones(
+                    args.eval_sample_images,
+                    slot_positions.shape[1],
+                    dtype=torch.bool,
+                    device=slot_positions.device,
+                ),
+                "text_token_count": text_token_count,
+            }
+        else:
+            print(
+                "Validation sample warning: falling back to vanilla prompt conditioning for "
+                f"{prompt!r}. Reason: {reason}"
+            )
+
+        for image_index in range(args.eval_sample_images):
+            generator = torch.Generator(device="cpu").manual_seed(
+                args.seed + step * 1009 + prompt_index * args.eval_sample_images + image_index
+            )
+            filename = f"prompt{prompt_index:02d}_{image_index:02d}.png"
+            if supported:
+                assert prompt_embeds is not None
+                image_prompt_embeds = prompt_embeds[image_index : image_index + 1]
+                image_negative_prompt_embeds = (
+                    negative_prompt_embeds[image_index : image_index + 1]
+                    if negative_prompt_embeds is not None
+                    else None
+                )
+                image_cross_kwargs = {
+                    key: value[image_index : image_index + 1]
+                    if torch.is_tensor(value) and value.ndim > 0 and value.shape[0] == args.eval_sample_images
+                    else value
+                    for key, value in (cross_attention_kwargs or {}).items()
+                }
+                image = pipeline(
+                    prompt_embeds=image_prompt_embeds,
+                    negative_prompt_embeds=image_negative_prompt_embeds,
+                    cross_attention_kwargs=image_cross_kwargs,
+                    num_inference_steps=args.eval_sample_inference_steps,
+                    guidance_scale=args.eval_sample_guidance_scale,
+                    height=args.image_size,
+                    width=args.image_size,
+                    generator=generator,
+                ).images[0]
+            else:
+                image = pipeline(
+                    prompt=prompt,
+                    num_inference_steps=args.eval_sample_inference_steps,
+                    guidance_scale=args.eval_sample_guidance_scale,
+                    height=args.image_size,
+                    width=args.image_size,
+                    generator=generator,
+                ).images[0]
+            image.save(sample_dir / filename)
+            if supported:
+                assert slot_positions is not None
+                assert slot_log_sigmas is not None
+                save_gnn_overlay(
+                    image=image,
+                    prompt=prompt,
+                    slot_positions=slot_positions,
+                    slot_log_sigmas=slot_log_sigmas,
+                    output_path=overlay_dir / filename,
+                )
+
+    del pipeline
+    if was_unet_training:
+        unet.train()
+    if was_graph_training:
+        graph_encoder.train()
+    if device == "cuda":
+        torch.cuda.empty_cache()
+    print(f"Saved eval samples to {sample_dir}")
+    print(f"Saved eval GNN overlays to {overlay_dir}")
 
 
 def _drop_object_tokens_from_prompts(
@@ -200,15 +523,13 @@ def _build_relation_aware_losses(
     aux_loss_weight: float,
     relation_loss_weight: float,
     embedding_loss_weight: float,
-    attention_token_loss_weight: float,
-    attention_pixel_loss_weight: float,
-    slot_usage_loss_weight: float,
-    slot_usage_target: float,
+    region_slot_loss_weight: float,
+    region_slot_target: float,
     inverse_relation_loss_weight: float,
+    box_loss_weight: float,
     relation_attention_processors: dict[str, torch.nn.Module],
     object_token_dropout_prob: float = 0.0,
     apply_object_token_dropout: bool = False,
-    debug_attention_supervision: bool = False,
 ) -> dict[str, torch.Tensor]:
     clear_attention_cache(relation_attention_processors)
     pixel_values = batch["pixel_values"].to(device=device, dtype=weight_dtype)
@@ -256,6 +577,12 @@ def _build_relation_aware_losses(
         max_nodes=max_nodes,
         device=torch.device(device),
     )
+    log_sigma_targets, _ = bbox_log_sigmas_after_crop(
+        batch["metadata"],
+        batch["image_sizes"],
+        max_nodes=max_nodes,
+        device=torch.device(device),
+    )
     scene_graph_batch = build_batched_scene_graphs(
         batch["scene_graphs"],
         slot_targets=slot_targets,
@@ -287,6 +614,7 @@ def _build_relation_aware_losses(
             encoder_hidden_states=encoder_hidden_states,
             cross_attention_kwargs={
                 "slot_positions": conditioning.slot_positions,
+                "slot_log_sigmas": conditioning.slot_log_sigmas,
                 "slot_mask": conditioning.slot_mask,
                 "text_token_count": text_hidden_states.shape[1],
             },
@@ -306,28 +634,30 @@ def _build_relation_aware_losses(
             pooled_embeddings,
             conditioning.slot_mask,
         )
+        box_loss = log_sigma_loss(
+            conditioning.slot_log_sigmas,
+            log_sigma_targets,
+            conditioning.slot_mask,
+        )
         inverse_relation_loss_value = inverse_relation_regularizer(graph_encoder)
         attention_maps = collect_slot_attention_maps(relation_attention_processors)
-        if (
-            attention_token_loss_weight > 0.0
-            or attention_pixel_loss_weight > 0.0
-            or slot_usage_loss_weight > 0.0
-        ) and not attention_maps:
+        if region_slot_loss_weight > 0.0 and not attention_maps:
             raise RuntimeError(
                 "Attention supervision was enabled, but no slot attention maps were captured."
             )
-        slot_usage = compute_mean_slot_usage(attention_maps)
-        slot_usage_loss = F.relu(
-            denoise_loss.new_tensor(slot_usage_target)
-            - slot_usage.to(device=denoise_loss.device, dtype=denoise_loss.dtype)
-        )
-        attention_token_loss, attention_pixel_loss, attention_debug = compute_slot_attention_losses(
+        (
+            region_slot_loss,
+            region_slot_usage_pct,
+            region_slot_pos_loss,
+            region_slot_neg_in_loss,
+            region_slot_neg_out_loss,
+        ) = compute_region_slot_loss(
             attention_maps=attention_maps,
-            metadata=batch["metadata"],
-            image_sizes=batch["image_sizes"],
+            slot_centers=slot_targets,
+            slot_log_sigmas=log_sigma_targets,
             slot_mask=conditioning.slot_mask,
             device=torch.device(device),
-            return_debug=debug_attention_supervision,
+            target_usage=region_slot_target,
         )
         edge_loss = relation_loss(
             conditioning.relation_logits,
@@ -339,10 +669,9 @@ def _build_relation_aware_losses(
             + aux_loss_weight * geometry_loss
             + embedding_loss_weight * semantic_loss
             + relation_loss_weight * edge_loss
-            + attention_token_loss_weight * attention_token_loss
-            + attention_pixel_loss_weight * attention_pixel_loss
-            + slot_usage_loss_weight * slot_usage_loss
+            + region_slot_loss_weight * region_slot_loss
             + inverse_relation_loss_weight * inverse_relation_loss_value
+            + box_loss_weight * box_loss
         )
     return {
         "loss": loss,
@@ -350,12 +679,13 @@ def _build_relation_aware_losses(
         "geometry_loss": geometry_loss,
         "relation_loss": edge_loss,
         "embedding_loss": semantic_loss,
-        "attention_token_loss": attention_token_loss,
-        "attention_pixel_loss": attention_pixel_loss,
-        "slot_usage_loss": slot_usage_loss,
-        "slot_usage_pct": slot_usage * 100.0,
+        "region_slot_loss": region_slot_loss,
+        "region_slot_usage_pct": region_slot_usage_pct,
+        "region_slot_pos_loss": region_slot_pos_loss,
+        "region_slot_neg_in_loss": region_slot_neg_in_loss,
+        "region_slot_neg_out_loss": region_slot_neg_out_loss,
         "inverse_relation_loss": inverse_relation_loss_value,
-        "attention_debug": attention_debug,
+        "box_loss": box_loss,
     }
 
 
@@ -375,11 +705,10 @@ def _evaluate_relation_aware(
     aux_loss_weight: float,
     relation_loss_weight: float,
     embedding_loss_weight: float,
-    attention_token_loss_weight: float,
-    attention_pixel_loss_weight: float,
-    slot_usage_loss_weight: float,
-    slot_usage_target: float,
+    region_slot_loss_weight: float,
+    region_slot_target: float,
     inverse_relation_loss_weight: float,
+    box_loss_weight: float,
     relation_attention_processors: dict[str, torch.nn.Module],
 ) -> dict[str, float]:
     graph_encoder.eval()
@@ -390,11 +719,13 @@ def _evaluate_relation_aware(
         "geometry_loss": 0.0,
         "relation_loss": 0.0,
         "embedding_loss": 0.0,
-        "attention_token_loss": 0.0,
-        "attention_pixel_loss": 0.0,
-        "slot_usage_loss": 0.0,
-        "slot_usage_pct": 0.0,
+        "region_slot_loss": 0.0,
+        "region_slot_usage_pct": 0.0,
+        "region_slot_pos_loss": 0.0,
+        "region_slot_neg_in_loss": 0.0,
+        "region_slot_neg_out_loss": 0.0,
         "inverse_relation_loss": 0.0,
+        "box_loss": 0.0,
     }
     batch_count = 0
     for batch in dataloader:
@@ -412,11 +743,10 @@ def _evaluate_relation_aware(
             aux_loss_weight=aux_loss_weight,
             relation_loss_weight=relation_loss_weight,
             embedding_loss_weight=embedding_loss_weight,
-            attention_token_loss_weight=attention_token_loss_weight,
-            attention_pixel_loss_weight=attention_pixel_loss_weight,
-            slot_usage_loss_weight=slot_usage_loss_weight,
-            slot_usage_target=slot_usage_target,
+            region_slot_loss_weight=region_slot_loss_weight,
+            region_slot_target=region_slot_target,
             inverse_relation_loss_weight=inverse_relation_loss_weight,
+            box_loss_weight=box_loss_weight,
             relation_attention_processors=relation_attention_processors,
         )
         for key in totals:
@@ -442,15 +772,34 @@ def main() -> int:
         enabled=device == "cuda" and args.mixed_precision == "fp16",
     )
 
-    datasets = build_dataset_splits(
-        args.dataset_dir,
+    overfit_row_indices = _parse_overfit_row_indices(args.overfit_row_indices)
+    datasets = _build_overfit_dataset_splits(
+        dataset_dir=args.dataset_dir,
         image_size=args.image_size,
         prompt_prefix=args.prompt_prefix,
         limit_rows=args.limit_rows,
-        seed=args.seed,
-        eval_fraction=args.eval_fraction,
-        test_fraction=args.test_fraction,
+        row_indices=overfit_row_indices,
+        num_rows=args.overfit_num_rows,
     )
+    if datasets is None:
+        datasets = build_dataset_splits(
+            args.dataset_dir,
+            image_size=args.image_size,
+            prompt_prefix=args.prompt_prefix,
+            limit_rows=args.limit_rows,
+            seed=args.seed,
+            eval_fraction=args.eval_fraction,
+            test_fraction=args.test_fraction,
+        )
+    else:
+        print(
+            "Overfit mode enabled: using the selected rows for train, eval, and test "
+            "so we can verify memorization on a tiny set."
+        )
+        _write_and_print_overfit_prompts(
+            output_dir=args.output_dir,
+            dataset=datasets["train"],
+        )
     write_split_manifest(
         args.output_dir,
         train_rows=datasets["train"].rows,
@@ -572,11 +921,13 @@ def main() -> int:
             "geometry_loss",
             "relation_loss",
             "embedding_loss",
-            "attention_token_loss",
-            "attention_pixel_loss",
-            "slot_usage_loss",
-            "slot_usage_pct",
+            "region_slot_loss",
+            "region_slot_usage_pct",
+            "region_slot_pos_loss",
+            "region_slot_neg_in_loss",
+            "region_slot_neg_out_loss",
             "inverse_relation_loss",
+            "box_loss",
         ],
     )
 
@@ -595,14 +946,15 @@ def main() -> int:
         "geometry_loss": 0.0,
         "relation_loss": 0.0,
         "embedding_loss": 0.0,
-        "attention_token_loss": 0.0,
-        "attention_pixel_loss": 0.0,
-        "slot_usage_loss": 0.0,
-        "slot_usage_pct": 0.0,
+        "region_slot_loss": 0.0,
+        "region_slot_usage_pct": 0.0,
+        "region_slot_pos_loss": 0.0,
+        "region_slot_neg_in_loss": 0.0,
+        "region_slot_neg_out_loss": 0.0,
         "inverse_relation_loss": 0.0,
+        "box_loss": 0.0,
     }
     running_updates = 0
-    attention_debug_printed = False
 
     while global_step < args.max_train_steps:
         for batch in train_dataloader:
@@ -620,18 +972,13 @@ def main() -> int:
                 aux_loss_weight=args.aux_loss_weight,
                 relation_loss_weight=args.relation_loss_weight,
                 embedding_loss_weight=args.embedding_loss_weight,
-                attention_token_loss_weight=args.attention_token_loss_weight,
-                attention_pixel_loss_weight=args.attention_pixel_loss_weight,
-                slot_usage_loss_weight=args.slot_usage_loss_weight,
-                slot_usage_target=args.slot_usage_target,
+                region_slot_loss_weight=args.region_slot_loss_weight,
+                region_slot_target=args.region_slot_target,
                 inverse_relation_loss_weight=args.inverse_relation_loss_weight,
+                box_loss_weight=args.box_loss_weight,
                 relation_attention_processors=relation_attention_processors,
                 object_token_dropout_prob=args.object_token_dropout_prob,
                 apply_object_token_dropout=True,
-                debug_attention_supervision=(
-                    not attention_debug_printed
-                    and (args.attention_token_loss_weight > 0.0 or args.attention_pixel_loss_weight > 0.0)
-                ),
             )
             loss = metrics["loss"]
 
@@ -648,22 +995,6 @@ def main() -> int:
             for key in running:
                 running[key] += float(metrics[key].item())
             running_updates += 1
-
-            if not attention_debug_printed and metrics.get("attention_debug") is not None:
-                debug = metrics["attention_debug"]
-                print(
-                    "Attention supervision debug: "
-                    f"valid_slots={debug['valid_slots']}, "
-                    f"num_attention_maps={debug['num_attention_maps']}, "
-                    f"resolutions={debug['resolutions']}, "
-                    f"mask_sum_mean={debug['mask_sum_mean']:.4f}, "
-                    f"mask_sum_min={debug['mask_sum_min']:.4f}, "
-                    f"mask_sum_max={debug['mask_sum_max']:.4f}, "
-                    f"attn_sum_mean={debug['attn_sum_mean']:.4f}, "
-                    f"attn_sum_min={debug['attn_sum_min']:.4f}, "
-                    f"attn_sum_max={debug['attn_sum_max']:.4f}"
-                )
-                attention_debug_printed = True
 
             if micro_step % args.gradient_accumulation_steps == 0:
                 if scaler.is_enabled():
@@ -684,17 +1015,19 @@ def main() -> int:
                         "geometry_loss": running["geometry_loss"] / running_updates,
                         "relation_loss": running["relation_loss"] / running_updates,
                         "embedding_loss": running["embedding_loss"] / running_updates,
-                        "attention_token_loss": running["attention_token_loss"] / running_updates,
-                        "attention_pixel_loss": running["attention_pixel_loss"] / running_updates,
-                        "slot_usage_loss": running["slot_usage_loss"] / running_updates,
-                        "slot_usage_pct": running["slot_usage_pct"] / running_updates,
+                        "region_slot_loss": running["region_slot_loss"] / running_updates,
+                        "region_slot_usage_pct": running["region_slot_usage_pct"] / running_updates,
+                        "region_slot_pos_loss": running["region_slot_pos_loss"] / running_updates,
+                        "region_slot_neg_in_loss": running["region_slot_neg_in_loss"] / running_updates,
+                        "region_slot_neg_out_loss": running["region_slot_neg_out_loss"] / running_updates,
                         "inverse_relation_loss": running["inverse_relation_loss"] / running_updates,
+                        "box_loss": running["box_loss"] / running_updates,
                     }
                     metrics_logger.log(train_log)
                     progress_bar.set_postfix(
                         denoise=f"{train_log['denoise_loss']:.4f}",
                         rel=f"{train_log['relation_loss']:.4f}",
-                        slot=f"{train_log['slot_usage_pct']:.2f}%",
+                        region=f"{train_log['region_slot_usage_pct']:.2f}%",
                     )
                     running = {key: 0.0 for key in running}
                     running_updates = 0
@@ -717,11 +1050,10 @@ def main() -> int:
                             aux_loss_weight=args.aux_loss_weight,
                             relation_loss_weight=args.relation_loss_weight,
                             embedding_loss_weight=args.embedding_loss_weight,
-                            attention_token_loss_weight=args.attention_token_loss_weight,
-                            attention_pixel_loss_weight=args.attention_pixel_loss_weight,
-                            slot_usage_loss_weight=args.slot_usage_loss_weight,
-                            slot_usage_target=args.slot_usage_target,
+                            region_slot_loss_weight=args.region_slot_loss_weight,
+                            region_slot_target=args.region_slot_target,
                             inverse_relation_loss_weight=args.inverse_relation_loss_weight,
+                            box_loss_weight=args.box_loss_weight,
                             relation_attention_processors=relation_attention_processors,
                         ),
                     }
@@ -733,10 +1065,38 @@ def main() -> int:
                         f"geom={eval_log['geometry_loss']:.4f}, "
                         f"rel={eval_log['relation_loss']:.4f}, "
                         f"sem={eval_log['embedding_loss']:.4f}, "
-                        f"attn_token={eval_log['attention_token_loss']:.4f}, "
-                        f"attn_pixel={eval_log['attention_pixel_loss']:.4f}, "
-                        f"slot_use={eval_log['slot_usage_pct']:.2f}%, "
-                        f"inv_rel={eval_log['inverse_relation_loss']:.4f}"
+                        f"region_slot_loss={eval_log['region_slot_loss']:.4f}, "
+                        f"region_slot={eval_log['region_slot_usage_pct']:.2f}%, "
+                        f"region_pos={eval_log['region_slot_pos_loss']:.4f}, "
+                        f"region_neg_in={eval_log['region_slot_neg_in_loss']:.4f}, "
+                        f"region_neg_out={eval_log['region_slot_neg_out_loss']:.4f}, "
+                        f"inv_rel={eval_log['inverse_relation_loss']:.4f}, "
+                        f"box={eval_log['box_loss']:.4f}"
+                    )
+                    sample_dataset = (
+                        datasets["train"]
+                        if args.eval_sample_source == "train" or len(datasets["eval"]) == 0
+                        else datasets["eval"]
+                    )
+                    eval_sample_prompts = _sample_eval_prompts(
+                        dataset=sample_dataset,
+                        prompt_count=args.eval_sample_prompts,
+                        step=global_step,
+                        seed=args.seed,
+                    )
+                    _run_relation_aware_eval_samples(
+                        args=args,
+                        output_dir=args.output_dir,
+                        prompts=eval_sample_prompts,
+                        device=device,
+                        dtype=weight_dtype,
+                        unet=unet,
+                        vae=vae,
+                        text_encoder=text_encoder,
+                        tokenizer=tokenizer,
+                        noise_scheduler=noise_scheduler,
+                        graph_encoder=graph_encoder,
+                        step=global_step,
                     )
 
                 if global_step % args.save_every == 0:
@@ -795,11 +1155,10 @@ def main() -> int:
                 aux_loss_weight=args.aux_loss_weight,
                 relation_loss_weight=args.relation_loss_weight,
                 embedding_loss_weight=args.embedding_loss_weight,
-                attention_token_loss_weight=args.attention_token_loss_weight,
-                attention_pixel_loss_weight=args.attention_pixel_loss_weight,
-                slot_usage_loss_weight=args.slot_usage_loss_weight,
-                slot_usage_target=args.slot_usage_target,
+                region_slot_loss_weight=args.region_slot_loss_weight,
+                region_slot_target=args.region_slot_target,
                 inverse_relation_loss_weight=args.inverse_relation_loss_weight,
+                box_loss_weight=args.box_loss_weight,
                 relation_attention_processors=relation_attention_processors,
             ),
         }
@@ -811,10 +1170,13 @@ def main() -> int:
             f"geom={test_log['geometry_loss']:.4f}, "
             f"rel={test_log['relation_loss']:.4f}, "
             f"sem={test_log['embedding_loss']:.4f}, "
-            f"attn_token={test_log['attention_token_loss']:.4f}, "
-            f"attn_pixel={test_log['attention_pixel_loss']:.4f}, "
-            f"slot_use={test_log['slot_usage_pct']:.2f}%, "
-            f"inv_rel={test_log['inverse_relation_loss']:.4f})"
+            f"region_slot_loss={test_log['region_slot_loss']:.4f}, "
+            f"region_slot={test_log['region_slot_usage_pct']:.2f}%, "
+            f"region_pos={test_log['region_slot_pos_loss']:.4f}, "
+            f"region_neg_in={test_log['region_slot_neg_in_loss']:.4f}, "
+            f"region_neg_out={test_log['region_slot_neg_out_loss']:.4f}, "
+            f"inv_rel={test_log['inverse_relation_loss']:.4f}, "
+            f"box={test_log['box_loss']:.4f})"
         )
     _save_state(args.output_dir, step=global_step, args=args, validation_prompts=validation_prompts)
     print(f"Relation-aware training finished at step {global_step}.")

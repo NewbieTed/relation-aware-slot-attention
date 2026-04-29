@@ -35,3 +35,27 @@ def bbox_centers_after_crop(
             )
             mask[batch_index, node_index] = True
     return targets, mask
+
+
+def bbox_log_sigmas_after_crop(
+    metadata_rows: list[dict[str, Any]],
+    image_sizes: list[tuple[int, int]],
+    max_nodes: int,
+    device: torch.device,
+    *,
+    min_sigma: float = 0.03,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    targets = torch.zeros(len(metadata_rows), max_nodes, 2, device=device)
+    mask = torch.zeros(len(metadata_rows), max_nodes, dtype=torch.bool, device=device)
+    for batch_index, (row, (width, height)) in enumerate(zip(metadata_rows, image_sizes)):
+        crop_size = min(width, height)
+        for node_index, annot in enumerate(row["annots"][:max_nodes]):
+            _, _, bbox_w, bbox_h = annot["bbox"]
+            sigma_x = max(float(bbox_w) / crop_size, min_sigma)
+            sigma_y = max(float(bbox_h) / crop_size, min_sigma)
+            targets[batch_index, node_index] = torch.tensor(
+                [sigma_x, sigma_y],
+                device=device,
+            ).log()
+            mask[batch_index, node_index] = True
+    return targets, mask

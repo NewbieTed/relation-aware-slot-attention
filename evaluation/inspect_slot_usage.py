@@ -182,7 +182,7 @@ def main() -> int:
                 negative_prompt=None,
             )
             text_token_count = int(prompt_embeds.shape[1])
-            slot_embeddings, slot_positions, slot_count = build_relation_aware_conditioning(
+            slot_embeddings, slot_positions, slot_log_sigmas, slot_count = build_relation_aware_conditioning(
                 prompt=prompt,
                 pipeline=pipeline,
                 graph_encoder=graph_encoder,
@@ -196,6 +196,7 @@ def main() -> int:
                 )
             cross_attention_kwargs = {
                 "slot_positions": slot_positions,
+                "slot_log_sigmas": slot_log_sigmas,
                 "slot_mask": torch.ones(1, slot_positions.shape[1], dtype=torch.bool, device=slot_positions.device),
                 "text_token_count": text_token_count,
             }
