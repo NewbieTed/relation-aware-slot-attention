@@ -380,6 +380,7 @@ def _draw_overlay_on_crop(
 def _draw_prediction_overlay_on_image(
     *,
     image_path: Path,
+    prompt: str,
     labels: list[str],
     pred_centers: list[list[float]],
     pred_sigmas: list[list[float]],
@@ -390,8 +391,14 @@ def _draw_prediction_overlay_on_image(
     font = _load_font(19)
     small = _load_font(15)
     colors = ["#00d5ff", "#ff3366", "#2a9d8f", "#f77f00"]
-    draw.rectangle([0, 0, CANVAS_SIZE, 38], fill="black")
-    draw.text((10, 9), "GNN predicted bbox + ellipse", font=font, fill="white")
+    _draw_text_block(
+        draw,
+        ["GNN predicted bbox + ellipse"] + _wrap_text(prompt, max_chars=52),
+        (0, 0),
+        font,
+        fill="white",
+        background="black",
+    )
 
     for index, (center, sigma, label) in enumerate(zip(pred_centers, pred_sigmas, labels)):
         px, py = _coord_to_px(center[0], center[1])
@@ -755,6 +762,7 @@ def main() -> int:
             raise FileNotFoundError(f"Missing overlay image: {args.overlay_image}")
         _draw_prediction_overlay_on_image(
             image_path=args.overlay_image,
+            prompt=prompt,
             labels=labels,
             pred_centers=pred_centers,
             pred_sigmas=pred_sigmas,

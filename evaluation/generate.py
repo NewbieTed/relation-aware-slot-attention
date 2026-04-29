@@ -57,6 +57,22 @@ def _draw_text_block(
         cursor_y += height + gap
 
 
+def _wrap_text(text: str, *, max_chars: int) -> list[str]:
+    words = text.split()
+    lines: list[str] = []
+    current: list[str] = []
+    for word in words:
+        candidate = " ".join(current + [word])
+        if len(candidate) > max_chars and current:
+            lines.append(" ".join(current))
+            current = [word]
+        else:
+            current.append(word)
+    if current:
+        lines.append(" ".join(current))
+    return lines
+
+
 def save_gnn_overlay(
     *,
     image: Image.Image,
@@ -80,8 +96,12 @@ def save_gnn_overlay(
     small = _load_font(14)
     colors = ["#00d5ff", "#ff3366", "#2a9d8f", "#f77f00"]
 
-    draw.rectangle([0, 0, size, 38], fill="black")
-    draw.text((10, 9), "GNN predicted bbox + ellipse", font=font, fill="white")
+    _draw_text_block(
+        draw,
+        ["GNN predicted bbox + ellipse"] + _wrap_text(prompt, max_chars=52),
+        (0, 0),
+        font,
+    )
 
     centers = slot_positions[0].detach().cpu().to(torch.float32).tolist()
     sigmas = slot_log_sigmas[0].detach().cpu().to(torch.float32).exp().tolist()
