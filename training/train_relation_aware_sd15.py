@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import re
 from pathlib import Path
 from typing import Any
@@ -47,6 +48,11 @@ from .train_sd15_lora import (
     resolve_torch_device,
     set_seed,
 )
+from evaluation.generate import (
+    build_relation_aware_conditioning,
+    describe_prompt_parse_support,
+    save_gnn_overlay,
+)
 
 def _save_state(
     output_dir: Path,
@@ -77,6 +83,11 @@ def _save_state(
         "full_unet_finetune": args.full_unet_finetune,
         "overfit_row_indices": args.overfit_row_indices,
         "overfit_num_rows": args.overfit_num_rows,
+        "eval_sample_images": args.eval_sample_images,
+        "eval_sample_prompts": args.eval_sample_prompts,
+        "eval_sample_source": args.eval_sample_source,
+        "eval_sample_inference_steps": args.eval_sample_inference_steps,
+        "eval_sample_guidance_scale": args.eval_sample_guidance_scale,
         "validation_prompts": validation_prompts,
     }
     (output_dir / "training_state.json").write_text(json.dumps(payload, indent=2))
@@ -149,6 +160,26 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--validation-prompts-file", type=Path, default=None)
     parser.add_argument("--num-validation-images", type=int, default=4)
     parser.add_argument("--validation-every", type=int, default=0)
+    parser.add_argument(
+        "--eval-sample-images",
+        type=int,
+        default=0,
+        help="Generate this many validation images per prompt at each eval step, with GNN overlays.",
+    )
+    parser.add_argument(
+        "--eval-sample-prompts",
+        type=int,
+        default=4,
+        help="Randomly sample this many prompts from the selected eval-sample split at each eval step.",
+    )
+    parser.add_argument(
+        "--eval-sample-source",
+        choices=("eval", "train"),
+        default="eval",
+        help="Dataset split to sample eval images from during full training.",
+    )
+    parser.add_argument("--eval-sample-inference-steps", type=int, default=30)
+    parser.add_argument("--eval-sample-guidance-scale", type=float, default=7.5)
     parser.add_argument("--eval-every", type=int, default=250)
     parser.add_argument("--eval-fraction", type=float, default=0.1)
     parser.add_argument("--test-fraction", type=float, default=0.1)
@@ -260,6 +291,185 @@ def _write_and_print_overfit_prompts(
         )
     )
     return prompts
+
+
+def _sample_eval_prompts(
+    *,
+    dataset: SCOPDepthTextToImageDataset,
+    prompt_count: int,
+    step: int,
+    seed: int,
+) -> list[str]:
+    if prompt_count <= 0:
+        return []
+    rows = list(dataset.rows)
+    if not rows:
+        return []
+    rng = random.Random(seed + step * 7919)
+    if prompt_count >= len(rows):
+        selected_rows = rows
+        rng.shuffle(selected_rows)
+    else:
+        selected_rows = rng.sample(rows, prompt_count)
+    return [
+        prompt_from_scop_depth_row(row, prefix=dataset.prompt_prefix)
+        for row in selected_rows
+    ]
+
+
+@torch.no_grad()
+def _run_relation_aware_eval_samples(
+    *,
+    args: argparse.Namespace,
+    output_dir: Path,
+    prompts: list[str],
+    device: str,
+    dtype: torch.dtype,
+    unet: Any,
+    vae: Any,
+    text_encoder: Any,
+    tokenizer: Any,
+    noise_scheduler: Any,
+    graph_encoder: GraphSlotEncoder,
+    step: int,
+) -> None:
+    if args.eval_sample_images <= 0:
+        return
+
+    from diffusers import StableDiffusionPipeline
+
+    sample_dir = output_dir / "validation" / f"step-{step:06d}" / "samples"
+    overlay_dir = output_dir / "validation" / f"step-{step:06d}" / "overlays"
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    overlay_dir.mkdir(parents=True, exist_ok=True)
+    (sample_dir.parent / "prompts.txt").write_text("\n".join(prompts) + "\n")
+
+    was_unet_training = unet.training
+    was_graph_training = graph_encoder.training
+    unet.eval()
+    graph_encoder.eval()
+
+    pipeline = StableDiffusionPipeline.from_pretrained(
+        args.model_id,
+        vae=vae,
+        text_encoder=text_encoder,
+        tokenizer=tokenizer,
+        unet=unet,
+        scheduler=noise_scheduler,
+        safety_checker=None,
+        torch_dtype=dtype,
+    ).to(device)
+    pipeline.set_progress_bar_config(disable=True)
+
+    do_classifier_free_guidance = args.eval_sample_guidance_scale > 1.0
+    for prompt_index, prompt in enumerate(prompts):
+        supported, reason = describe_prompt_parse_support(prompt)
+        prompt_embeds = None
+        negative_prompt_embeds = None
+        cross_attention_kwargs: dict[str, Any] | None = None
+        slot_positions = None
+        slot_log_sigmas = None
+        if supported:
+            prompt_embeds, negative_prompt_embeds = pipeline.encode_prompt(
+                prompt=prompt,
+                device=device,
+                num_images_per_prompt=args.eval_sample_images,
+                do_classifier_free_guidance=do_classifier_free_guidance,
+                negative_prompt=None,
+            )
+            text_token_count = int(prompt_embeds.shape[1])
+            slot_embeddings, slot_positions, slot_log_sigmas, _ = build_relation_aware_conditioning(
+                prompt=prompt,
+                pipeline=pipeline,
+                graph_encoder=graph_encoder,
+                device=device,
+            )
+            slot_embeddings = slot_embeddings.to(prompt_embeds.dtype).repeat_interleave(
+                args.eval_sample_images,
+                dim=0,
+            )
+            prompt_embeds = torch.cat([prompt_embeds, slot_embeddings], dim=1)
+            if negative_prompt_embeds is not None:
+                negative_prompt_embeds = torch.cat(
+                    [negative_prompt_embeds, torch.zeros_like(slot_embeddings)],
+                    dim=1,
+                )
+            cross_attention_kwargs = {
+                "slot_positions": slot_positions.repeat_interleave(args.eval_sample_images, dim=0),
+                "slot_log_sigmas": slot_log_sigmas.repeat_interleave(args.eval_sample_images, dim=0),
+                "slot_mask": torch.ones(
+                    args.eval_sample_images,
+                    slot_positions.shape[1],
+                    dtype=torch.bool,
+                    device=slot_positions.device,
+                ),
+                "text_token_count": text_token_count,
+            }
+        else:
+            print(
+                "Validation sample warning: falling back to vanilla prompt conditioning for "
+                f"{prompt!r}. Reason: {reason}"
+            )
+
+        for image_index in range(args.eval_sample_images):
+            generator = torch.Generator(device="cpu").manual_seed(
+                args.seed + step * 1009 + prompt_index * args.eval_sample_images + image_index
+            )
+            filename = f"prompt{prompt_index:02d}_{image_index:02d}.png"
+            if supported:
+                assert prompt_embeds is not None
+                image_prompt_embeds = prompt_embeds[image_index : image_index + 1]
+                image_negative_prompt_embeds = (
+                    negative_prompt_embeds[image_index : image_index + 1]
+                    if negative_prompt_embeds is not None
+                    else None
+                )
+                image_cross_kwargs = {
+                    key: value[image_index : image_index + 1]
+                    if torch.is_tensor(value) and value.ndim > 0 and value.shape[0] == args.eval_sample_images
+                    else value
+                    for key, value in (cross_attention_kwargs or {}).items()
+                }
+                image = pipeline(
+                    prompt_embeds=image_prompt_embeds,
+                    negative_prompt_embeds=image_negative_prompt_embeds,
+                    cross_attention_kwargs=image_cross_kwargs,
+                    num_inference_steps=args.eval_sample_inference_steps,
+                    guidance_scale=args.eval_sample_guidance_scale,
+                    height=args.image_size,
+                    width=args.image_size,
+                    generator=generator,
+                ).images[0]
+            else:
+                image = pipeline(
+                    prompt=prompt,
+                    num_inference_steps=args.eval_sample_inference_steps,
+                    guidance_scale=args.eval_sample_guidance_scale,
+                    height=args.image_size,
+                    width=args.image_size,
+                    generator=generator,
+                ).images[0]
+            image.save(sample_dir / filename)
+            if supported:
+                assert slot_positions is not None
+                assert slot_log_sigmas is not None
+                save_gnn_overlay(
+                    image=image,
+                    prompt=prompt,
+                    slot_positions=slot_positions,
+                    slot_log_sigmas=slot_log_sigmas,
+                    output_path=overlay_dir / filename,
+                )
+
+    del pipeline
+    if was_unet_training:
+        unet.train()
+    if was_graph_training:
+        graph_encoder.train()
+    if device == "cuda":
+        torch.cuda.empty_cache()
+    print(f"Saved eval samples to {sample_dir}")
+    print(f"Saved eval GNN overlays to {overlay_dir}")
 
 
 def _drop_object_tokens_from_prompts(
@@ -862,6 +1072,31 @@ def main() -> int:
                         f"region_neg_out={eval_log['region_slot_neg_out_loss']:.4f}, "
                         f"inv_rel={eval_log['inverse_relation_loss']:.4f}, "
                         f"box={eval_log['box_loss']:.4f}"
+                    )
+                    sample_dataset = (
+                        datasets["train"]
+                        if args.eval_sample_source == "train" or len(datasets["eval"]) == 0
+                        else datasets["eval"]
+                    )
+                    eval_sample_prompts = _sample_eval_prompts(
+                        dataset=sample_dataset,
+                        prompt_count=args.eval_sample_prompts,
+                        step=global_step,
+                        seed=args.seed,
+                    )
+                    _run_relation_aware_eval_samples(
+                        args=args,
+                        output_dir=args.output_dir,
+                        prompts=eval_sample_prompts,
+                        device=device,
+                        dtype=weight_dtype,
+                        unet=unet,
+                        vae=vae,
+                        text_encoder=text_encoder,
+                        tokenizer=tokenizer,
+                        noise_scheduler=noise_scheduler,
+                        graph_encoder=graph_encoder,
+                        step=global_step,
                     )
 
                 if global_step % args.save_every == 0:
