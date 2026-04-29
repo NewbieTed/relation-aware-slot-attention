@@ -1,3 +1,17 @@
+"""Generate and benchmark vanilla, relation-aware, and ControlNet SD outputs.
+
+This module supports three related inference modes:
+1. Vanilla Stable Diffusion with only text prompts.
+2. Relation-aware slot-token inference, where GNN slot embeddings are appended
+   to CLIP tokens and optional relation-attention processors use slot geometry.
+3. ControlNet layout inference, where the frozen GNN produces Gaussian layout
+   maps and a trained ControlNet injects spatial residuals into the U-Net.
+
+The ControlNet path intentionally does not require appending slot tokens. That
+keeps the explicit-layout experiment separate from the older cross-attention
+experiments.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -221,6 +235,13 @@ def resolve_relation_aware_artifacts(
     relation_attention_path: Path | None,
     controlnet_path: Path | None,
 ) -> tuple[Path | None, Path | None, Path | None, Path | None, Path | None]:
+    """Resolve artifact paths from explicit args or a run's ``final`` folder.
+
+    A ``relation_aware_dir`` may contain any subset of ``unet/``, ``lora/``,
+    ``graph_encoder.pt``, ``relation_attention.pt``, and ``controlnet/``. This
+    resolver keeps old LoRA/full-U-Net runs and new ControlNet runs compatible.
+    """
+
     if relation_aware_dir is None:
         return unet_path, lora_path, graph_encoder_path, relation_attention_path, controlnet_path
 
@@ -250,6 +271,14 @@ def build_pipeline(
     *,
     disable_progress_bar: bool = True,
 ):
+    """Load the appropriate Diffusers pipeline and optional trained artifacts.
+
+    When ``controlnet_path`` is present, this returns a
+    ``StableDiffusionControlNetPipeline``. Otherwise it returns the normal
+    ``StableDiffusionPipeline``. Both expose the same text encoder, tokenizer,
+    VAE, and U-Net interfaces used later in generation.
+    """
+
     from diffusers import (
         ControlNetModel,
         StableDiffusionControlNetPipeline,
@@ -261,6 +290,8 @@ def build_pipeline(
     torch_dtype = torch.float16 if device in {"cuda", "mps"} else torch.float32
 
     if controlnet_path is not None:
+        # ControlNet checkpoints are saved independently from the base SD1.5
+        # weights, so we load the adapter and attach it to the base pipeline.
         if not controlnet_path.exists():
             raise FileNotFoundError(f"Missing ControlNet checkpoint path: {controlnet_path}")
         controlnet = ControlNetModel.from_pretrained(controlnet_path, torch_dtype=torch_dtype)
@@ -278,6 +309,7 @@ def build_pipeline(
             safety_checker=None,
         )
     if unet_path is not None:
+        # Full-U-Net fine-tuning checkpoints replace the base U-Net entirely.
         if not unet_path.exists():
             raise FileNotFoundError(f"Missing UNet checkpoint path: {unet_path}")
         pipeline.unet = UNet2DConditionModel.from_pretrained(
@@ -289,6 +321,8 @@ def build_pipeline(
 
     relation_attention_processors: dict[str, torch.nn.Module] | None = None
     if relation_attention_path is not None:
+        # Relation-attention processors are only for the old slot-token path.
+        # They are optional and intentionally independent from ControlNet.
         relation_attention_processors = install_relation_aware_processors(pipeline.unet)
         if relation_attention_path.exists():
             processor_state = torch.load(relation_attention_path, map_location="cpu")
@@ -313,6 +347,8 @@ def build_pipeline(
             )
 
     if lora_path is not None:
+        # LoRA adapters can still be evaluated for older runs. A pure ControlNet
+        # run normally leaves this unset.
         if not lora_path.exists():
             raise FileNotFoundError(f"Missing LoRA adapter path: {lora_path}")
         adapter_name = "scopdepth"
@@ -361,6 +397,8 @@ def save_run_config(
     layout_sigma_scale: float,
     controlnet_conditioning_scale: float,
 ) -> None:
+    """Persist the exact inference settings beside generated samples."""
+
     payload = {
         "model_key": model_key,
         "model_name": model_name,
@@ -396,6 +434,13 @@ def build_relation_aware_conditioning(
     graph_encoder: GraphSlotEncoder,
     device: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Run prompt parsing and frozen GNN conditioning for one text prompt.
+
+    The returned slot embeddings are used only by the relation-attention path.
+    The returned slot positions/sigmas are used by both relation-attention
+    overlays and ControlNet layout-map construction.
+    """
+
     scene_graph = parse_prompt_to_scene_graph(prompt)
     node_count = len(scene_graph["nodes"])
     slot_targets = torch.zeros(1, node_count, 3, device=device)
@@ -560,6 +605,8 @@ def make_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    """CLI entry point for prompt-file generation."""
+
     args = make_parser().parse_args()
     model_name = MODEL_REGISTRY[args.model]
     device = resolve_torch_device(args.device)
@@ -583,6 +630,8 @@ def main() -> int:
         relation_attention_path=args.relation_attention_path,
         controlnet_path=args.controlnet_path,
     )
+    # Keep "we have a GNN" separate from "we append slot tokens" and "we use
+    # ControlNet"; the three modes can overlap but should not be conflated.
     graph_conditioning_enabled = graph_encoder_path is not None
     controlnet_enabled = controlnet_path is not None
     relation_attention_enabled = graph_conditioning_enabled and (
@@ -609,6 +658,8 @@ def main() -> int:
     )
     graph_encoder: GraphSlotEncoder | None = None
     if graph_conditioning_enabled:
+        # The same frozen GNN can either provide slot embeddings for the old
+        # attention path or Gaussian layout maps for ControlNet.
         if not graph_encoder_path.exists():
             raise FileNotFoundError(f"Missing graph encoder checkpoint: {graph_encoder_path}")
         graph_encoder = load_graph_encoder(
@@ -656,6 +707,8 @@ def main() -> int:
         use_graph_for_prompt = graph_conditioning_enabled
 
         if graph_conditioning_enabled:
+            # Unsupported prompts fall back to vanilla text conditioning so a
+            # long benchmark run does not crash on one parser miss.
             supported, reason = describe_prompt_parse_support(prompt)
             if not supported:
                 fallback_count += 1
@@ -681,6 +734,8 @@ def main() -> int:
                     device=slot_positions.device,
                 )
                 if controlnet_enabled:
+                    # ControlNet sees an image-like condition: slot 0 heatmap,
+                    # slot 1 heatmap, and union heatmap.
                     control_image = build_gaussian_layout_maps(
                         slot_centers=slot_positions,
                         slot_log_sigmas=slot_log_sigmas,
@@ -689,6 +744,8 @@ def main() -> int:
                         sigma_scale=args.layout_sigma_scale,
                     ).to(device=device, dtype=control_image_dtype)
                 if relation_attention_enabled:
+                    # Old path: append GNN slot embeddings after CLIP tokens
+                    # and pass slot geometry into custom attention processors.
                     prompt_embeds, negative_prompt_embeds = pipeline.encode_prompt(
                         prompt=prompt,
                         device=device,
@@ -715,6 +772,8 @@ def main() -> int:
                         "text_token_count": text_token_count,
                     }
         if controlnet_enabled and control_image is None:
+            # If a ControlNet run hits an unsupported prompt, supply a blank
+            # condition and set conditioning scale to zero below.
             control_image = torch.zeros(
                 1,
                 3,
@@ -752,6 +811,8 @@ def main() -> int:
                     "generator": generator,
                 }
                 if controlnet_enabled:
+                    # ControlNet receives the same layout map for every image
+                    # sample of this prompt; only the diffusion seed changes.
                     pipeline_kwargs["image"] = control_image
                     pipeline_kwargs["controlnet_conditioning_scale"] = (
                         args.controlnet_conditioning_scale if use_graph_for_prompt else 0.0
@@ -767,6 +828,8 @@ def main() -> int:
                     "generator": generator,
                 }
                 if controlnet_enabled:
+                    # Pure ControlNet path: normal text prompt plus explicit
+                    # GNN layout map. No slot embeddings are appended here.
                     pipeline_kwargs["image"] = control_image
                     pipeline_kwargs["controlnet_conditioning_scale"] = (
                         args.controlnet_conditioning_scale if use_graph_for_prompt else 0.0

@@ -1,3 +1,17 @@
+"""Train a ControlNet adapter from relation-aware GNN layout maps.
+
+This trainer is intentionally separate from ``train_relation_aware_sd15.py``.
+The older path appends learned slot embeddings to the CLIP token sequence and
+modifies cross-attention. This path keeps the base SD1.5 U-Net, VAE, CLIP text
+encoder, and GNN frozen, then trains only a ControlNet branch that receives an
+explicit spatial condition image built from the GNN's predicted object ellipses.
+
+High-level data flow:
+    prompt/image row -> frozen GNN -> Gaussian layout map -> trainable ControlNet
+    normal CLIP prompt -> frozen U-Net cross-attention
+    ControlNet residuals + noisy latents -> frozen U-Net denoising prediction
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -36,6 +50,14 @@ from .train_sd15_lora import (
 
 
 def make_parser() -> argparse.ArgumentParser:
+    """Create CLI options for the ControlNet layout experiment.
+
+    The most important switches are ``--layout-source`` and
+    ``--controlnet-conditioning-scale``. ``layout-source=gnn`` tests the real
+    pipeline; ``layout-source=gt`` is a debugging upper bound using dataset
+    boxes instead of GNN predictions.
+    """
+
     parser = argparse.ArgumentParser(
         description="Train a ControlNet layout adapter for relation-aware SD1.5."
     )
@@ -73,6 +95,8 @@ def make_parser() -> argparse.ArgumentParser:
 
 
 def _save_state(output_dir: Path, *, step: int, args: argparse.Namespace) -> None:
+    """Write resumability/debug metadata for the current training run."""
+
     payload = {
         "step": step,
         "dataset_dir": str(args.dataset_dir),
@@ -96,6 +120,12 @@ def _save_controlnet(
     graph_encoder: GraphSlotEncoder,
     optimizer: torch.optim.Optimizer,
 ) -> Path:
+    """Save the trainable ControlNet plus frozen GNN reference checkpoint.
+
+    The graph encoder is frozen during training, but saving it beside the
+    ControlNet makes evaluation self-contained through ``--relation-aware-dir``.
+    """
+
     checkpoint_dir = output_dir / f"checkpoint-{step:06d}"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     controlnet.save_pretrained(checkpoint_dir / "controlnet")
@@ -111,6 +141,8 @@ def _sample_eval_prompts(
     step: int,
     seed: int,
 ) -> list[str]:
+    """Select deterministic validation prompts for periodic image snapshots."""
+
     rows = list(dataset.rows)
     if prompt_count <= 0 or not rows:
         return []
@@ -134,7 +166,21 @@ def _layout_from_batch(
     layout_source: str,
     sigma_scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build the image-like ControlNet condition for a training batch.
+
+    Returns:
+        layout: The rasterized Gaussian condition image.
+        slot_positions: GNN-predicted x/y/z centers, used for overlays.
+        slot_log_sigmas: GNN-predicted x/y log sigmas, used for overlays.
+        slot_mask: Boolean object-slot mask.
+    """
+
+    # Dataset rows may contain fewer objects in future variants, so derive the
+    # padded slot count from the current mini-batch rather than hard-coding two.
     max_nodes = max(len(graph["nodes"]) for graph in batch["scene_graphs"])
+
+    # Ground-truth centers/sigmas are still useful for debugging with
+    # --layout-source gt, and they provide the slot mask shape in both modes.
     gt_centers, slot_mask = bbox_centers_after_crop(
         batch["metadata"],
         batch["image_sizes"],
@@ -152,6 +198,9 @@ def _layout_from_batch(
         slot_targets=gt_centers,
         slot_mask=slot_mask,
     )
+
+    # The frozen GNN reads CLIP-pooled object labels plus scene-graph edges and
+    # predicts one embedding, center, and sigma pair per object slot.
     conditioning = build_slot_conditioning(
         tokenizer=tokenizer,
         text_encoder=text_encoder,
@@ -160,11 +209,17 @@ def _layout_from_batch(
         device=device,
     )
     if layout_source == "gt":
+        # Debug/upper-bound mode: bypass the learned GNN layout and ask whether
+        # ControlNet can use perfect dataset layout maps.
         layout_centers = gt_centers
         layout_log_sigmas = gt_log_sigmas
     else:
+        # Real experiment mode: use the GNN-predicted spatial layout.
         layout_centers = conditioning.slot_positions
         layout_log_sigmas = conditioning.slot_log_sigmas
+
+    # Convert centers/sigmas into the 3-channel raster condition consumed by
+    # ControlNet's conditioning stem.
     layout = build_gaussian_layout_maps(
         slot_centers=layout_centers,
         slot_log_sigmas=layout_log_sigmas,
@@ -193,11 +248,20 @@ def _build_losses(
     layout_sigma_scale: float,
     conditioning_scale: float,
 ) -> dict[str, torch.Tensor]:
+    """Run one forward pass and compute the ControlNet denoising objective.
+
+    Only ControlNet receives gradients. The VAE, text encoder, base U-Net, and
+    GNN are used as frozen feature/layout providers.
+    """
+
+    # Encode target images into SD latent space, exactly like normal diffusion
+    # fine-tuning. This is frozen, so gradients are not needed here.
     pixel_values = batch["pixel_values"].to(device=device, dtype=weight_dtype)
     with torch.no_grad():
         latents = vae.encode(pixel_values).latent_dist.sample()
         latents = latents * vae.config.scaling_factor
 
+    # Sample a diffusion timestep and corrupt the latent with Gaussian noise.
     noise = torch.randn_like(latents)
     timesteps = torch.randint(
         0,
@@ -208,6 +272,8 @@ def _build_losses(
     )
     noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
+    # Text conditioning remains vanilla CLIP. We deliberately do not append slot
+    # embeddings in this ControlNet experiment.
     text_inputs = tokenizer(
         batch["prompts"],
         padding="max_length",
@@ -232,6 +298,8 @@ def _build_losses(
         )
 
     with build_autocast_context(device, mixed_precision):
+        # ControlNet predicts additive residuals for the frozen U-Net blocks.
+        # The base U-Net still performs the final denoising prediction.
         down_res, mid_res = controlnet(
             noisy_latents,
             timesteps,
@@ -252,6 +320,9 @@ def _build_losses(
             if noise_scheduler.config.prediction_type == "epsilon"
             else noise_scheduler.get_velocity(latents, noise, timesteps)
         )
+
+        # The loss is intentionally just denoising MSE. Layout pressure enters
+        # through the ControlNet condition, not through extra hand-written terms.
         denoise_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
     return {"loss": denoise_loss, "denoise_loss": denoise_loss}
 
@@ -275,6 +346,8 @@ def _evaluate(
     layout_sigma_scale: float,
     conditioning_scale: float,
 ) -> dict[str, float]:
+    """Measure validation denoising loss without updating ControlNet weights."""
+
     controlnet.eval()
     total = 0.0
     count = 0
@@ -318,6 +391,13 @@ def _run_eval_samples(
     weight_dtype: torch.dtype,
     step: int,
 ) -> None:
+    """Generate qualitative validation images and matching GNN-layout overlays.
+
+    These samples are not used for optimization. They are a quick visual check
+    that the generated objects, ControlNet condition, and GNN-predicted ellipses
+    are at least moving in the same direction during training.
+    """
+
     if args.eval_sample_images <= 0 or not prompts:
         return
     from diffusers import StableDiffusionControlNetPipeline
@@ -330,6 +410,9 @@ def _run_eval_samples(
 
     was_training = controlnet.training
     controlnet.eval()
+
+    # Reuse the already-loaded frozen components and currently-trained
+    # ControlNet, so snapshots reflect the exact in-memory checkpoint.
     pipeline = StableDiffusionControlNetPipeline.from_pretrained(
         args.model_id,
         vae=vae,
@@ -343,8 +426,14 @@ def _run_eval_samples(
     pipeline.set_progress_bar_config(disable=True)
 
     for prompt_index, prompt in enumerate(prompts):
+        # Eval prompts come from dataset rows, but we still parse from text so
+        # this path matches standalone prompt generation as closely as possible.
         scene_graph = parse_prompt_to_scene_graph(prompt)
         max_nodes = len(scene_graph["nodes"])
+
+        # Prompt-only inference has no GT boxes, so dummy targets only provide
+        # shapes for the graph batching utility. The GNN prediction is what
+        # actually defines the ControlNet layout map below.
         dummy_targets = torch.zeros(1, max_nodes, 3, device=device)
         dummy_mask = torch.ones(1, max_nodes, dtype=torch.bool, device=device)
         scene_graph_batch = build_batched_scene_graphs(
@@ -367,6 +456,8 @@ def _run_eval_samples(
             sigma_scale=args.layout_sigma_scale,
         )
         for image_index in range(args.eval_sample_images):
+            # Use deterministic per-prompt/per-image seeds so snapshots are
+            # comparable across checkpoints.
             generator = torch.Generator(device="cpu").manual_seed(
                 args.seed + step * 1009 + prompt_index * args.eval_sample_images + image_index
             )
@@ -382,6 +473,9 @@ def _run_eval_samples(
             ).images[0]
             filename = f"prompt{prompt_index:02d}_{image_index:02d}.png"
             image.save(sample_dir / filename)
+
+            # Overlay lets us inspect whether bad generation is due to layout
+            # prediction or due to ControlNet/U-Net not using that layout well.
             save_gnn_overlay(
                 image=image,
                 prompt=prompt,
@@ -397,6 +491,8 @@ def _run_eval_samples(
 
 
 def main() -> int:
+    """CLI entry point for frozen-GNN ControlNet training."""
+
     args = make_parser().parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
@@ -408,6 +504,8 @@ def main() -> int:
         enabled=device == "cuda" and args.mixed_precision == "fp16",
     )
 
+    # Build stable train/eval/test splits and save the row manifest so a run can
+    # be audited later.
     datasets = build_dataset_splits(
         args.dataset_dir,
         image_size=args.image_size,
@@ -441,6 +539,8 @@ def main() -> int:
         collate_fn=collate_training_items,
     )
 
+    # Imports stay inside main so users who only inspect CLI help do not pay the
+    # cost of importing diffusers/transformers.
     from diffusers import AutoencoderKL, ControlNetModel, DDPMScheduler, UNet2DConditionModel
     from transformers import CLIPTextModel, CLIPTokenizer
 
@@ -451,6 +551,8 @@ def main() -> int:
     noise_scheduler = DDPMScheduler.from_pretrained(args.model_id, subfolder="scheduler")
     controlnet = ControlNetModel.from_unet(unet, conditioning_channels=3)
 
+    # Freeze the original SD pipeline. ControlNet is the only trainable model,
+    # which isolates whether explicit layout residuals help.
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
     unet.requires_grad_(False)
@@ -463,6 +565,9 @@ def main() -> int:
         if parameter.requires_grad and parameter.dtype != torch.float32:
             parameter.data = parameter.data.to(torch.float32)
 
+    # Load the pretrained relation-aware GNN and freeze it. This gives us a
+    # fixed layout generator rather than letting layout drift during ControlNet
+    # training.
     graph_encoder = GraphSlotEncoder(
         text_hidden_dim=text_encoder.config.hidden_size,
         slot_dim=args.slot_dim,
@@ -472,6 +577,8 @@ def main() -> int:
     graph_encoder.requires_grad_(False)
     graph_encoder.eval()
 
+    # AdamW defaults are used intentionally here; the main hyperparameter we are
+    # testing first is whether ControlNet can learn from the GNN condition map.
     optimizer = torch.optim.AdamW(controlnet.parameters(), lr=args.learning_rate)
     metrics_logger = MetricsLogger(args.output_dir, fieldnames=["step", "split", "loss", "denoise_loss"])
     _save_state(args.output_dir, step=0, args=args)
@@ -504,6 +611,9 @@ def main() -> int:
             loss = metrics["loss"]
             if not torch.isfinite(loss):
                 raise FloatingPointError("Encountered a non-finite ControlNet training loss.")
+
+            # Gradient accumulation keeps the effective batch size configurable
+            # without changing the per-GPU memory footprint.
             scaled_loss = loss / args.gradient_accumulation_steps
             if scaler.is_enabled():
                 scaler.scale(scaled_loss).backward()
@@ -513,6 +623,8 @@ def main() -> int:
             running_loss += float(loss.item())
             running_updates += 1
             if micro_step % args.gradient_accumulation_steps == 0:
+                # Optimizer step updates ControlNet only; frozen modules have
+                # requires_grad=False and never receive gradients.
                 if scaler.is_enabled():
                     scaler.step(optimizer)
                     scaler.update()
@@ -533,6 +645,8 @@ def main() -> int:
                     running_loss = 0.0
                     running_updates = 0
                 if len(datasets["eval"]) > 0 and args.eval_every > 0 and global_step % args.eval_every == 0:
+                    # Numeric eval catches training divergence, while image
+                    # snapshots catch "low loss but ugly image" failure modes.
                     eval_log = {
                         "step": global_step,
                         "split": "eval",
@@ -577,6 +691,8 @@ def main() -> int:
                         step=global_step,
                     )
                 if global_step % args.save_every == 0:
+                    # Store periodic checkpoints so we can roll back to the
+                    # best qualitative stage if later steps overfit or degrade.
                     checkpoint = _save_controlnet(
                         output_dir=args.output_dir,
                         step=global_step,
