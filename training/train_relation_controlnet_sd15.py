@@ -411,6 +411,11 @@ def _run_eval_samples(
     was_training = controlnet.training
     controlnet.eval()
 
+    # Training keeps ControlNet parameters in fp32 so GradScaler/autocast have
+    # stable master weights. Diffusers' pipeline feeds fp16 tensors during fp16
+    # inference, so temporarily match the inference dtype for sample generation.
+    controlnet.to(device=device, dtype=weight_dtype)
+
     # Reuse the already-loaded frozen components and currently-trained
     # ControlNet, so snapshots reflect the exact in-memory checkpoint.
     pipeline = StableDiffusionControlNetPipeline.from_pretrained(
@@ -484,6 +489,10 @@ def _run_eval_samples(
                 output_path=overlay_dir / filename,
             )
     del pipeline
+
+    # Restore fp32 parameters before returning to the optimizer-backed training
+    # loop. Parameter objects stay the same, so optimizer state remains attached.
+    controlnet.to(device=device, dtype=torch.float32)
     if was_training:
         controlnet.train()
     if device == "cuda":
