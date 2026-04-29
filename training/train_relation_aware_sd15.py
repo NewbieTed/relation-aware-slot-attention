@@ -17,7 +17,12 @@ from .attention_supervision import (
     collect_slot_attention_maps,
     compute_region_slot_loss,
 )
-from .dataset import build_dataset_splits, collate_training_items
+from .dataset import (
+    SCOPDepthTextToImageDataset,
+    build_dataset_splits,
+    collate_training_items,
+    load_metadata_rows,
+)
 from .graph_modules import (
     GraphSlotEncoder,
     build_slot_conditioning,
@@ -29,6 +34,7 @@ from .graph_modules import (
 )
 from .graph_targets import bbox_centers_after_crop, bbox_log_sigmas_after_crop
 from .metrics import MetricsLogger, write_split_manifest
+from .prompts import prompt_from_scop_depth_row
 from .relation_attention import install_relation_aware_processors
 from .scene_graph import build_batched_scene_graphs
 from .train_sd15_lora import (
@@ -69,6 +75,8 @@ def _save_state(
         "init_graph_encoder": str(args.init_graph_encoder) if args.init_graph_encoder else None,
         "freeze_graph_encoder": args.freeze_graph_encoder,
         "full_unet_finetune": args.full_unet_finetune,
+        "overfit_row_indices": args.overfit_row_indices,
+        "overfit_num_rows": args.overfit_num_rows,
         "validation_prompts": validation_prompts,
     }
     (output_dir / "training_state.json").write_text(json.dumps(payload, indent=2))
@@ -125,6 +133,18 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--save-every", type=int, default=250)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--limit-rows", type=int, default=None)
+    parser.add_argument(
+        "--overfit-row-indices",
+        type=str,
+        default=None,
+        help="Comma-separated metadata row indices to overfit. Reuses these rows for train/eval/test.",
+    )
+    parser.add_argument(
+        "--overfit-num-rows",
+        type=int,
+        default=0,
+        help="Overfit the first N rows after applying --limit-rows. Ignored if --overfit-row-indices is set.",
+    )
     parser.add_argument("--prompt-prefix", type=str, default="a photo of")
     parser.add_argument("--validation-prompts-file", type=Path, default=None)
     parser.add_argument("--num-validation-images", type=int, default=4)
@@ -145,6 +165,101 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--full-unet-finetune", action="store_true")
     parser.add_argument("--disable-tqdm", action="store_true")
     return parser
+
+
+def _parse_overfit_row_indices(raw_indices: str | None) -> list[int] | None:
+    if raw_indices is None:
+        return None
+    indices: list[int] = []
+    for piece in raw_indices.split(","):
+        piece = piece.strip()
+        if not piece:
+            continue
+        index = int(piece)
+        if index < 0:
+            raise ValueError("--overfit-row-indices cannot contain negative indices")
+        indices.append(index)
+    if not indices:
+        raise ValueError("--overfit-row-indices was provided but no indices were parsed")
+    return indices
+
+
+def _build_overfit_dataset_splits(
+    *,
+    dataset_dir: Path,
+    image_size: int,
+    prompt_prefix: str,
+    limit_rows: int | None,
+    row_indices: list[int] | None,
+    num_rows: int,
+) -> dict[str, SCOPDepthTextToImageDataset] | None:
+    if row_indices is None and num_rows <= 0:
+        return None
+
+    rows = load_metadata_rows(dataset_dir)
+    if limit_rows is not None:
+        rows = rows[:limit_rows]
+
+    if row_indices is not None:
+        max_index = len(rows) - 1
+        missing = [index for index in row_indices if index > max_index]
+        if missing:
+            raise IndexError(
+                f"Overfit row indices outside available range 0..{max_index}: {missing}"
+            )
+        selected_rows = [rows[index] for index in row_indices]
+    else:
+        selected_rows = rows[:num_rows]
+
+    if not selected_rows:
+        raise ValueError("Overfit mode selected no rows")
+
+    datasets = {
+        split: SCOPDepthTextToImageDataset(
+            dataset_dir,
+            image_size=image_size,
+            prompt_prefix=prompt_prefix,
+            rows=list(selected_rows),
+        )
+        for split in ("train", "eval", "test")
+    }
+    return datasets
+
+
+def _write_and_print_overfit_prompts(
+    *,
+    output_dir: Path,
+    dataset: SCOPDepthTextToImageDataset,
+) -> list[str]:
+    prompts = [
+        prompt_from_scop_depth_row(row, prefix=dataset.prompt_prefix)
+        for row in dataset.rows
+    ]
+    lines = ["Overfit prompts:"]
+    for index, (row, prompt) in enumerate(zip(dataset.rows, prompts)):
+        row_seq = row.get("seq", "unknown")
+        file_name = row.get("file_name", "unknown")
+        lines.append(f"{index}: seq={row_seq} file={file_name} prompt={prompt}")
+    text = "\n".join(lines) + "\n"
+    print(text)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "overfit_prompts.txt").write_text(text)
+    (output_dir / "overfit_prompts.json").write_text(
+        json.dumps(
+            [
+                {
+                    "overfit_index": index,
+                    "seq": row.get("seq"),
+                    "file_name": row.get("file_name"),
+                    "prompt": prompt,
+                    "oros": row.get("oros"),
+                }
+                for index, (row, prompt) in enumerate(zip(dataset.rows, prompts))
+            ],
+            indent=2,
+        )
+    )
+    return prompts
 
 
 def _drop_object_tokens_from_prompts(
@@ -447,15 +562,34 @@ def main() -> int:
         enabled=device == "cuda" and args.mixed_precision == "fp16",
     )
 
-    datasets = build_dataset_splits(
-        args.dataset_dir,
+    overfit_row_indices = _parse_overfit_row_indices(args.overfit_row_indices)
+    datasets = _build_overfit_dataset_splits(
+        dataset_dir=args.dataset_dir,
         image_size=args.image_size,
         prompt_prefix=args.prompt_prefix,
         limit_rows=args.limit_rows,
-        seed=args.seed,
-        eval_fraction=args.eval_fraction,
-        test_fraction=args.test_fraction,
+        row_indices=overfit_row_indices,
+        num_rows=args.overfit_num_rows,
     )
+    if datasets is None:
+        datasets = build_dataset_splits(
+            args.dataset_dir,
+            image_size=args.image_size,
+            prompt_prefix=args.prompt_prefix,
+            limit_rows=args.limit_rows,
+            seed=args.seed,
+            eval_fraction=args.eval_fraction,
+            test_fraction=args.test_fraction,
+        )
+    else:
+        print(
+            "Overfit mode enabled: using the selected rows for train, eval, and test "
+            "so we can verify memorization on a tiny set."
+        )
+        _write_and_print_overfit_prompts(
+            output_dir=args.output_dir,
+            dataset=datasets["train"],
+        )
     write_split_manifest(
         args.output_dir,
         train_rows=datasets["train"].rows,
