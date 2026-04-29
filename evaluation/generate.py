@@ -268,11 +268,20 @@ def build_pipeline(
         relation_attention_processors = install_relation_aware_processors(pipeline.unet)
         if relation_attention_path.exists():
             processor_state = torch.load(relation_attention_path, map_location="cpu")
+            missing_key_count = 0
+            unexpected_key_count = 0
             for name, module in relation_attention_processors.items():
                 state = processor_state.get(name)
                 if state is not None:
-                    module.load_state_dict(state)
+                    incompatible = module.load_state_dict(state, strict=False)
+                    missing_key_count += len(incompatible.missing_keys)
+                    unexpected_key_count += len(incompatible.unexpected_keys)
             print(f"Evaluation: loaded relation-attention weights from {relation_attention_path}")
+            if missing_key_count or unexpected_key_count:
+                print(
+                    "Evaluation: relation-attention checkpoint was loaded with "
+                    f"{missing_key_count} missing and {unexpected_key_count} unexpected processor keys."
+                )
         else:
             print(
                 "Evaluation warning: relation-attention weights were requested but not found at "

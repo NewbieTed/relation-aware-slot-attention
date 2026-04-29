@@ -150,10 +150,19 @@ def main() -> int:
     relation_attention_processors = install_relation_aware_processors(pipeline.unet)
     if relation_attention_path is not None and relation_attention_path.exists():
         processor_state = torch.load(relation_attention_path, map_location="cpu")
+        missing_key_count = 0
+        unexpected_key_count = 0
         for name, module in relation_attention_processors.items():
             state = processor_state.get(name)
             if state is not None:
-                module.load_state_dict(state)
+                incompatible = module.load_state_dict(state, strict=False)
+                missing_key_count += len(incompatible.missing_keys)
+                unexpected_key_count += len(incompatible.unexpected_keys)
+        if missing_key_count or unexpected_key_count:
+            print(
+                "Slot-usage inspection: relation-attention checkpoint was loaded with "
+                f"{missing_key_count} missing and {unexpected_key_count} unexpected processor keys."
+            )
 
     graph_encoder = None
     if relation_aware_enabled:

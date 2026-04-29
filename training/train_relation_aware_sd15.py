@@ -335,6 +335,8 @@ def _run_relation_aware_eval_samples(
 ) -> None:
     if args.eval_sample_images <= 0:
         return
+    if not prompts:
+        return
 
     from diffusers import StableDiffusionPipeline
 

@@ -50,7 +50,9 @@ class RelationAwareAttnProcessor2_0(nn.Module):
         self.enable_bias = enable_bias
         self.capture_attention = capture_attention
         self.spatial_scale = nn.Parameter(torch.tensor(2.0))
-        self.slot_logit_scale = nn.Parameter(torch.tensor(1.0))
+        self.slot_logit_scale = nn.Parameter(torch.tensor(0.5413))
+        self.gaussian_alpha = nn.Parameter(torch.tensor(-2.9444))
+        self.gaussian_beta = nn.Parameter(torch.tensor(-2.9444))
         self.latest_slot_attention_map: torch.Tensor | None = None
         self.latest_query_hw: tuple[int, int] | None = None
         self.reset_usage_stats()
@@ -183,7 +185,10 @@ class RelationAwareAttnProcessor2_0(nn.Module):
                 sigmas = slot_log_sigmas.exp().clamp(min=0.03, max=2.0)
                 normalized_delta = (grid.unsqueeze(2) - xy_positions.unsqueeze(1)) / sigmas.unsqueeze(1)
                 dist2 = (normalized_delta**2).sum(dim=-1)
-                slot_bias = -0.5 * self.spatial_scale.exp() * dist2
+                gaussian = torch.exp(-0.5 * dist2)
+                alpha = F.softplus(self.gaussian_alpha)
+                beta = F.softplus(self.gaussian_beta)
+                slot_bias = alpha * gaussian - beta * (1.0 - gaussian)
             else:
                 dist2 = ((grid.unsqueeze(2) - xy_positions.unsqueeze(1)) ** 2).sum(dim=-1)
                 slot_bias = -self.spatial_scale.exp() * dist2
@@ -195,7 +200,8 @@ class RelationAwareAttnProcessor2_0(nn.Module):
                 device=query.device,
                 dtype=query.dtype,
             )
-            full_bias[:, :, text_token_count:] = slot_bias.to(query.dtype) * self.slot_logit_scale
+            slot_logit_scale = F.softplus(self.slot_logit_scale)
+            full_bias[:, :, text_token_count:] = slot_bias.to(query.dtype) * slot_logit_scale
             full_bias = full_bias.unsqueeze(1).expand(-1, attn.heads, -1, -1)
             attention_mask = full_bias if attention_mask is None else attention_mask + full_bias
 
