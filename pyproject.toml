@@ -34,6 +34,7 @@ train = [
 scop-depth = "scop_depth.__main__:main"
 scop-depth-train-lora = "training.train_sd15_lora:main"
 scop-depth-train-relation-aware = "training.train_relation_aware_sd15:main"
+scop-depth-train-controlnet = "training.train_relation_controlnet_sd15:main"
 
 [tool.setuptools]
 

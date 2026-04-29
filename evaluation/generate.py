@@ -11,6 +11,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from evaluation.prompt_parser import parse_prompt_to_scene_graph
 from training.graph_modules import GraphSlotEncoder, build_slot_conditioning
+from training.layout_conditioning import build_gaussian_layout_maps
 from training.relation_attention import install_relation_aware_processors
 from training.scene_graph import build_batched_scene_graphs
 
@@ -218,9 +219,10 @@ def resolve_relation_aware_artifacts(
     lora_path: Path | None,
     graph_encoder_path: Path | None,
     relation_attention_path: Path | None,
-) -> tuple[Path | None, Path | None, Path | None, Path | None]:
+    controlnet_path: Path | None,
+) -> tuple[Path | None, Path | None, Path | None, Path | None, Path | None]:
     if relation_aware_dir is None:
-        return unet_path, lora_path, graph_encoder_path, relation_attention_path
+        return unet_path, lora_path, graph_encoder_path, relation_attention_path, controlnet_path
 
     candidate_unet = relation_aware_dir / "unet"
     resolved_unet = unet_path or (candidate_unet if candidate_unet.exists() else None)
@@ -231,7 +233,11 @@ def resolve_relation_aware_artifacts(
         resolved_lora = candidate_lora if candidate_lora.exists() else None
     resolved_graph = graph_encoder_path or (relation_aware_dir / "graph_encoder.pt")
     resolved_attention = relation_attention_path or (relation_aware_dir / "relation_attention.pt")
-    return resolved_unet, resolved_lora, resolved_graph, resolved_attention
+    candidate_controlnet = relation_aware_dir / "controlnet"
+    resolved_controlnet = controlnet_path or (
+        candidate_controlnet if candidate_controlnet.exists() else None
+    )
+    return resolved_unet, resolved_lora, resolved_graph, resolved_attention, resolved_controlnet
 
 
 def build_pipeline(
@@ -240,19 +246,37 @@ def build_pipeline(
     unet_path: Path | None = None,
     lora_path: Path | None = None,
     relation_attention_path: Path | None = None,
+    controlnet_path: Path | None = None,
     *,
     disable_progress_bar: bool = True,
 ):
-    from diffusers import StableDiffusionPipeline, UNet2DConditionModel
+    from diffusers import (
+        ControlNetModel,
+        StableDiffusionControlNetPipeline,
+        StableDiffusionPipeline,
+        UNet2DConditionModel,
+    )
 
     os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
     torch_dtype = torch.float16 if device in {"cuda", "mps"} else torch.float32
 
-    pipeline = StableDiffusionPipeline.from_pretrained(
-        model_name,
-        torch_dtype=torch_dtype,
-        safety_checker=None,
-    )
+    if controlnet_path is not None:
+        if not controlnet_path.exists():
+            raise FileNotFoundError(f"Missing ControlNet checkpoint path: {controlnet_path}")
+        controlnet = ControlNetModel.from_pretrained(controlnet_path, torch_dtype=torch_dtype)
+        pipeline = StableDiffusionControlNetPipeline.from_pretrained(
+            model_name,
+            controlnet=controlnet,
+            torch_dtype=torch_dtype,
+            safety_checker=None,
+        )
+        print(f"Evaluation: loaded ControlNet weights from {controlnet_path}")
+    else:
+        pipeline = StableDiffusionPipeline.from_pretrained(
+            model_name,
+            torch_dtype=torch_dtype,
+            safety_checker=None,
+        )
     if unet_path is not None:
         if not unet_path.exists():
             raise FileNotFoundError(f"Missing UNet checkpoint path: {unet_path}")
@@ -324,6 +348,7 @@ def save_run_config(
     lora_path: Path | None,
     graph_encoder_path: Path | None,
     relation_attention_path: Path | None,
+    controlnet_path: Path | None,
     prompt_file: Path,
     device: str,
     seed: int,
@@ -333,6 +358,8 @@ def save_run_config(
     image_size: int,
     prompt_count: int,
     save_gnn_overlays: bool,
+    layout_sigma_scale: float,
+    controlnet_conditioning_scale: float,
 ) -> None:
     payload = {
         "model_key": model_key,
@@ -341,6 +368,7 @@ def save_run_config(
         "lora_path": str(lora_path) if lora_path is not None else None,
         "graph_encoder_path": str(graph_encoder_path) if graph_encoder_path is not None else None,
         "relation_attention_path": str(relation_attention_path) if relation_attention_path is not None else None,
+        "controlnet_path": str(controlnet_path) if controlnet_path is not None else None,
         "prompt_file": str(prompt_file),
         "device": device,
         "seed": seed,
@@ -350,6 +378,8 @@ def save_run_config(
         "image_size": image_size,
         "prompt_count": prompt_count,
         "save_gnn_overlays": save_gnn_overlays,
+        "layout_sigma_scale": layout_sigma_scale,
+        "controlnet_conditioning_scale": controlnet_conditioning_scale,
         "output_layout": "t2i-compbench-style",
     }
     (output_dir / "run_config.json").write_text(json.dumps(payload, indent=2))
@@ -457,6 +487,24 @@ def make_parser() -> argparse.ArgumentParser:
         help="Optional relation-attention processor checkpoint for relation-aware generation.",
     )
     parser.add_argument(
+        "--controlnet-path",
+        type=Path,
+        default=None,
+        help="Optional ControlNet checkpoint directory for explicit GNN layout conditioning.",
+    )
+    parser.add_argument(
+        "--layout-sigma-scale",
+        type=float,
+        default=1.0,
+        help="Scale applied to GNN-predicted layout sigmas before building ControlNet maps.",
+    )
+    parser.add_argument(
+        "--controlnet-conditioning-scale",
+        type=float,
+        default=1.0,
+        help="ControlNet conditioning strength used during generation.",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=42,
@@ -521,14 +569,27 @@ def main() -> int:
     if not prompts:
         raise ValueError("No prompts found in prompt file")
 
-    unet_path, lora_path, graph_encoder_path, relation_attention_path = resolve_relation_aware_artifacts(
+    (
+        unet_path,
+        lora_path,
+        graph_encoder_path,
+        relation_attention_path,
+        controlnet_path,
+    ) = resolve_relation_aware_artifacts(
         relation_aware_dir=args.relation_aware_dir,
         unet_path=args.unet_path,
         lora_path=args.lora_path,
         graph_encoder_path=args.graph_encoder_path,
         relation_attention_path=args.relation_attention_path,
+        controlnet_path=args.controlnet_path,
     )
-    relation_aware_enabled = graph_encoder_path is not None
+    graph_conditioning_enabled = graph_encoder_path is not None
+    controlnet_enabled = controlnet_path is not None
+    relation_attention_enabled = graph_conditioning_enabled and (
+        relation_attention_path is not None and relation_attention_path.exists()
+    )
+    if controlnet_enabled and not graph_conditioning_enabled:
+        raise ValueError("ControlNet generation requires --graph-encoder-path or a relation-aware dir with graph_encoder.pt.")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     samples_dir = args.output_dir / "samples"
@@ -542,11 +603,12 @@ def main() -> int:
         device,
         unet_path=unet_path,
         lora_path=lora_path,
-        relation_attention_path=relation_attention_path if relation_aware_enabled else None,
+        relation_attention_path=relation_attention_path if relation_attention_enabled else None,
+        controlnet_path=controlnet_path,
         disable_progress_bar=not args.show_progress_bar,
     )
     graph_encoder: GraphSlotEncoder | None = None
-    if relation_aware_enabled:
+    if graph_conditioning_enabled:
         if not graph_encoder_path.exists():
             raise FileNotFoundError(f"Missing graph encoder checkpoint: {graph_encoder_path}")
         graph_encoder = load_graph_encoder(
@@ -564,7 +626,8 @@ def main() -> int:
         unet_path=unet_path,
         lora_path=lora_path,
         graph_encoder_path=graph_encoder_path,
-        relation_attention_path=relation_attention_path if relation_aware_enabled else None,
+        relation_attention_path=relation_attention_path if relation_attention_enabled else None,
+        controlnet_path=controlnet_path,
         prompt_file=args.prompts_file,
         device=device,
         seed=args.seed,
@@ -574,10 +637,13 @@ def main() -> int:
         image_size=args.image_size,
         prompt_count=len(prompts),
         save_gnn_overlays=args.save_gnn_overlays,
+        layout_sigma_scale=args.layout_sigma_scale,
+        controlnet_conditioning_scale=args.controlnet_conditioning_scale,
     )
 
     global_image_index = args.start_index
     do_classifier_free_guidance = args.guidance_scale > 1.0
+    control_image_dtype = next(pipeline.unet.parameters()).dtype
     fallback_count = 0
     for prompt_index, prompt in enumerate(prompts):
         cross_attention_kwargs: dict[str, Any] | None = None
@@ -585,27 +651,21 @@ def main() -> int:
         negative_prompt_embeds = None
         prompt_slot_positions = None
         prompt_slot_log_sigmas = None
-        use_relation_aware_for_prompt = relation_aware_enabled
+        control_image = None
+        prompt_slot_mask = None
+        use_graph_for_prompt = graph_conditioning_enabled
 
-        if relation_aware_enabled:
+        if graph_conditioning_enabled:
             supported, reason = describe_prompt_parse_support(prompt)
             if not supported:
                 fallback_count += 1
-                use_relation_aware_for_prompt = False
+                use_graph_for_prompt = False
                 print(
                     "Evaluation warning: falling back to vanilla prompt conditioning for "
                     f"unsupported relation prompt: {prompt!r}. Reason: {reason}"
                 )
             else:
                 assert graph_encoder is not None
-                prompt_embeds, negative_prompt_embeds = pipeline.encode_prompt(
-                    prompt=prompt,
-                    device=device,
-                    num_images_per_prompt=args.num_images_per_prompt,
-                    do_classifier_free_guidance=do_classifier_free_guidance,
-                    negative_prompt=None,
-                )
-                text_token_count = int(prompt_embeds.shape[1])
                 slot_embeddings, slot_positions, slot_log_sigmas, _ = build_relation_aware_conditioning(
                     prompt=prompt,
                     pipeline=pipeline,
@@ -614,31 +674,61 @@ def main() -> int:
                 )
                 prompt_slot_positions = slot_positions
                 prompt_slot_log_sigmas = slot_log_sigmas
-                slot_embeddings = slot_embeddings.to(prompt_embeds.dtype).repeat_interleave(
-                    args.num_images_per_prompt,
-                    dim=0,
+                prompt_slot_mask = torch.ones(
+                    1,
+                    slot_positions.shape[1],
+                    dtype=torch.bool,
+                    device=slot_positions.device,
                 )
-                prompt_embeds = torch.cat([prompt_embeds, slot_embeddings], dim=1)
-                if negative_prompt_embeds is not None:
-                    zero_slots = torch.zeros_like(slot_embeddings)
-                    negative_prompt_embeds = torch.cat([negative_prompt_embeds, zero_slots], dim=1)
-                cross_attention_kwargs = {
-                    "slot_positions": slot_positions.repeat_interleave(args.num_images_per_prompt, dim=0),
-                    "slot_log_sigmas": slot_log_sigmas.repeat_interleave(args.num_images_per_prompt, dim=0),
-                    "slot_mask": torch.ones(
+                if controlnet_enabled:
+                    control_image = build_gaussian_layout_maps(
+                        slot_centers=slot_positions,
+                        slot_log_sigmas=slot_log_sigmas,
+                        slot_mask=prompt_slot_mask,
+                        image_size=args.image_size,
+                        sigma_scale=args.layout_sigma_scale,
+                    ).to(device=device, dtype=control_image_dtype)
+                if relation_attention_enabled:
+                    prompt_embeds, negative_prompt_embeds = pipeline.encode_prompt(
+                        prompt=prompt,
+                        device=device,
+                        num_images_per_prompt=args.num_images_per_prompt,
+                        do_classifier_free_guidance=do_classifier_free_guidance,
+                        negative_prompt=None,
+                    )
+                    text_token_count = int(prompt_embeds.shape[1])
+                    repeated_slot_embeddings = slot_embeddings.to(prompt_embeds.dtype).repeat_interleave(
                         args.num_images_per_prompt,
-                        slot_positions.shape[1],
-                        dtype=torch.bool,
-                        device=slot_positions.device,
-                    ),
-                    "text_token_count": text_token_count,
-                }
+                        dim=0,
+                    )
+                    prompt_embeds = torch.cat([prompt_embeds, repeated_slot_embeddings], dim=1)
+                    if negative_prompt_embeds is not None:
+                        zero_slots = torch.zeros_like(repeated_slot_embeddings)
+                        negative_prompt_embeds = torch.cat([negative_prompt_embeds, zero_slots], dim=1)
+                    cross_attention_kwargs = {
+                        "slot_positions": slot_positions.repeat_interleave(args.num_images_per_prompt, dim=0),
+                        "slot_log_sigmas": slot_log_sigmas.repeat_interleave(
+                            args.num_images_per_prompt,
+                            dim=0,
+                        ),
+                        "slot_mask": prompt_slot_mask.repeat_interleave(args.num_images_per_prompt, dim=0),
+                        "text_token_count": text_token_count,
+                    }
+        if controlnet_enabled and control_image is None:
+            control_image = torch.zeros(
+                1,
+                3,
+                args.image_size,
+                args.image_size,
+                device=device,
+                dtype=control_image_dtype,
+            )
 
         for image_index in range(args.num_images_per_prompt):
             generator = torch.Generator(device="cpu").manual_seed(
                 args.seed + prompt_index * args.num_images_per_prompt + image_index
             )
-            if use_relation_aware_for_prompt:
+            if relation_attention_enabled and use_graph_for_prompt:
                 image_prompt_embeds = prompt_embeds[image_index : image_index + 1]
                 image_negative_prompt_embeds = (
                     negative_prompt_embeds[image_index : image_index + 1]
@@ -651,29 +741,41 @@ def main() -> int:
                     else value
                     for key, value in (cross_attention_kwargs or {}).items()
                 }
-                result = pipeline(
-                    prompt_embeds=image_prompt_embeds,
-                    negative_prompt_embeds=image_negative_prompt_embeds,
-                    cross_attention_kwargs=image_cross_kwargs,
-                    num_inference_steps=args.num_inference_steps,
-                    guidance_scale=args.guidance_scale,
-                    height=args.image_size,
-                    width=args.image_size,
-                    generator=generator,
-                )
+                pipeline_kwargs = {
+                    "prompt_embeds": image_prompt_embeds,
+                    "negative_prompt_embeds": image_negative_prompt_embeds,
+                    "cross_attention_kwargs": image_cross_kwargs,
+                    "num_inference_steps": args.num_inference_steps,
+                    "guidance_scale": args.guidance_scale,
+                    "height": args.image_size,
+                    "width": args.image_size,
+                    "generator": generator,
+                }
+                if controlnet_enabled:
+                    pipeline_kwargs["image"] = control_image
+                    pipeline_kwargs["controlnet_conditioning_scale"] = (
+                        args.controlnet_conditioning_scale if use_graph_for_prompt else 0.0
+                    )
+                result = pipeline(**pipeline_kwargs)
             else:
-                result = pipeline(
-                    prompt=prompt,
-                    num_inference_steps=args.num_inference_steps,
-                    guidance_scale=args.guidance_scale,
-                    height=args.image_size,
-                    width=args.image_size,
-                    generator=generator,
-                )
+                pipeline_kwargs = {
+                    "prompt": prompt,
+                    "num_inference_steps": args.num_inference_steps,
+                    "guidance_scale": args.guidance_scale,
+                    "height": args.image_size,
+                    "width": args.image_size,
+                    "generator": generator,
+                }
+                if controlnet_enabled:
+                    pipeline_kwargs["image"] = control_image
+                    pipeline_kwargs["controlnet_conditioning_scale"] = (
+                        args.controlnet_conditioning_scale if use_graph_for_prompt else 0.0
+                    )
+                result = pipeline(**pipeline_kwargs)
             image: Image.Image = result.images[0]
             image_name = prompt_to_filename(prompt, global_image_index)
             image.save(samples_dir / image_name)
-            if args.save_gnn_overlays and use_relation_aware_for_prompt:
+            if args.save_gnn_overlays and use_graph_for_prompt:
                 assert prompt_slot_positions is not None
                 assert prompt_slot_log_sigmas is not None
                 save_gnn_overlay(
@@ -685,7 +787,7 @@ def main() -> int:
                 )
             global_image_index += 1
 
-    if relation_aware_enabled and fallback_count > 0:
+    if graph_conditioning_enabled and fallback_count > 0:
         print(
             "Evaluation summary: "
             f"{fallback_count} prompt(s) used vanilla fallback because the rule-based parser "
