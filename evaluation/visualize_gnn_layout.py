@@ -27,7 +27,12 @@ def make_parser() -> argparse.ArgumentParser:
         description="Visualize GNN-predicted slot layout against SCOP-Depth bbox center/sigma targets."
     )
     parser.add_argument("--prompt", type=str, required=True)
-    parser.add_argument("--dataset-dir", type=Path, required=True)
+    parser.add_argument(
+        "--dataset-dir",
+        type=Path,
+        default=None,
+        help="Optional SCOP-Depth export for GT comparison. If omitted or no prompt match is found, saves prediction-only visuals.",
+    )
     parser.add_argument("--graph-encoder-path", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--row-index", type=int, default=None)
@@ -297,6 +302,38 @@ def _render_layout_comparison(
     image.save(output_path)
 
 
+def _render_prediction_layout(
+    *,
+    labels: list[str],
+    pred_centers: list[list[float]],
+    pred_sigmas: list[list[float]],
+    output_path: Path,
+) -> None:
+    font = _load_font(20)
+    image = Image.new("RGB", (620, 640), "white")
+    draw = ImageDraw.Draw(image)
+    colors = ["#0077b6", "#d62828", "#2a9d8f", "#f77f00"]
+    draw.text(
+        (20, 18),
+        "GNN Predicted Layout (x,y in [-1,1])",
+        font=font,
+        fill="#111827",
+    )
+    _draw_layout(
+        draw,
+        centers=pred_centers,
+        sigmas=pred_sigmas,
+        labels=labels,
+        colors=colors,
+        offset_x=54,
+        offset_y=90,
+        title="GNN predicted center / sigma",
+        font=font,
+        solid=False,
+    )
+    image.save(output_path)
+
+
 def _draw_overlay_on_crop(
     *,
     image_path: Path,
@@ -434,14 +471,93 @@ def _build_report(
     return "\n".join(lines), table_lines, payload
 
 
+def _build_prediction_only_report(
+    *,
+    prompt: str,
+    scene_graph: dict[str, Any],
+    labels: list[str],
+    pred_centers: list[list[float]],
+    pred_sigmas: list[list[float]],
+) -> tuple[str, list[str], dict[str, Any]]:
+    lines: list[str] = []
+    lines.append(f"Prompt: {prompt}")
+    lines.append("Mode: prediction-only prompt visualization")
+    lines.append("")
+    lines.append("Scene graph:")
+    for node in scene_graph["nodes"]:
+        lines.append(f"  Node {node['id']}: {node['label']}")
+    for edge in scene_graph["edges"]:
+        lines.append(f"  Prompt edge {edge['source_id']} -> {edge['target_id']}: {edge['relation']}")
+    lines.append("Effective message-passing edges:")
+    for edge in _edges_with_inverses(scene_graph):
+        kind = "inverse" if edge["is_inverse"] else "forward"
+        lines.append(
+            f"  {kind} edge {edge['source_id']} -> {edge['target_id']}: {edge['relation']}"
+        )
+    lines.append("")
+    lines.append("No ground-truth row was used. Values below are GNN predictions only.")
+    lines.append("x,y are in [-1,1]. sigma values are normalized ellipse radii.")
+    lines.append("")
+
+    table_lines: list[str] = []
+    for label, pred_center, pred_sigma in zip(labels, pred_centers, pred_sigmas):
+        block = [
+            f"{label}:",
+            f"  Pred center = ({pred_center[0]:+.4f}, {pred_center[1]:+.4f}, {pred_center[2]:+.4f})",
+            f"  Pred sigma  = ({pred_sigma[0]:.4f}, {pred_sigma[1]:.4f})",
+        ]
+        lines.extend(block)
+        lines.append("")
+        table_lines.extend(block)
+        table_lines.append("")
+
+    payload = {
+        "prompt": prompt,
+        "matched_row_index": None,
+        "mode": "prediction_only",
+        "scene_graph": scene_graph,
+        "labels": labels,
+        "prediction": [
+            {"label": label, "center_xyz": center, "sigma_xy": sigma}
+            for label, center, sigma in zip(labels, pred_centers, pred_sigmas)
+        ],
+    }
+    return "\n".join(lines), table_lines, payload
+
+
 def main() -> int:
     args = make_parser().parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    rows = load_metadata_rows(args.dataset_dir)
-    row_index, row = _find_row(prompt=args.prompt, rows=rows, row_index=args.row_index)
-    prompt = prompt_from_scop_depth_row(row) if args.row_index is not None else args.prompt
-    scene_graph = scene_graph_payload_from_row(row)
+    row_index: int | None = None
+    row: dict[str, Any] | None = None
+    image_size: tuple[int, int] | None = None
+    prompt = args.prompt
+    if args.dataset_dir is not None:
+        rows = load_metadata_rows(args.dataset_dir)
+        try:
+            row_index, row = _find_row(prompt=args.prompt, rows=rows, row_index=args.row_index)
+        except ValueError:
+            if args.row_index is not None:
+                raise
+            print(
+                "No exact metadata prompt match found. Falling back to prompt-only "
+                "prediction visualization without ground truth."
+            )
+        if row is not None:
+            prompt = prompt_from_scop_depth_row(row) if args.row_index is not None else args.prompt
+            image_path = args.dataset_dir / row["file_name"]
+            if not image_path.exists():
+                raise FileNotFoundError(f"Could not find matched row image: {image_path}")
+            image_size = Image.open(image_path).size
+            scene_graph = scene_graph_payload_from_row(row)
+        else:
+            scene_graph = parse_prompt_to_scene_graph(prompt)
+    else:
+        if args.row_index is not None:
+            raise ValueError("--row-index requires --dataset-dir")
+        scene_graph = parse_prompt_to_scene_graph(prompt)
+
     prompt_relation: str | None = None
     try:
         parsed_prompt_graph = parse_prompt_to_scene_graph(prompt)
@@ -455,11 +571,6 @@ def main() -> int:
             "Warning: parsed prompt relation does not appear in matched metadata row. "
             "Using metadata scene graph for GT alignment."
         )
-
-    image_path = args.dataset_dir / row["file_name"]
-    if not image_path.exists():
-        raise FileNotFoundError(f"Could not find matched row image: {image_path}")
-    image_size = Image.open(image_path).size
 
     device = resolve_torch_device(args.device)
     model_id = args.model_id or MODEL_REGISTRY[args.model]
@@ -475,18 +586,40 @@ def main() -> int:
     graph_encoder.eval()
 
     max_nodes = len(scene_graph["nodes"])
-    slot_targets, slot_mask = bbox_centers_after_crop(
-        [row],
-        [image_size],
-        max_nodes=max_nodes,
-        device=torch.device(device),
-    )
-    log_sigma_targets, _ = bbox_log_sigmas_after_crop(
-        [row],
-        [image_size],
-        max_nodes=max_nodes,
-        device=torch.device(device),
-    )
+    if row is not None and image_size is not None:
+        slot_targets, slot_mask = bbox_centers_after_crop(
+            [row],
+            [image_size],
+            max_nodes=max_nodes,
+            device=torch.device(device),
+        )
+        log_sigma_targets, _ = bbox_log_sigmas_after_crop(
+            [row],
+            [image_size],
+            max_nodes=max_nodes,
+            device=torch.device(device),
+        )
+    else:
+        slot_targets = torch.zeros(
+            1,
+            max_nodes,
+            3,
+            device=torch.device(device),
+            dtype=torch.float32,
+        )
+        slot_mask = torch.ones(
+            1,
+            max_nodes,
+            device=torch.device(device),
+            dtype=torch.bool,
+        )
+        log_sigma_targets = torch.zeros(
+            1,
+            max_nodes,
+            2,
+            device=torch.device(device),
+            dtype=torch.float32,
+        )
     batched_graph = build_batched_scene_graphs(
         [scene_graph],
         slot_targets=slot_targets,
@@ -502,22 +635,33 @@ def main() -> int:
         )
 
     labels = [str(node["label"]) for node in scene_graph["nodes"]]
-    gt_centers = [_to_float_list(value) for value in slot_targets[0, :max_nodes]]
-    gt_sigmas = [_to_float_list(value.exp()) for value in log_sigma_targets[0, :max_nodes]]
     pred_centers = [_to_float_list(value) for value in conditioning.slot_positions[0, :max_nodes]]
     pred_sigmas = [_to_float_list(value.exp()) for value in conditioning.slot_log_sigmas[0, :max_nodes]]
 
-    report, table_lines, payload = _build_report(
-        row_index=row_index,
-        row=row,
-        prompt=prompt,
-        scene_graph=scene_graph,
-        labels=labels,
-        gt_centers=gt_centers,
-        gt_sigmas=gt_sigmas,
-        pred_centers=pred_centers,
-        pred_sigmas=pred_sigmas,
-    )
+    if row is not None and row_index is not None:
+        gt_centers = [_to_float_list(value) for value in slot_targets[0, :max_nodes]]
+        gt_sigmas = [_to_float_list(value.exp()) for value in log_sigma_targets[0, :max_nodes]]
+        report, table_lines, payload = _build_report(
+            row_index=row_index,
+            row=row,
+            prompt=prompt,
+            scene_graph=scene_graph,
+            labels=labels,
+            gt_centers=gt_centers,
+            gt_sigmas=gt_sigmas,
+            pred_centers=pred_centers,
+            pred_sigmas=pred_sigmas,
+        )
+    else:
+        gt_centers = []
+        gt_sigmas = []
+        report, table_lines, payload = _build_prediction_only_report(
+            prompt=prompt,
+            scene_graph=scene_graph,
+            labels=labels,
+            pred_centers=pred_centers,
+            pred_sigmas=pred_sigmas,
+        )
 
     (args.output_dir / "gnn_layout_report.txt").write_text(report)
     (args.output_dir / "gnn_layout_values.json").write_text(json.dumps(payload, indent=2))
@@ -526,23 +670,32 @@ def main() -> int:
         scene_graph=scene_graph,
         output_path=args.output_dir / "scene_graph.png",
     )
-    _render_layout_comparison(
-        labels=labels,
-        gt_centers=gt_centers,
-        gt_sigmas=gt_sigmas,
-        pred_centers=pred_centers,
-        pred_sigmas=pred_sigmas,
-        output_path=args.output_dir / "layout_comparison.png",
-    )
-    _draw_overlay_on_crop(
-        image_path=image_path,
-        labels=labels,
-        gt_centers=gt_centers,
-        gt_sigmas=gt_sigmas,
-        pred_centers=pred_centers,
-        pred_sigmas=pred_sigmas,
-        output_path=args.output_dir / "crop_overlay_comparison.png",
-    )
+    if row is not None and args.dataset_dir is not None:
+        image_path = args.dataset_dir / row["file_name"]
+        _render_layout_comparison(
+            labels=labels,
+            gt_centers=gt_centers,
+            gt_sigmas=gt_sigmas,
+            pred_centers=pred_centers,
+            pred_sigmas=pred_sigmas,
+            output_path=args.output_dir / "layout_comparison.png",
+        )
+        _draw_overlay_on_crop(
+            image_path=image_path,
+            labels=labels,
+            gt_centers=gt_centers,
+            gt_sigmas=gt_sigmas,
+            pred_centers=pred_centers,
+            pred_sigmas=pred_sigmas,
+            output_path=args.output_dir / "crop_overlay_comparison.png",
+        )
+    else:
+        _render_prediction_layout(
+            labels=labels,
+            pred_centers=pred_centers,
+            pred_sigmas=pred_sigmas,
+            output_path=args.output_dir / "predicted_layout.png",
+        )
     _render_summary_image(
         prompt=prompt,
         report_lines=table_lines,
@@ -551,8 +704,11 @@ def main() -> int:
     print(report)
     print("")
     print(f"Saved scene graph image to {args.output_dir / 'scene_graph.png'}")
-    print(f"Saved layout comparison to {args.output_dir / 'layout_comparison.png'}")
-    print(f"Saved crop overlay comparison to {args.output_dir / 'crop_overlay_comparison.png'}")
+    if row is not None:
+        print(f"Saved layout comparison to {args.output_dir / 'layout_comparison.png'}")
+        print(f"Saved crop overlay comparison to {args.output_dir / 'crop_overlay_comparison.png'}")
+    else:
+        print(f"Saved predicted layout to {args.output_dir / 'predicted_layout.png'}")
     print(f"Saved summary image to {args.output_dir / 'gnn_layout_summary.png'}")
     return 0
 
