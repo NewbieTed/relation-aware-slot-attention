@@ -83,6 +83,15 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--layout-source", choices=("gnn", "gt"), default="gnn")
     parser.add_argument("--layout-sigma-scale", type=float, default=1.0)
     parser.add_argument("--layout-semantic-channels", type=int, default=8)
+    parser.add_argument(
+        "--prompt-dropout-prob",
+        type=float,
+        default=0.5,
+        help=(
+            "Probability of replacing the U-Net text prompt with an empty "
+            "string during training, following ControlNet's 50%% prompt dropout."
+        ),
+    )
     parser.add_argument("--controlnet-conditioning-scale", type=float, default=1.0)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--eval-every", type=int, default=1000)
@@ -106,6 +115,7 @@ def _save_state(output_dir: Path, *, step: int, args: argparse.Namespace) -> Non
         "layout_source": args.layout_source,
         "layout_sigma_scale": args.layout_sigma_scale,
         "layout_semantic_channels": args.layout_semantic_channels,
+        "prompt_dropout_prob": args.prompt_dropout_prob,
         "controlnet_conditioning_scale": args.controlnet_conditioning_scale,
         "learning_rate": args.learning_rate,
         "batch_size": args.batch_size,
@@ -264,6 +274,7 @@ def _build_losses(
     layout_source: str,
     layout_sigma_scale: float,
     layout_semantic_channels: int,
+    prompt_dropout_prob: float,
     conditioning_scale: float,
 ) -> dict[str, torch.Tensor]:
     """Run one forward pass and compute the ControlNet denoising objective.
@@ -291,9 +302,21 @@ def _build_losses(
     noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
     # Text conditioning remains vanilla CLIP. We deliberately do not append slot
-    # embeddings in this ControlNet experiment.
+    # embeddings in this ControlNet experiment. During training, ControlNet-style
+    # prompt dropout sometimes replaces the text prompt with an empty string so
+    # the trainable branch has to rely more directly on the layout condition.
+    training_prompts = list(batch["prompts"])
+    prompt_dropout_pct = 0.0
+    if prompt_dropout_prob > 0.0:
+        keep_prob = 1.0 - prompt_dropout_prob
+        keep_mask = torch.rand(len(training_prompts), device=device) < keep_prob
+        training_prompts = [
+            prompt if bool(keep_mask[index].item()) else ""
+            for index, prompt in enumerate(training_prompts)
+        ]
+        prompt_dropout_pct = 1.0 - float(keep_mask.float().mean().item())
     text_inputs = tokenizer(
-        batch["prompts"],
+        training_prompts,
         padding="max_length",
         truncation=True,
         max_length=tokenizer.model_max_length,
@@ -352,6 +375,7 @@ def _build_losses(
         "denoise_loss": denoise_loss,
         "control_down_norm": control_down_norm.detach(),
         "control_mid_norm": control_mid_norm.detach(),
+        "prompt_dropout_pct": denoise_loss.new_tensor(prompt_dropout_pct),
     }
 
 
@@ -383,6 +407,7 @@ def _evaluate(
         "denoise_loss": 0.0,
         "control_down_norm": 0.0,
         "control_mid_norm": 0.0,
+        "prompt_dropout_pct": 0.0,
     }
     count = 0
     for batch in dataloader:
@@ -402,6 +427,7 @@ def _evaluate(
             layout_source=layout_source,
             layout_sigma_scale=layout_sigma_scale,
             layout_semantic_channels=layout_semantic_channels,
+            prompt_dropout_prob=0.0,
             conditioning_scale=conditioning_scale,
         )
         for key in totals:
@@ -649,6 +675,7 @@ def main() -> int:
             "denoise_loss",
             "control_down_norm",
             "control_mid_norm",
+            "prompt_dropout_pct",
         ],
     )
     _save_state(args.output_dir, step=0, args=args)
@@ -661,6 +688,7 @@ def main() -> int:
         "denoise_loss": 0.0,
         "control_down_norm": 0.0,
         "control_mid_norm": 0.0,
+        "prompt_dropout_pct": 0.0,
     }
     running_updates = 0
     optimizer.zero_grad(set_to_none=True)
@@ -682,6 +710,7 @@ def main() -> int:
                 layout_source=args.layout_source,
                 layout_sigma_scale=args.layout_sigma_scale,
                 layout_semantic_channels=args.layout_semantic_channels,
+                prompt_dropout_prob=args.prompt_dropout_prob,
                 conditioning_scale=args.controlnet_conditioning_scale,
             )
             loss = metrics["loss"]
