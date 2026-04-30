@@ -327,6 +327,10 @@ def _build_losses(
             conditioning_scale=conditioning_scale,
             return_dict=False,
         )
+        control_down_norm = torch.stack(
+            [res.float().pow(2).mean().sqrt() for res in down_res]
+        ).mean()
+        control_mid_norm = mid_res.float().pow(2).mean().sqrt()
         model_pred = unet(
             noisy_latents,
             timesteps,
@@ -343,7 +347,12 @@ def _build_losses(
         # The loss is intentionally just denoising MSE. Layout pressure enters
         # through the ControlNet condition, not through extra hand-written terms.
         denoise_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-    return {"loss": denoise_loss, "denoise_loss": denoise_loss}
+    return {
+        "loss": denoise_loss,
+        "denoise_loss": denoise_loss,
+        "control_down_norm": control_down_norm.detach(),
+        "control_mid_norm": control_mid_norm.detach(),
+    }
 
 
 @torch.no_grad()
@@ -369,7 +378,12 @@ def _evaluate(
     """Measure validation denoising loss without updating ControlNet weights."""
 
     controlnet.eval()
-    total = 0.0
+    totals = {
+        "loss": 0.0,
+        "denoise_loss": 0.0,
+        "control_down_norm": 0.0,
+        "control_mid_norm": 0.0,
+    }
     count = 0
     for batch in dataloader:
         metrics = _build_losses(
@@ -390,10 +404,13 @@ def _evaluate(
             layout_semantic_channels=layout_semantic_channels,
             conditioning_scale=conditioning_scale,
         )
-        total += float(metrics["loss"].item())
+        for key in totals:
+            totals[key] += float(metrics[key].item())
         count += 1
     controlnet.train()
-    return {"loss": total / count if count else 0.0, "denoise_loss": total / count if count else 0.0}
+    if count == 0:
+        return {key: 0.0 for key in totals}
+    return {key: value / count for key, value in totals.items()}
 
 
 @torch.no_grad()
@@ -623,13 +640,28 @@ def main() -> int:
     # AdamW defaults are used intentionally here; the main hyperparameter we are
     # testing first is whether ControlNet can learn from the GNN condition map.
     optimizer = torch.optim.AdamW(controlnet.parameters(), lr=args.learning_rate)
-    metrics_logger = MetricsLogger(args.output_dir, fieldnames=["step", "split", "loss", "denoise_loss"])
+    metrics_logger = MetricsLogger(
+        args.output_dir,
+        fieldnames=[
+            "step",
+            "split",
+            "loss",
+            "denoise_loss",
+            "control_down_norm",
+            "control_mid_norm",
+        ],
+    )
     _save_state(args.output_dir, step=0, args=args)
 
     progress = tqdm(total=args.max_train_steps, disable=_is_tqdm_disabled(args), desc="RelationControlNet")
     global_step = 0
     micro_step = 0
-    running_loss = 0.0
+    running_totals = {
+        "loss": 0.0,
+        "denoise_loss": 0.0,
+        "control_down_norm": 0.0,
+        "control_mid_norm": 0.0,
+    }
     running_updates = 0
     optimizer.zero_grad(set_to_none=True)
     while global_step < args.max_train_steps:
@@ -664,7 +696,8 @@ def main() -> int:
             else:
                 scaled_loss.backward()
             micro_step += 1
-            running_loss += float(loss.item())
+            for key in running_totals:
+                running_totals[key] += float(metrics[key].item())
             running_updates += 1
             if micro_step % args.gradient_accumulation_steps == 0:
                 # Optimizer step updates ControlNet only; frozen modules have
@@ -681,12 +714,18 @@ def main() -> int:
                     train_log = {
                         "step": global_step,
                         "split": "train",
-                        "loss": running_loss / running_updates,
-                        "denoise_loss": running_loss / running_updates,
+                        **{
+                            key: value / running_updates
+                            for key, value in running_totals.items()
+                        },
                     }
                     metrics_logger.log(train_log)
-                    progress.set_postfix(loss=f"{train_log['loss']:.4f}")
-                    running_loss = 0.0
+                    progress.set_postfix(
+                        loss=f"{train_log['loss']:.4f}",
+                        ctrl=f"{train_log['control_down_norm']:.4f}",
+                    )
+                    for key in running_totals:
+                        running_totals[key] = 0.0
                     running_updates = 0
                 if len(datasets["eval"]) > 0 and args.eval_every > 0 and global_step % args.eval_every == 0:
                     # Numeric eval catches training divergence, while image
