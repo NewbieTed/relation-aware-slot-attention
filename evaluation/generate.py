@@ -24,7 +24,7 @@ import torch
 from PIL import Image, ImageDraw, ImageFont
 
 from evaluation.prompt_parser import parse_prompt_to_scene_graph
-from training.graph_modules import GraphSlotEncoder, build_slot_conditioning
+from training.graph_modules import GraphSlotEncoder, build_slot_conditioning, pooled_label_embeddings
 from training.layout_conditioning import build_gaussian_layout_maps
 from training.relation_attention import install_relation_aware_processors
 from training.scene_graph import build_batched_scene_graphs
@@ -433,7 +433,7 @@ def build_relation_aware_conditioning(
     pipeline: Any,
     graph_encoder: GraphSlotEncoder,
     device: str,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
     """Run prompt parsing and frozen GNN conditioning for one text prompt.
 
     The returned slot embeddings are used only by the relation-attention path.
@@ -457,10 +457,18 @@ def build_relation_aware_conditioning(
         graph_encoder=graph_encoder,
         device=device,
     )
+    label_features = pooled_label_embeddings(
+        tokenizer=pipeline.tokenizer,
+        text_encoder=pipeline.text_encoder,
+        scene_graph_batch=scene_graph_batch,
+        device=device,
+        dtype=graph_encoder.node_proj.weight.dtype,
+    )
     return (
         conditioning.slot_embeddings,
         conditioning.slot_positions,
         conditioning.slot_log_sigmas,
+        label_features,
         int(node_count),
     )
 
@@ -719,7 +727,13 @@ def main() -> int:
                 )
             else:
                 assert graph_encoder is not None
-                slot_embeddings, slot_positions, slot_log_sigmas, _ = build_relation_aware_conditioning(
+                (
+                    slot_embeddings,
+                    slot_positions,
+                    slot_log_sigmas,
+                    label_features,
+                    _,
+                ) = build_relation_aware_conditioning(
                     prompt=prompt,
                     pipeline=pipeline,
                     graph_encoder=graph_encoder,
@@ -734,14 +748,22 @@ def main() -> int:
                     device=slot_positions.device,
                 )
                 if controlnet_enabled:
+                    conditioning_channels = int(
+                        getattr(pipeline.controlnet.config, "conditioning_channels", 3)
+                    )
+                    semantic_channels = max(0, conditioning_channels - 3)
                     # ControlNet sees an image-like condition: slot 0 heatmap,
-                    # slot 1 heatmap, and union heatmap.
+                    # slot 1 heatmap, union heatmap, and optional semantic
+                    # heatmaps tied to the object label embeddings.
                     control_image = build_gaussian_layout_maps(
                         slot_centers=slot_positions,
                         slot_log_sigmas=slot_log_sigmas,
                         slot_mask=prompt_slot_mask,
                         image_size=args.image_size,
+                        channels=conditioning_channels,
                         sigma_scale=args.layout_sigma_scale,
+                        slot_features=label_features,
+                        semantic_channels=semantic_channels,
                     ).to(device=device, dtype=control_image_dtype)
                 if relation_attention_enabled:
                     # Old path: append GNN slot embeddings after CLIP tokens
@@ -776,7 +798,7 @@ def main() -> int:
             # condition and set conditioning scale to zero below.
             control_image = torch.zeros(
                 1,
-                3,
+                int(getattr(pipeline.controlnet.config, "conditioning_channels", 3)),
                 args.image_size,
                 args.image_size,
                 device=device,

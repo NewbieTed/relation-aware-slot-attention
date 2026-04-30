@@ -33,7 +33,7 @@ from .dataset import (
     build_dataset_splits,
     collate_training_items,
 )
-from .graph_modules import GraphSlotEncoder, build_slot_conditioning
+from .graph_modules import GraphSlotEncoder, build_slot_conditioning, pooled_label_embeddings
 from .graph_targets import bbox_centers_after_crop, bbox_log_sigmas_after_crop
 from .layout_conditioning import build_gaussian_layout_maps
 from .metrics import MetricsLogger, write_split_manifest
@@ -82,6 +82,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--test-fraction", type=float, default=0.1)
     parser.add_argument("--layout-source", choices=("gnn", "gt"), default="gnn")
     parser.add_argument("--layout-sigma-scale", type=float, default=1.0)
+    parser.add_argument("--layout-semantic-channels", type=int, default=8)
     parser.add_argument("--controlnet-conditioning-scale", type=float, default=1.0)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--eval-every", type=int, default=1000)
@@ -104,6 +105,7 @@ def _save_state(output_dir: Path, *, step: int, args: argparse.Namespace) -> Non
         "init_graph_encoder": str(args.init_graph_encoder),
         "layout_source": args.layout_source,
         "layout_sigma_scale": args.layout_sigma_scale,
+        "layout_semantic_channels": args.layout_semantic_channels,
         "controlnet_conditioning_scale": args.controlnet_conditioning_scale,
         "learning_rate": args.learning_rate,
         "batch_size": args.batch_size,
@@ -165,6 +167,7 @@ def _layout_from_batch(
     image_size: int,
     layout_source: str,
     sigma_scale: float,
+    semantic_channels: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build the image-like ControlNet condition for a training batch.
 
@@ -199,6 +202,17 @@ def _layout_from_batch(
         slot_mask=slot_mask,
     )
 
+    # These pooled object-label features are used twice: the GNN consumes them
+    # internally, and the ControlNet condition map uses their first dimensions
+    # as object-identity heatmap channels.
+    label_features = pooled_label_embeddings(
+        tokenizer=tokenizer,
+        text_encoder=text_encoder,
+        scene_graph_batch=scene_graph_batch,
+        device=device,
+        dtype=graph_encoder.node_proj.weight.dtype,
+    )
+
     # The frozen GNN reads CLIP-pooled object labels plus scene-graph edges and
     # predicts one embedding, center, and sigma pair per object slot.
     conditioning = build_slot_conditioning(
@@ -225,7 +239,10 @@ def _layout_from_batch(
         slot_log_sigmas=layout_log_sigmas,
         slot_mask=slot_mask,
         image_size=image_size,
+        channels=3 + semantic_channels,
         sigma_scale=sigma_scale,
+        slot_features=label_features,
+        semantic_channels=semantic_channels,
     )
     return layout, conditioning.slot_positions, conditioning.slot_log_sigmas, slot_mask
 
@@ -246,6 +263,7 @@ def _build_losses(
     image_size: int,
     layout_source: str,
     layout_sigma_scale: float,
+    layout_semantic_channels: int,
     conditioning_scale: float,
 ) -> dict[str, torch.Tensor]:
     """Run one forward pass and compute the ControlNet denoising objective.
@@ -295,6 +313,7 @@ def _build_losses(
             image_size=image_size,
             layout_source=layout_source,
             sigma_scale=layout_sigma_scale,
+            semantic_channels=layout_semantic_channels,
         )
 
     with build_autocast_context(device, mixed_precision):
@@ -344,6 +363,7 @@ def _evaluate(
     image_size: int,
     layout_source: str,
     layout_sigma_scale: float,
+    layout_semantic_channels: int,
     conditioning_scale: float,
 ) -> dict[str, float]:
     """Measure validation denoising loss without updating ControlNet weights."""
@@ -367,6 +387,7 @@ def _evaluate(
             image_size=image_size,
             layout_source=layout_source,
             layout_sigma_scale=layout_sigma_scale,
+            layout_semantic_channels=layout_semantic_channels,
             conditioning_scale=conditioning_scale,
         )
         total += float(metrics["loss"].item())
@@ -446,6 +467,13 @@ def _run_eval_samples(
             slot_targets=dummy_targets,
             slot_mask=dummy_mask,
         )
+        label_features = pooled_label_embeddings(
+            tokenizer=tokenizer,
+            text_encoder=text_encoder,
+            scene_graph_batch=scene_graph_batch,
+            device=device,
+            dtype=graph_encoder.node_proj.weight.dtype,
+        )
         conditioning = build_slot_conditioning(
             tokenizer=tokenizer,
             text_encoder=text_encoder,
@@ -458,7 +486,10 @@ def _run_eval_samples(
             slot_log_sigmas=conditioning.slot_log_sigmas,
             slot_mask=dummy_mask,
             image_size=args.image_size,
+            channels=3 + args.layout_semantic_channels,
             sigma_scale=args.layout_sigma_scale,
+            slot_features=label_features,
+            semantic_channels=args.layout_semantic_channels,
         )
         for image_index in range(args.eval_sample_images):
             # Use deterministic per-prompt/per-image seeds so snapshots are
@@ -558,7 +589,10 @@ def main() -> int:
     vae = AutoencoderKL.from_pretrained(args.model_id, subfolder="vae", torch_dtype=weight_dtype)
     unet = UNet2DConditionModel.from_pretrained(args.model_id, subfolder="unet", torch_dtype=weight_dtype)
     noise_scheduler = DDPMScheduler.from_pretrained(args.model_id, subfolder="scheduler")
-    controlnet = ControlNetModel.from_unet(unet, conditioning_channels=3)
+    controlnet = ControlNetModel.from_unet(
+        unet,
+        conditioning_channels=3 + args.layout_semantic_channels,
+    )
 
     # Freeze the original SD pipeline. ControlNet is the only trainable model,
     # which isolates whether explicit layout residuals help.
@@ -615,6 +649,7 @@ def main() -> int:
                 image_size=args.image_size,
                 layout_source=args.layout_source,
                 layout_sigma_scale=args.layout_sigma_scale,
+                layout_semantic_channels=args.layout_semantic_channels,
                 conditioning_scale=args.controlnet_conditioning_scale,
             )
             loss = metrics["loss"]
@@ -674,6 +709,7 @@ def main() -> int:
                             image_size=args.image_size,
                             layout_source=args.layout_source,
                             layout_sigma_scale=args.layout_sigma_scale,
+                            layout_semantic_channels=args.layout_semantic_channels,
                             conditioning_scale=args.controlnet_conditioning_scale,
                         ),
                     }

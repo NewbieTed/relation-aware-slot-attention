@@ -19,6 +19,8 @@ def build_gaussian_layout_maps(
     image_size: int,
     channels: int = 3,
     sigma_scale: float = 1.0,
+    slot_features: torch.Tensor | None = None,
+    semantic_channels: int = 0,
 ) -> torch.Tensor:
     """Build image-shaped Gaussian layout maps from slot center/sigma predictions.
 
@@ -35,6 +37,12 @@ def build_gaussian_layout_maps(
             three-channel conditions, so the default is 3.
         sigma_scale: Optional multiplier for widening/narrowing the predicted
             Gaussian ellipses at train or inference time.
+        slot_features: Optional semantic feature tensor with shape
+            ``[batch, slots, feature_dim]``. When provided, the first
+            ``semantic_channels`` normalized feature dimensions are painted into
+            extra layout channels using each slot's Gaussian map as a mask.
+        semantic_channels: Number of semantic heatmap channels to append after
+            the first three geometric channels.
 
     Returns:
         Tensor with shape ``[batch, channels, image_size, image_size]`` and
@@ -47,6 +55,12 @@ def build_gaussian_layout_maps(
 
     if channels < 3:
         raise ValueError("Gaussian layout conditioning expects at least 3 channels")
+    if semantic_channels < 0:
+        raise ValueError("semantic_channels must be non-negative")
+    if semantic_channels > 0 and slot_features is None:
+        raise ValueError("slot_features must be provided when semantic_channels > 0")
+    if channels < 3 + semantic_channels:
+        raise ValueError("channels must be at least 3 + semantic_channels")
 
     # Build the coordinate grid in the same normalized image space used by the
     # GNN targets: x=-1 is left, x=+1 is right, y=-1 is top, y=+1 is bottom.
@@ -92,6 +106,17 @@ def build_gaussian_layout_maps(
 
     # If a future dataset has more than two slots and the caller asks for more
     # channels, expose additional slot maps after the union channel.
-    for slot_index in range(2, min(max_slots, channels - 1)):
+    geometry_extra_channels = channels - 3 - semantic_channels
+    for slot_index in range(2, min(max_slots, geometry_extra_channels + 2)):
         layout[:, slot_index + 1] = maps_by_slot[:, slot_index]
+
+    if semantic_channels > 0 and slot_features is not None:
+        # These channels give ControlNet object identity information. Each
+        # semantic channel is a heatmap-weighted CLIP/GNN label feature, so a
+        # "cat" region and "dog" region are not just anonymous slot 0/slot 1
+        # masks anymore.
+        feature_slice = slot_features.to(device=device, dtype=dtype)[..., :semantic_channels]
+        feature_slice = torch.nn.functional.normalize(feature_slice, dim=-1)
+        semantic_maps = (maps_by_slot[:, :, None] * feature_slice[:, :, :, None, None]).sum(dim=1)
+        layout[:, -semantic_channels:] = (semantic_maps + 1.0) * 0.5
     return layout.clamp(0.0, 1.0)
