@@ -13,7 +13,8 @@ from transformers import CLIPTextModel, CLIPTokenizer
 from evaluation.prompt_parser import parse_prompt_to_scene_graph
 from training.dataset import load_metadata_rows
 from training.graph_modules import build_slot_conditioning
-from training.graph_targets import bbox_centers_after_crop, bbox_log_sigmas_after_crop
+from training.graph_targets import bbox_centers_after_crop, bbox_log_sizes_3d_after_crop
+from training.oscr_renderer import render_oscr_boxes
 from training.prompts import prompt_from_scop_depth_row, scene_graph_payload_from_row
 from training.runtime import DEFAULT_FLUX_MODEL_ID, load_graph_encoder, resolve_torch_device
 from training.scene_graph import INVERSE_RELATION, build_batched_scene_graphs
@@ -24,7 +25,7 @@ CANVAS_SIZE = 512
 
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Visualize GNN-predicted slot layout against SCOP-Depth bbox center/sigma targets."
+        description="Visualize GNN-predicted slot layout against SCOP-Depth 3D center/box targets."
     )
     parser.add_argument("--prompt", type=str, required=True)
     parser.add_argument(
@@ -154,19 +155,46 @@ def _to_float_list(tensor: torch.Tensor) -> list[float]:
     return [float(value) for value in tensor.detach().cpu().to(torch.float32).tolist()]
 
 
+def _save_oscr_preview(
+    *,
+    centers: torch.Tensor,
+    log_sizes: torch.Tensor,
+    slot_mask: torch.Tensor,
+    output_path: Path,
+) -> None:
+    oscr = render_oscr_boxes(
+        centers=centers.detach().cpu(),
+        log_sizes=log_sizes.detach().cpu(),
+        slot_mask=slot_mask.detach().cpu(),
+        image_size=CANVAS_SIZE,
+    )[0]
+    image = (
+        oscr.detach()
+        .cpu()
+        .to(torch.float32)
+        .add(1.0)
+        .mul(127.5)
+        .clamp(0, 255)
+        .byte()
+        .permute(1, 2, 0)
+        .numpy()
+    )
+    Image.fromarray(image, mode="RGB").save(output_path)
+
+
 def _coord_to_px(x: float, y: float, size: int = CANVAS_SIZE) -> tuple[float, float]:
     return (x + 1.0) * 0.5 * size, (y + 1.0) * 0.5 * size
 
 
-def _sigma_to_px(sigma_x: float, sigma_y: float, size: int = CANVAS_SIZE) -> tuple[float, float]:
-    return sigma_x * size * 0.5, sigma_y * size * 0.5
+def _size_to_px(size_x: float, size_y: float, size: int = CANVAS_SIZE) -> tuple[float, float]:
+    return size_x * size * 0.5, size_y * size * 0.5
 
 
 def _draw_layout(
     draw: ImageDraw.ImageDraw,
     *,
     centers: list[list[float]],
-    sigmas: list[list[float]],
+    sizes: list[list[float]],
     labels: list[str],
     colors: list[str],
     offset_x: int,
@@ -193,11 +221,11 @@ def _draw_layout(
     )
     draw.text((offset_x, offset_y - 30), title, font=font, fill="#111827")
 
-    for index, (center, sigma, label) in enumerate(zip(centers, sigmas, labels)):
+    for index, (center, size, label) in enumerate(zip(centers, sizes, labels)):
         x, y = center[:2]
-        sigma_x, sigma_y = sigma[:2]
+        size_x, size_y = size[:2]
         px, py = _coord_to_px(x, y)
-        rx, ry = _sigma_to_px(sigma_x, sigma_y)
+        rx, ry = _size_to_px(size_x, size_y)
         color = colors[index % len(colors)]
         box = [
             offset_x + px - rx,
@@ -270,9 +298,9 @@ def _render_layout_comparison(
     *,
     labels: list[str],
     gt_centers: list[list[float]],
-    gt_sigmas: list[list[float]],
+    gt_sizes: list[list[float]],
     pred_centers: list[list[float]],
-    pred_sigmas: list[list[float]],
+    pred_sizes: list[list[float]],
     output_path: Path,
 ) -> None:
     font = _load_font(20)
@@ -283,24 +311,24 @@ def _render_layout_comparison(
     _draw_layout(
         draw,
         centers=gt_centers,
-        sigmas=gt_sigmas,
+        sizes=gt_sizes,
         labels=labels,
         colors=colors,
         offset_x=20,
         offset_y=90,
-        title="Ground truth center / sigma",
+        title="Ground truth center / size",
         font=font,
         solid=True,
     )
     _draw_layout(
         draw,
         centers=pred_centers,
-        sigmas=pred_sigmas,
+        sizes=pred_sizes,
         labels=labels,
         colors=colors,
         offset_x=560,
         offset_y=90,
-        title="GNN predicted center / sigma",
+        title="GNN predicted center / size",
         font=font,
         solid=False,
     )
@@ -311,7 +339,7 @@ def _render_prediction_layout(
     *,
     labels: list[str],
     pred_centers: list[list[float]],
-    pred_sigmas: list[list[float]],
+    pred_sizes: list[list[float]],
     output_path: Path,
 ) -> None:
     font = _load_font(20)
@@ -327,12 +355,12 @@ def _render_prediction_layout(
     _draw_layout(
         draw,
         centers=pred_centers,
-        sigmas=pred_sigmas,
+        sizes=pred_sizes,
         labels=labels,
         colors=colors,
         offset_x=54,
         offset_y=90,
-        title="GNN predicted center / sigma",
+        title="GNN predicted center / size",
         font=font,
         solid=False,
     )
@@ -344,26 +372,26 @@ def _draw_overlay_on_crop(
     image_path: Path,
     labels: list[str],
     gt_centers: list[list[float]],
-    gt_sigmas: list[list[float]],
+    gt_sizes: list[list[float]],
     pred_centers: list[list[float]],
-    pred_sigmas: list[list[float]],
+    pred_sizes: list[list[float]],
     output_path: Path,
 ) -> None:
     base = Image.open(image_path).convert("RGB").resize((CANVAS_SIZE, CANVAS_SIZE), Image.Resampling.BICUBIC)
     panels = []
     font = _load_font(19)
     colors = ["#00d5ff", "#ff3366", "#2a9d8f", "#f77f00"]
-    for title, centers, sigmas, solid in [
-        ("GT on crop", gt_centers, gt_sigmas, True),
-        ("Prediction on crop", pred_centers, pred_sigmas, False),
+    for title, centers, sizes, solid in [
+        ("GT on crop", gt_centers, gt_sizes, True),
+        ("Prediction on crop", pred_centers, pred_sizes, False),
     ]:
         panel = base.copy()
         draw = ImageDraw.Draw(panel)
         draw.rectangle([0, 0, CANVAS_SIZE, 34], fill="black")
         draw.text((10, 7), title, font=font, fill="white")
-        for index, (center, sigma, label) in enumerate(zip(centers, sigmas, labels)):
+        for index, (center, size, label) in enumerate(zip(centers, sizes, labels)):
             px, py = _coord_to_px(center[0], center[1])
-            rx, ry = _sigma_to_px(sigma[0], sigma[1])
+            rx, ry = _size_to_px(size[0], size[1])
             color = colors[index % len(colors)]
             box = [px - rx, py - ry, px + rx, py + ry]
             draw.ellipse(box, outline=color, width=4 if solid else 2)
@@ -382,7 +410,7 @@ def _draw_prediction_overlay_on_image(
     prompt: str,
     labels: list[str],
     pred_centers: list[list[float]],
-    pred_sigmas: list[list[float]],
+    pred_sizes: list[list[float]],
     output_path: Path,
 ) -> None:
     image = Image.open(image_path).convert("RGB").resize((CANVAS_SIZE, CANVAS_SIZE), Image.Resampling.BICUBIC)
@@ -399,9 +427,9 @@ def _draw_prediction_overlay_on_image(
         background="black",
     )
 
-    for index, (center, sigma, label) in enumerate(zip(pred_centers, pred_sigmas, labels)):
+    for index, (center, size, label) in enumerate(zip(pred_centers, pred_sizes, labels)):
         px, py = _coord_to_px(center[0], center[1])
-        rx, ry = _sigma_to_px(sigma[0], sigma[1])
+        rx, ry = _size_to_px(size[0], size[1])
         color = colors[index % len(colors)]
         box = [px - rx, py - ry, px + rx, py + ry]
         draw.rectangle(box, outline=color, width=3)
@@ -414,8 +442,8 @@ def _draw_prediction_overlay_on_image(
         draw.ellipse([px - 5, py - 5, px + 5, py + 5], fill=color, outline="black")
         label_lines = [
             label,
-            f"c=({center[0]:+.2f},{center[1]:+.2f})",
-            f"s=({sigma[0]:.2f},{sigma[1]:.2f})",
+            f"c=({center[0]:+.2f},{center[1]:+.2f},{center[2]:+.2f})",
+            f"sz=({size[0]:.2f},{size[1]:.2f},{size[2]:.2f})",
         ]
         label_x = max(4, min(CANVAS_SIZE - 150, int(px + 8)))
         label_y = max(42, min(CANVAS_SIZE - 72, int(py + 8)))
@@ -459,9 +487,9 @@ def _build_report(
     scene_graph: dict[str, Any],
     labels: list[str],
     gt_centers: list[list[float]],
-    gt_sigmas: list[list[float]],
+    gt_sizes: list[list[float]],
     pred_centers: list[list[float]],
-    pred_sigmas: list[list[float]],
+    pred_sizes: list[list[float]],
 ) -> tuple[str, list[str], dict[str, Any]]:
     lines: list[str] = []
     lines.append(f"Prompt: {prompt}")
@@ -482,30 +510,32 @@ def _build_report(
             f"  {kind} edge {edge['source_id']} -> {edge['target_id']}: {edge['relation']}"
         )
     lines.append("")
-    lines.append("Centers and sigmas use normalized image/latent coordinates.")
-    lines.append("x,y are in [-1,1]. sigma values are normalized ellipse radii.")
+    lines.append("Centers and sizes use normalized image/latent coordinates.")
+    lines.append("x,y,z are in [-1,1]. size values are normalized 3D box extents.")
+    lines.append("The 2D images draw the x/y footprint; z and z-size are listed below and in the OSCR previews.")
     lines.append("")
     table_lines: list[str] = []
-    for label, gt_center, gt_sigma, pred_center, pred_sigma in zip(
+    for label, gt_center, gt_size, pred_center, pred_size in zip(
         labels,
         gt_centers,
-        gt_sigmas,
+        gt_sizes,
         pred_centers,
-        pred_sigmas,
+        pred_sizes,
     ):
         dx = pred_center[0] - gt_center[0]
         dy = pred_center[1] - gt_center[1]
         dz = pred_center[2] - gt_center[2]
-        dsx = pred_sigma[0] - gt_sigma[0]
-        dsy = pred_sigma[1] - gt_sigma[1]
+        dsx = pred_size[0] - gt_size[0]
+        dsy = pred_size[1] - gt_size[1]
+        dsz = pred_size[2] - gt_size[2]
         block = [
             f"{label}:",
             f"  GT center    = ({gt_center[0]:+.4f}, {gt_center[1]:+.4f}, {gt_center[2]:+.4f})",
             f"  Pred center  = ({pred_center[0]:+.4f}, {pred_center[1]:+.4f}, {pred_center[2]:+.4f})",
             f"  Center error = ({dx:+.4f}, {dy:+.4f}, {dz:+.4f})",
-            f"  GT sigma     = ({gt_sigma[0]:.4f}, {gt_sigma[1]:.4f})",
-            f"  Pred sigma   = ({pred_sigma[0]:.4f}, {pred_sigma[1]:.4f})",
-            f"  Sigma error  = ({dsx:+.4f}, {dsy:+.4f})",
+            f"  GT size      = ({gt_size[0]:.4f}, {gt_size[1]:.4f}, {gt_size[2]:.4f})",
+            f"  Pred size    = ({pred_size[0]:.4f}, {pred_size[1]:.4f}, {pred_size[2]:.4f})",
+            f"  Size error   = ({dsx:+.4f}, {dsy:+.4f}, {dsz:+.4f})",
         ]
         lines.extend(block)
         lines.append("")
@@ -520,12 +550,12 @@ def _build_report(
         "scene_graph": scene_graph,
         "labels": labels,
         "ground_truth": [
-            {"label": label, "center_xyz": center, "sigma_xy": sigma}
-            for label, center, sigma in zip(labels, gt_centers, gt_sigmas)
+            {"label": label, "center_xyz": center, "size_xyz": size}
+            for label, center, size in zip(labels, gt_centers, gt_sizes)
         ],
         "prediction": [
-            {"label": label, "center_xyz": center, "sigma_xy": sigma}
-            for label, center, sigma in zip(labels, pred_centers, pred_sigmas)
+            {"label": label, "center_xyz": center, "size_xyz": size}
+            for label, center, size in zip(labels, pred_centers, pred_sizes)
         ],
     }
     return "\n".join(lines), table_lines, payload
@@ -537,7 +567,7 @@ def _build_prediction_only_report(
     scene_graph: dict[str, Any],
     labels: list[str],
     pred_centers: list[list[float]],
-    pred_sigmas: list[list[float]],
+    pred_sizes: list[list[float]],
 ) -> tuple[str, list[str], dict[str, Any]]:
     lines: list[str] = []
     lines.append(f"Prompt: {prompt}")
@@ -556,15 +586,16 @@ def _build_prediction_only_report(
         )
     lines.append("")
     lines.append("No ground-truth row was used. Values below are GNN predictions only.")
-    lines.append("x,y are in [-1,1]. sigma values are normalized ellipse radii.")
+    lines.append("x,y,z are in [-1,1]. size values are normalized 3D box extents.")
+    lines.append("The 2D image draws the x/y footprint; z and z-size are listed below and in the OSCR preview.")
     lines.append("")
 
     table_lines: list[str] = []
-    for label, pred_center, pred_sigma in zip(labels, pred_centers, pred_sigmas):
+    for label, pred_center, pred_size in zip(labels, pred_centers, pred_sizes):
         block = [
             f"{label}:",
             f"  Pred center = ({pred_center[0]:+.4f}, {pred_center[1]:+.4f}, {pred_center[2]:+.4f})",
-            f"  Pred sigma  = ({pred_sigma[0]:.4f}, {pred_sigma[1]:.4f})",
+            f"  Pred size   = ({pred_size[0]:.4f}, {pred_size[1]:.4f}, {pred_size[2]:.4f})",
         ]
         lines.extend(block)
         lines.append("")
@@ -578,8 +609,8 @@ def _build_prediction_only_report(
         "scene_graph": scene_graph,
         "labels": labels,
         "prediction": [
-            {"label": label, "center_xyz": center, "sigma_xy": sigma}
-            for label, center, sigma in zip(labels, pred_centers, pred_sigmas)
+            {"label": label, "center_xyz": center, "size_xyz": size}
+            for label, center, size in zip(labels, pred_centers, pred_sizes)
         ],
     }
     return "\n".join(lines), table_lines, payload
@@ -652,7 +683,7 @@ def main() -> int:
             max_nodes=max_nodes,
             device=torch.device(device),
         )
-        log_sigma_targets, _ = bbox_log_sigmas_after_crop(
+        log_size_targets, _ = bbox_log_sizes_3d_after_crop(
             [row],
             [image_size],
             max_nodes=max_nodes,
@@ -672,10 +703,10 @@ def main() -> int:
             device=torch.device(device),
             dtype=torch.bool,
         )
-        log_sigma_targets = torch.zeros(
+        log_size_targets = torch.zeros(
             1,
             max_nodes,
-            2,
+            3,
             device=torch.device(device),
             dtype=torch.float32,
         )
@@ -695,11 +726,14 @@ def main() -> int:
 
     labels = [str(node["label"]) for node in scene_graph["nodes"]]
     pred_centers = [_to_float_list(value) for value in conditioning.slot_positions[0, :max_nodes]]
-    pred_sigmas = [_to_float_list(value.exp()) for value in conditioning.slot_log_sigmas[0, :max_nodes]]
+    pred_sizes = [_to_float_list(value.exp()) for value in conditioning.slot_log_sizes_3d[0, :max_nodes]]
+    pred_center_tensor = conditioning.slot_positions[:, :max_nodes]
+    pred_log_size_tensor = conditioning.slot_log_sizes_3d[:, :max_nodes]
+    pred_slot_mask = conditioning.slot_mask[:, :max_nodes]
 
     if row is not None and row_index is not None:
         gt_centers = [_to_float_list(value) for value in slot_targets[0, :max_nodes]]
-        gt_sigmas = [_to_float_list(value.exp()) for value in log_sigma_targets[0, :max_nodes]]
+        gt_sizes = [_to_float_list(value.exp()) for value in log_size_targets[0, :max_nodes]]
         report, table_lines, payload = _build_report(
             row_index=row_index,
             row=row,
@@ -707,23 +741,29 @@ def main() -> int:
             scene_graph=scene_graph,
             labels=labels,
             gt_centers=gt_centers,
-            gt_sigmas=gt_sigmas,
+            gt_sizes=gt_sizes,
             pred_centers=pred_centers,
-            pred_sigmas=pred_sigmas,
+            pred_sizes=pred_sizes,
         )
     else:
         gt_centers = []
-        gt_sigmas = []
+        gt_sizes = []
         report, table_lines, payload = _build_prediction_only_report(
             prompt=prompt,
             scene_graph=scene_graph,
             labels=labels,
             pred_centers=pred_centers,
-            pred_sigmas=pred_sigmas,
+            pred_sizes=pred_sizes,
         )
 
     (args.output_dir / "gnn_layout_report.txt").write_text(report)
     (args.output_dir / "gnn_layout_values.json").write_text(json.dumps(payload, indent=2))
+    _save_oscr_preview(
+        centers=pred_center_tensor,
+        log_sizes=pred_log_size_tensor,
+        slot_mask=pred_slot_mask,
+        output_path=args.output_dir / "oscr_prediction.png",
+    )
     _render_scene_graph(
         prompt=prompt,
         scene_graph=scene_graph,
@@ -734,25 +774,31 @@ def main() -> int:
         _render_layout_comparison(
             labels=labels,
             gt_centers=gt_centers,
-            gt_sigmas=gt_sigmas,
+            gt_sizes=gt_sizes,
             pred_centers=pred_centers,
-            pred_sigmas=pred_sigmas,
+            pred_sizes=pred_sizes,
             output_path=args.output_dir / "layout_comparison.png",
         )
         _draw_overlay_on_crop(
             image_path=image_path,
             labels=labels,
             gt_centers=gt_centers,
-            gt_sigmas=gt_sigmas,
+            gt_sizes=gt_sizes,
             pred_centers=pred_centers,
-            pred_sigmas=pred_sigmas,
+            pred_sizes=pred_sizes,
             output_path=args.output_dir / "crop_overlay_comparison.png",
+        )
+        _save_oscr_preview(
+            centers=slot_targets[:, :max_nodes],
+            log_sizes=log_size_targets[:, :max_nodes],
+            slot_mask=slot_mask[:, :max_nodes],
+            output_path=args.output_dir / "oscr_ground_truth.png",
         )
     else:
         _render_prediction_layout(
             labels=labels,
             pred_centers=pred_centers,
-            pred_sigmas=pred_sigmas,
+            pred_sizes=pred_sizes,
             output_path=args.output_dir / "predicted_layout.png",
         )
     if args.overlay_image is not None:
@@ -763,7 +809,7 @@ def main() -> int:
             prompt=prompt,
             labels=labels,
             pred_centers=pred_centers,
-            pred_sigmas=pred_sigmas,
+            pred_sizes=pred_sizes,
             output_path=args.output_dir / "generated_overlay_prediction.png",
         )
     _render_summary_image(

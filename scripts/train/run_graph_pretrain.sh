@@ -6,7 +6,9 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
 DEFAULT_PYTHON="python3"
-if [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
+if [[ -x "$ROOT_DIR/.venv-flux/bin/python" ]]; then
+  DEFAULT_PYTHON="$ROOT_DIR/.venv-flux/bin/python"
+elif [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
   DEFAULT_PYTHON="$ROOT_DIR/.venv/bin/python"
 fi
 
