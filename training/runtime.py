@@ -62,10 +62,49 @@ def is_tqdm_disabled(disable_tqdm_arg: object) -> bool:
     return bool(getattr(disable_tqdm_arg, "disable_tqdm", False))
 
 
+def normalize_graph_encoder_state_dict(checkpoint: object) -> dict[str, torch.Tensor]:
+    """Return a plain graph encoder state dict from common checkpoint shapes."""
+
+    if not isinstance(checkpoint, dict):
+        raise TypeError(f"Expected graph encoder checkpoint dict, got {type(checkpoint)!r}")
+
+    for wrapper_key in ("graph_encoder", "graph_encoder_state_dict", "state_dict", "model"):
+        nested = checkpoint.get(wrapper_key)
+        if isinstance(nested, dict):
+            checkpoint = nested
+            break
+
+    state_dict: dict[str, torch.Tensor] = {}
+    for key, value in checkpoint.items():
+        if not isinstance(key, str) or not torch.is_tensor(value):
+            continue
+        normalized_key = key
+        for prefix in ("module.", "graph_encoder."):
+            if normalized_key.startswith(prefix):
+                normalized_key = normalized_key[len(prefix) :]
+        if normalized_key.startswith("node_in."):
+            normalized_key = "node_proj." + normalized_key[len("node_in.") :]
+        state_dict[normalized_key] = value
+
+    if not state_dict:
+        available = ", ".join(str(key) for key in list(checkpoint.keys())[:12])
+        raise ValueError(f"No tensor state dict entries found in graph checkpoint. Keys: {available}")
+    return state_dict
+
+
 def infer_graph_encoder_config(state_dict: dict[str, torch.Tensor]) -> tuple[int, int]:
     """Infer slot dimension and GNN depth from a saved graph encoder state."""
 
-    slot_dim = int(state_dict["node_in.weight"].shape[0])
+    node_weight = state_dict.get("node_proj.weight")
+    if node_weight is None:
+        node_weight = state_dict.get("node_in.weight")
+    if node_weight is None:
+        available = ", ".join(list(state_dict.keys())[:12])
+        raise KeyError(
+            "Could not infer graph encoder slot dimension because neither "
+            f"'node_proj.weight' nor 'node_in.weight' exists. Keys: {available}"
+        )
+    slot_dim = int(node_weight.shape[0])
     layer_indices = {
         int(key.split(".")[1])
         for key in state_dict
@@ -83,7 +122,7 @@ def load_graph_encoder(
 ) -> GraphSlotEncoder:
     """Load a saved graph encoder with its inferred architecture."""
 
-    state_dict = torch.load(path, map_location="cpu")
+    state_dict = normalize_graph_encoder_state_dict(torch.load(path, map_location="cpu"))
     slot_dim, gnn_layers = infer_graph_encoder_config(state_dict)
     encoder = GraphSlotEncoder(
         text_hidden_dim=text_hidden_dim,

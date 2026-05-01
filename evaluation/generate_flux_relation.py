@@ -25,7 +25,12 @@ from training.train_relation_flux_lora import (
     _import_seethrough3d_flux,
     _install_condition_lora_processors,
 )
-from training.runtime import choose_weight_dtype, resolve_torch_device, set_seed
+from training.runtime import (
+    choose_weight_dtype,
+    normalize_graph_encoder_state_dict,
+    resolve_torch_device,
+    set_seed,
+)
 
 from .prompt_parser import parse_prompt_to_scene_graph
 
@@ -70,7 +75,10 @@ def _load_graph_encoder(
         slot_dim=slot_dim,
         num_layers=gnn_layers,
     ).to(device)
-    graph_encoder.load_state_dict(torch.load(path, map_location=device), strict=False)
+    graph_encoder.load_state_dict(
+        normalize_graph_encoder_state_dict(torch.load(path, map_location=device)),
+        strict=False,
+    )
     graph_encoder.requires_grad_(False)
     graph_encoder.eval()
     return graph_encoder

@@ -30,7 +30,13 @@ from .graph_modules import GraphSlotEncoder, build_slot_conditioning
 from .graph_targets import bbox_centers_after_crop
 from .metrics import MetricsLogger, write_split_manifest
 from .oscr_renderer import render_oscr_boxes
-from .runtime import choose_weight_dtype, is_tqdm_disabled, resolve_torch_device, set_seed
+from .runtime import (
+    choose_weight_dtype,
+    is_tqdm_disabled,
+    normalize_graph_encoder_state_dict,
+    resolve_torch_device,
+    set_seed,
+)
 from .scene_graph import build_batched_scene_graphs
 
 DEFAULT_FLUX_MODEL_ID = "black-forest-labs/FLUX.1-dev"
@@ -202,7 +208,7 @@ def _load_graph_encoder(
         slot_dim=slot_dim,
         num_layers=gnn_layers,
     ).to(device)
-    state_dict = torch.load(path, map_location=device)
+    state_dict = normalize_graph_encoder_state_dict(torch.load(path, map_location=device))
     incompatible = graph_encoder.load_state_dict(state_dict, strict=False)
     if incompatible.missing_keys or incompatible.unexpected_keys:
         print(
