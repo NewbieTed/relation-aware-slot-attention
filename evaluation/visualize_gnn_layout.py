@@ -10,12 +10,12 @@ import torch
 from PIL import Image, ImageDraw, ImageFont
 from transformers import CLIPTextModel, CLIPTokenizer
 
-from evaluation.generate import MODEL_REGISTRY, load_graph_encoder, resolve_torch_device
 from evaluation.prompt_parser import parse_prompt_to_scene_graph
 from training.dataset import load_metadata_rows
 from training.graph_modules import build_slot_conditioning
 from training.graph_targets import bbox_centers_after_crop, bbox_log_sigmas_after_crop
 from training.prompts import prompt_from_scop_depth_row, scene_graph_payload_from_row
+from training.runtime import DEFAULT_FLUX_MODEL_ID, load_graph_encoder, resolve_torch_device
 from training.scene_graph import INVERSE_RELATION, build_batched_scene_graphs
 
 
@@ -42,8 +42,7 @@ def make_parser() -> argparse.ArgumentParser:
         help="Optional generated image to annotate with predicted GNN bbox/ellipse regions.",
     )
     parser.add_argument("--row-index", type=int, default=None)
-    parser.add_argument("--model", choices=sorted(MODEL_REGISTRY.keys()), default="sd15")
-    parser.add_argument("--model-id", type=str, default=None)
+    parser.add_argument("--model-id", type=str, default=DEFAULT_FLUX_MODEL_ID)
     parser.add_argument("--device", choices=("auto", "cpu", "mps", "cuda"), default="auto")
     return parser
 
@@ -634,9 +633,8 @@ def main() -> int:
         )
 
     device = resolve_torch_device(args.device)
-    model_id = args.model_id or MODEL_REGISTRY[args.model]
-    tokenizer = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer")
-    text_encoder = CLIPTextModel.from_pretrained(model_id, subfolder="text_encoder").to(device)
+    tokenizer = CLIPTokenizer.from_pretrained(args.model_id, subfolder="tokenizer")
+    text_encoder = CLIPTextModel.from_pretrained(args.model_id, subfolder="text_encoder").to(device)
     text_encoder.eval()
     graph_encoder = load_graph_encoder(
         path=args.graph_encoder_path,

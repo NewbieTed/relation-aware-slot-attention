@@ -1,26 +1,24 @@
 # Training Workflows
 
-This repo now supports a two-stage relation-aware training workflow:
+This FLUX branch keeps only the current relation-aware training path:
 
-1. `scripts/train/run_graph_pretrain.sh`
-   Pretrains only the graph encoder on SCOP-Depth structure supervision. This stage
-   learns slot geometry and relation-aware message passing without paying the cost of
-   full diffusion training.
-2. `scripts/train/run_relation_aware_sd15.sh`
-   Runs the full relation-aware Stable Diffusion training loop with LoRA, graph
-   conditioning, and modified cross-attention. Pass `INIT_GRAPH_ENCODER=/path/to/graph_encoder.pt`
-   to warm-start from stage 1.
+1. `training.pretrain_graph_encoder`
+   Pretrains the graph encoder on SCOP-Depth relation, position, and 3D box-size targets.
+2. `training.train_relation_flux_lora`
+   Freezes FLUX.1-dev, the text encoders, VAE, and the GNN, then trains SeeThrough3D-style LoRA attention processors from GNN-rendered OSCR condition latents.
 
-The intended schedule is:
+Both stages create deterministic train/eval/test splits, save `data_split.json`,
+write losses to `metrics.jsonl` and `metrics.csv`, and save reusable checkpoints
+under the run output directory.
 
-- run graph pretraining for many epochs / many steps
-- select the best `graph_encoder.pt`
-- warm-start the full trainer
-- train LoRA + graph encoder + relation-attention for a shorter schedule
+Example graph pretraining:
 
-This split is useful because the graph encoder typically benefits from much longer
-optimization than the LoRA stage.
+```bash
+./scripts/train/run_graph_pretrain.sh
+```
 
-Both training entrypoints now create deterministic train/eval/test splits, save the
-split manifest to `data_split.json`, write loss curves to `metrics.jsonl` and
-`metrics.csv`, and report a held-out test loss at the end of training.
+Example FLUX LoRA training:
+
+```bash
+./scripts/train/run_flux_lora.sh
+```

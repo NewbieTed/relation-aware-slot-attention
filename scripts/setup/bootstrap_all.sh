@@ -6,6 +6,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 INSTALL_T2I_COMPBENCH_ENV="${INSTALL_T2I_COMPBENCH_ENV:-0}"
 
 "$ROOT_DIR/scripts/setup/bootstrap_env.sh"
+"$ROOT_DIR/scripts/setup/setup_seethrough3d_checkout.sh"
 "$ROOT_DIR/scripts/setup/bootstrap_benchmark.sh"
 
 if [[ "$INSTALL_T2I_COMPBENCH_ENV" == "1" ]]; then

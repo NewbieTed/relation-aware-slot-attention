@@ -12,7 +12,7 @@ fi
 
 PYTHON_BIN="${PYTHON_BIN:-$DEFAULT_PYTHON}"
 CATEGORY="${CATEGORY:-spatial}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-$ROOT_DIR/outputs/eval/sd15_t2i_compbench_${CATEGORY}_repeats}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-$ROOT_DIR/outputs/eval/flux_t2i_compbench_${CATEGORY}_repeats}"
 
 "$PYTHON_BIN" -m evaluation.t2i_compbench_repeats \
   --root-dir "$OUTPUT_ROOT" \

@@ -59,3 +59,56 @@ def bbox_log_sigmas_after_crop(
             ).log()
             mask[batch_index, node_index] = True
     return targets, mask
+
+
+def _depth_extent_from_row(row: dict[str, Any], node_index: int, fallback: float) -> float:
+    """Return an approximate normalized z-extent for one object.
+
+    SCOP-depth stores monocular depth statistics, not full metric 3D object
+    meshes. When a spread statistic is available we use it; otherwise the z-size
+    falls back to a conservative fraction of the 2D object scale.
+    """
+
+    depth = row.get("depth")
+    if not depth:
+        return fallback
+    key = f"bbox{node_index + 1}"
+    stats = depth.get(key, {})
+    for field in ("iqr", "std", "mad", "range"):
+        if field in stats:
+            return max(float(stats[field]), fallback)
+    return fallback
+
+
+def bbox_log_sizes_3d_after_crop(
+    metadata_rows: list[dict[str, Any]],
+    image_sizes: list[tuple[int, int]],
+    max_nodes: int,
+    device: torch.device,
+    *,
+    min_size: float = 0.03,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return approximate log 3D bbox sizes in normalized scene coordinates.
+
+    The x/y size comes directly from the cropped COCO bbox. The z size uses
+    depth-spread metadata when present, otherwise a small fallback tied to the
+    2D object scale. Values are log-space so the GNN can predict unconstrained
+    real values while the decoded sizes stay positive.
+    """
+
+    targets = torch.zeros(len(metadata_rows), max_nodes, 3, device=device)
+    mask = torch.zeros(len(metadata_rows), max_nodes, dtype=torch.bool, device=device)
+    for batch_index, (row, (width, height)) in enumerate(zip(metadata_rows, image_sizes)):
+        crop_size = min(width, height)
+        for node_index, annot in enumerate(row["annots"][:max_nodes]):
+            _, _, bbox_w, bbox_h = annot["bbox"]
+            size_x = max(float(bbox_w) / crop_size, min_size)
+            size_y = max(float(bbox_h) / crop_size, min_size)
+            fallback_z = max((size_x + size_y) * 0.25, min_size)
+            size_z = max(_depth_extent_from_row(row, node_index, fallback_z), min_size)
+            targets[batch_index, node_index] = torch.tensor(
+                [size_x, size_y, size_z],
+                device=device,
+            ).log()
+            mask[batch_index, node_index] = True
+    return targets, mask

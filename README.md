@@ -1,77 +1,72 @@
 # relation-aware-slot-attention
 
-This workspace currently contains `SCOP-Depth`, a depth-augmented variant of the SCOP data pipeline used to extract 2D, depth-order, and occlusion-style relations from COCO.
+This branch is the FLUX.1-dev version of the project. It keeps the SCOP-Depth
+data pipeline and relation-aware GNN, then uses the GNN to predict 3D object
+centers and box sizes. Those predictions are rendered into SeeThrough3D-style
+OSCR condition images, VAE-encoded as FLUX condition latents, and consumed by
+rank-128 LoRA processors in FLUX self-attention.
 
-The implementation lives in [scop_depth](/Users/newbieted/workspace/relation-aware-slot-attention/scop_depth), and the module path is `scop_depth`.
+## Setup
 
-For evaluation, this repo now keeps only our wrapper scripts and a lightweight
-override layer. External benchmark code such as T2I-CompBench should be prepared
-outside the tracked source tree with:
+Run the full bootstrap:
 
 ```bash
 ./scripts/setup/bootstrap_all.sh
 ```
 
-This creates a local `.venv`, installs the repo and evaluation dependencies,
-prepares the external T2I-CompBench checkout, and downloads the benchmark
-weights.
+This creates `.venv`, installs the repo with FLUX/evaluation dependencies, clones
+SeeThrough3D into `external/seethrough3d`, and prepares optional benchmark
+checkouts. The FLUX training and generation code directly imports
+SeeThrough3D's FLUX transformer fork and custom LoRA attention processors.
 
-If you previously used an older bootstrap version that created
-`scripts/.venv`, remove that stale environment first.
-
-## Evaluation Notes
-
-Do not run two T2I-CompBench evaluations in parallel from the same checkout.
-Our wrappers point at a shared external T2I-CompBench workspace, and that
-benchmark code uses shared intermediate files/state while scoring. Because of
-that, concurrent 2D/3D jobs can corrupt or overwrite each other's benchmark
-state even if their final output directories are different. Run these
-evaluations serially, and still use distinct output directories for every
-benchmark type, model checkpoint, and repeat group, for example one path ending
-in `_spatial_2d` and another ending in `_spatial_3d`.
-
-## Training Baseline
-
-The repo now also contains a first training scaffold for a vanilla Stable
-Diffusion 1.5 LoRA baseline on SCOP-Depth.
-
-Key pieces:
-
-- [`training/dataset.py`](/Users/newbieted/workspace/relation-aware-slot-attention/training/dataset.py):
-  loads `metadata.jsonl`, images, prompts, and serialized scene-graph metadata
-- [`training/prompts.py`](/Users/newbieted/workspace/relation-aware-slot-attention/training/prompts.py):
-  builds concise baseline prompts from SCOP-Depth relations
-- [`training/train_sd15_lora.py`](/Users/newbieted/workspace/relation-aware-slot-attention/training/train_sd15_lora.py):
-  trains SD1.5 LoRA attention processors on the exported dataset
-- [`scripts/train/run_sd15_lora_baseline.sh`](/Users/newbieted/workspace/relation-aware-slot-attention/scripts/train/run_sd15_lora_baseline.sh):
-  thin shell wrapper for launching the baseline trainer
-
-Example:
+If you only need the SeeThrough3D checkout:
 
 ```bash
-./.venv/bin/python -m pip install -e ".[train]"
-
-DATASET_DIR=/path/to/scop_depth_full \
-OUTPUT_DIR=outputs/train/sd15_scopdepth_lora \
-DEVICE=cuda \
-MAX_TRAIN_STEPS=1000 \
-./scripts/train/run_sd15_lora_baseline.sh
+./scripts/setup/setup_seethrough3d_checkout.sh
 ```
 
-This baseline intentionally keeps the model text-only at conditioning time while
-still carrying scene-graph metadata through the dataloader so the next stage can
-replace or augment text conditioning with graph-aware slots.
+## Current Workflow
 
-New SCOP-Depth exports create CoMPaSS-style pair crops by default, so each
-training row points to a crop around the selected object pair. If you explicitly
-used `--no-crop-pairs` and `metadata.jsonl` exists but
-`data/scop_depth_full/images/` is missing because the original COCO tree was
-moved or deleted, you can rebuild just the referenced full-image subset without
-rerunning SCOP-Depth:
+1. Build SCOP-Depth cropped/depth data.
+2. Pretrain the GNN with position, relation, and 3D box-size losses.
+3. Freeze the GNN and FLUX base model.
+4. Render GNN-predicted 3D boxes into OSCR condition images.
+5. Train FLUX.1-dev condition-stream LoRA processors.
+6. Generate/debug images with `evaluation.generate_flux_relation`.
+
+Example GNN training:
 
 ```bash
-./.venv/bin/python -m training.materialize_images \
-  --dataset-dir /path/to/scop_depth_full \
-  --coco-root /path/to/coco2017 \
-  --mode symlink
+python3 -m training.pretrain_graph_encoder \
+  --dataset-dir data/scop_depth_crops_depth \
+  --output-dir outputs/train/graph_pretrain_flux_3dbox \
+  --position-loss-weight 1.0 \
+  --relation-loss-weight 8.0 \
+  --box3d-loss-weight 1.0 \
+  --embedding-loss-weight 0.0 \
+  --inverse-relation-loss-weight 0.0
 ```
+
+Example FLUX LoRA training:
+
+```bash
+python3 -m training.train_relation_flux_lora \
+  --dataset-dir data/scop_depth_crops_depth \
+  --output-dir outputs/train/flux1dev_oscr_lora128 \
+  --init-graph-encoder outputs/train/graph_pretrain_flux_3dbox/final/graph_encoder.pt \
+  --model-id black-forest-labs/FLUX.1-dev \
+  --lora-rank 128 \
+  --lora-alpha 128
+```
+
+Example generation/debug:
+
+```bash
+python3 -m evaluation.generate_flux_relation \
+  --prompt "a cat to the left of a dog" \
+  --checkpoint-dir outputs/train/flux1dev_oscr_lora128/final \
+  --output-dir outputs/debug/flux_cat_left_dog
+```
+
+The generation utility saves the generated image, the rendered OSCR condition,
+and a JSON file containing predicted centers and 3D sizes.
