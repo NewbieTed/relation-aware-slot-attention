@@ -200,6 +200,25 @@ def _save_condition_lora_state(transformer: Any, path: Path) -> None:
     torch.save(state, path)
 
 
+def _enable_gradient_checkpointing_compat(transformer: Any) -> None:
+    """Enable checkpointing across diffusers and SeeThrough3D API variants."""
+
+    if hasattr(transformer, "enable_gradient_checkpointing"):
+        try:
+            transformer.enable_gradient_checkpointing()
+            return
+        except TypeError:
+            pass
+
+    if hasattr(transformer, "_set_gradient_checkpointing"):
+        for module in transformer.modules():
+            transformer._set_gradient_checkpointing(module, enable=True)
+        return
+
+    if hasattr(transformer, "gradient_checkpointing"):
+        transformer.gradient_checkpointing = True
+
+
 def _load_graph_encoder(
     *,
     path: Path,
@@ -496,11 +515,7 @@ def main() -> int:
         pipeline.transformer.to(device=device, dtype=dtype)
     else:
         pipeline.to(device)
-    if hasattr(pipeline.transformer, "enable_gradient_checkpointing"):
-        try:
-            pipeline.transformer.enable_gradient_checkpointing()
-        except TypeError:
-            pipeline.transformer._set_gradient_checkpointing(enable=True)
+    _enable_gradient_checkpointing_compat(pipeline.transformer)
     pipeline.vae.requires_grad_(False)
     pipeline.text_encoder.requires_grad_(False)
     pipeline.text_encoder_2.requires_grad_(False)
