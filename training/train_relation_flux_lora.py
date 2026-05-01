@@ -306,8 +306,8 @@ def _encode_packed_latents(
     packed = pipeline._pack_latents(latents, batch_size, channels, height, width)
     ids = pipeline._prepare_latent_image_ids(
         batch_size,
-        height // 2,
-        width // 2,
+        height,
+        width,
         torch.device(device),
         dtype,
     )
