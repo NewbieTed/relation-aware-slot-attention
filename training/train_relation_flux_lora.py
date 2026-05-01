@@ -69,6 +69,11 @@ def make_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Keep frozen text encoders/GNN on CPU and offload the VAE between encodes.",
     )
+    parser.add_argument(
+        "--gradient-checkpointing",
+        action="store_true",
+        help="Enable transformer gradient checkpointing. Disabled by default because SeeThrough3D checkpointing currently does not support condition kwargs on some versions.",
+    )
     parser.add_argument("--prompt-prefix", type=str, default="a photo of")
     parser.add_argument("--limit-rows", type=int, default=None)
     parser.add_argument("--eval-fraction", type=float, default=0.1)
@@ -516,7 +521,8 @@ def main() -> int:
         pipeline.transformer.to(device=device, dtype=dtype)
     else:
         pipeline.to(device)
-    _enable_gradient_checkpointing_compat(pipeline.transformer)
+    if args.gradient_checkpointing:
+        _enable_gradient_checkpointing_compat(pipeline.transformer)
     pipeline.vae.requires_grad_(False)
     pipeline.text_encoder.requires_grad_(False)
     pipeline.text_encoder_2.requires_grad_(False)

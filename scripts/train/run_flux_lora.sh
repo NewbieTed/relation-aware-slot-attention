@@ -31,6 +31,7 @@ MAX_SEQUENCE_LENGTH="${MAX_SEQUENCE_LENGTH:-512}"
 SAVE_EVERY="${SAVE_EVERY:-4000}"
 EVAL_EVERY="${EVAL_EVERY:-1000}"
 LOW_VRAM="${LOW_VRAM:-0}"
+GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-0}"
 
 CMD=(
   "$PYTHON_BIN" -m training.train_relation_flux_lora
@@ -55,6 +56,9 @@ CMD=(
 
 if [[ "$LOW_VRAM" == "1" ]]; then
   CMD+=(--low-vram)
+fi
+if [[ "$GRADIENT_CHECKPOINTING" == "1" ]]; then
+  CMD+=(--gradient-checkpointing)
 fi
 
 "${CMD[@]}" "$@"
