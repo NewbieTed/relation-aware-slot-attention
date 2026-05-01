@@ -161,6 +161,8 @@ def _save_oscr_preview(
     log_sizes: torch.Tensor,
     slot_mask: torch.Tensor,
     output_path: Path,
+    labels: list[str] | None = None,
+    title: str | None = None,
 ) -> None:
     oscr = render_oscr_boxes(
         centers=centers.detach().cpu(),
@@ -179,7 +181,38 @@ def _save_oscr_preview(
         .permute(1, 2, 0)
         .numpy()
     )
-    Image.fromarray(image, mode="RGB").save(output_path)
+    preview = Image.fromarray(image, mode="RGB")
+    draw = ImageDraw.Draw(preview)
+    font = _load_font(17)
+    small = _load_font(14)
+    if title is not None:
+        _draw_text_block(draw, [title], (0, 0), font, fill="white", background="black")
+    if labels is not None:
+        centers_cpu = centers.detach().cpu().to(torch.float32)
+        sizes_cpu = log_sizes.detach().cpu().to(torch.float32).exp()
+        mask_cpu = slot_mask.detach().cpu()
+        colors = ["#00d5ff", "#ff3366", "#2a9d8f", "#f77f00"]
+        for index, label in enumerate(labels):
+            if index >= centers_cpu.shape[1] or not bool(mask_cpu[0, index].item()):
+                continue
+            center = centers_cpu[0, index]
+            size = sizes_cpu[0, index]
+            px, py = _coord_to_px(float(center[0]), float(center[1]))
+            color = colors[index % len(colors)]
+            draw.ellipse([px - 5, py - 5, px + 5, py + 5], fill=color, outline="black")
+            _draw_text_block(
+                draw,
+                [
+                    str(label),
+                    f"z={float(center[2]):+.2f}",
+                    f"sz={float(size[2]):.2f}",
+                ],
+                (max(4, min(CANVAS_SIZE - 110, int(px + 8))), max(38, min(CANVAS_SIZE - 76, int(py + 8)))),
+                small,
+                fill="white",
+                background="black",
+            )
+    preview.save(output_path)
 
 
 def _coord_to_px(x: float, y: float, size: int = CANVAS_SIZE) -> tuple[float, float]:
@@ -248,7 +281,21 @@ def _draw_layout(
             outline="black",
             width=1,
         )
-        draw.text((offset_x + px + 8, offset_y + py + 8), label, font=font, fill=color)
+        _draw_text_block(
+            draw,
+            [
+                str(label),
+                f"z={center[2]:+.2f}",
+                f"sz={size[2]:.2f}",
+            ],
+            (
+                int(offset_x + max(4, min(CANVAS_SIZE - 118, px + 8))),
+                int(offset_y + max(4, min(CANVAS_SIZE - 82, py + 8))),
+            ),
+            font,
+            fill="white",
+            background="#111827",
+        )
 
 
 def _render_scene_graph(
@@ -396,7 +443,21 @@ def _draw_overlay_on_crop(
             box = [px - rx, py - ry, px + rx, py + ry]
             draw.ellipse(box, outline=color, width=4 if solid else 2)
             draw.ellipse([px - 5, py - 5, px + 5, py + 5], fill=color, outline="black")
-            draw.text((px + 8, py + 8), label, font=font, fill=color)
+            _draw_text_block(
+                draw,
+                [
+                    str(label),
+                    f"z={center[2]:+.2f}",
+                    f"sz={size[2]:.2f}",
+                ],
+                (
+                    max(4, min(CANVAS_SIZE - 118, int(px + 8))),
+                    max(42, min(CANVAS_SIZE - 82, int(py + 8))),
+                ),
+                font,
+                fill="white",
+                background="black",
+            )
         panels.append(panel)
     combined = Image.new("RGB", (CANVAS_SIZE * 2, CANVAS_SIZE), "black")
     combined.paste(panels[0], (0, 0))
@@ -762,6 +823,8 @@ def main() -> int:
         centers=pred_center_tensor,
         log_sizes=pred_log_size_tensor,
         slot_mask=pred_slot_mask,
+        labels=labels,
+        title="Predicted OSCR condition",
         output_path=args.output_dir / "oscr_prediction.png",
     )
     _render_scene_graph(
@@ -792,6 +855,8 @@ def main() -> int:
             centers=slot_targets[:, :max_nodes],
             log_sizes=log_size_targets[:, :max_nodes],
             slot_mask=slot_mask[:, :max_nodes],
+            labels=labels,
+            title="Ground-truth OSCR condition",
             output_path=args.output_dir / "oscr_ground_truth.png",
         )
     else:
