@@ -15,6 +15,7 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
 import types
 from pathlib import Path
@@ -370,6 +371,117 @@ def _resize_condition_ids(
     return ids.reshape(cond_h * cond_w, 3)
 
 
+def _find_label_token_ids(
+    *,
+    tokenizer: Any,
+    prompt: str,
+    label: str,
+    max_sequence_length: int,
+) -> list[int]:
+    """Find T5 token positions that overlap an object label in the prompt."""
+
+    prompt_lower = prompt.lower()
+    label_lower = label.lower().replace("_", " ")
+    match = re.search(rf"\b{re.escape(label_lower)}\b", prompt_lower)
+    try:
+        encoded = tokenizer(
+            prompt,
+            padding="max_length",
+            max_length=max_sequence_length,
+            truncation=True,
+            return_offsets_mapping=True,
+            return_tensors="pt",
+        )
+    except (NotImplementedError, TypeError):
+        encoded = tokenizer(
+            prompt,
+            padding="max_length",
+            max_length=max_sequence_length,
+            truncation=True,
+            return_tensors="pt",
+        )
+    if match is not None and hasattr(encoded, "offset_mapping"):
+        start, end = match.span()
+        ids = [
+            index
+            for index, (token_start, token_end) in enumerate(encoded.offset_mapping[0].tolist())
+            if token_end > start and token_start < end
+        ]
+        if ids:
+            return ids
+
+    prompt_ids = encoded.input_ids[0].tolist()
+    label_ids = tokenizer(
+        label_lower,
+        add_special_tokens=False,
+        return_tensors="pt",
+    ).input_ids[0].tolist()
+    if label_ids:
+        for index in range(0, max(0, len(prompt_ids) - len(label_ids) + 1)):
+            if prompt_ids[index : index + len(label_ids)] == label_ids:
+                return list(range(index, index + len(label_ids)))
+    return []
+
+
+def _build_binding_inputs(
+    *,
+    batch: dict[str, Any],
+    pipeline: Any,
+    centers: torch.Tensor,
+    log_sizes: torch.Tensor,
+    slot_mask: torch.Tensor,
+    cond_grid: tuple[int, int],
+    max_sequence_length: int,
+    device: str,
+) -> tuple[list[list[torch.Tensor]], torch.Tensor]:
+    """Build SeeThrough3D call ids and cuboid masks from GNN boxes."""
+
+    cond_h, cond_w = cond_grid
+    y_coords = (torch.arange(cond_h, device=device, dtype=torch.float32) + 0.5) / cond_h * 2.0 - 1.0
+    x_coords = (torch.arange(cond_w, device=device, dtype=torch.float32) + 0.5) / cond_w * 2.0 - 1.0
+    yy, xx = torch.meshgrid(y_coords, x_coords, indexing="ij")
+    sizes = log_sizes.float().exp().clamp(min=0.03, max=2.0)
+    batch_call_ids: list[list[torch.Tensor]] = []
+    max_subjects = centers.shape[1]
+    cuboid_masks = torch.zeros(
+        centers.shape[0],
+        max_subjects,
+        cond_h,
+        cond_w,
+        device=device,
+        dtype=torch.uint8,
+    )
+
+    for batch_index, (prompt, scene_graph) in enumerate(zip(batch["prompts"], batch["scene_graphs"])):
+        sample_call_ids: list[torch.Tensor] = []
+        for node_index, node in enumerate(scene_graph["nodes"]):
+            if node_index >= centers.shape[1] or not bool(slot_mask[batch_index, node_index].item()):
+                continue
+            label = str(node["label"])
+            token_ids = _find_label_token_ids(
+                tokenizer=pipeline.tokenizer_2,
+                prompt=str(prompt),
+                label=label,
+                max_sequence_length=max_sequence_length,
+            )
+            sample_call_ids.append(torch.tensor(token_ids, device=device, dtype=torch.long))
+            center = centers[batch_index, node_index].float()
+            size = sizes[batch_index, node_index]
+            mask = (
+                (xx >= center[0] - size[0])
+                & (xx <= center[0] + size[0])
+                & (yy >= center[1] - size[1])
+                & (yy <= center[1] + size[1])
+            )
+            if not bool(mask.any().item()):
+                cx = int(torch.clamp(((center[0] + 1.0) * 0.5 * cond_w).round(), 0, cond_w - 1).item())
+                cy = int(torch.clamp(((center[1] + 1.0) * 0.5 * cond_h).round(), 0, cond_h - 1).item())
+                mask[cy, cx] = True
+            cuboid_masks[batch_index, len(sample_call_ids) - 1] = mask.to(torch.uint8)
+        batch_call_ids.append(sample_call_ids)
+    return batch_call_ids, cuboid_masks
+
+
 @torch.no_grad()
 def _build_condition_latents(
     *,
@@ -379,7 +491,7 @@ def _build_condition_latents(
     device: str,
     dtype: torch.dtype,
     oscr_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     centers, log_sizes, slot_mask = _graph_3d_boxes(
         batch=batch,
         pipeline=pipeline,
@@ -399,7 +511,7 @@ def _build_condition_latents(
         device=device,
         dtype=dtype,
     )
-    return cond_latents, cond_ids, torch.tensor(cond_grid, device=device), centers, log_sizes
+    return cond_latents, cond_ids, torch.tensor(cond_grid, device=device), centers, log_sizes, slot_mask
 
 
 def _compute_loss(
@@ -434,7 +546,7 @@ def _compute_loss(
         prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
         pooled_prompt_embeds = pooled_prompt_embeds.to(device=device, dtype=dtype)
         text_ids = text_ids.to(device=device)
-        cond_latents, _cond_ids, cond_grid_tensor, centers, log_sizes = _build_condition_latents(
+        cond_latents, _cond_ids, cond_grid_tensor, centers, log_sizes, slot_mask = _build_condition_latents(
             batch=batch,
             pipeline=pipeline,
             graph_encoder=graph_encoder,
@@ -443,6 +555,16 @@ def _compute_loss(
             oscr_size=oscr_size,
         )
         cond_grid = (int(cond_grid_tensor[0].item()), int(cond_grid_tensor[1].item()))
+        call_ids, cuboids_segmasks = _build_binding_inputs(
+            batch=batch,
+            pipeline=pipeline,
+            centers=centers,
+            log_sizes=log_sizes,
+            slot_mask=slot_mask,
+            cond_grid=cond_grid,
+            max_sequence_length=max_sequence_length,
+            device=device,
+        )
         cond_ids = _resize_condition_ids(
             cond_grid=cond_grid,
             image_grid=image_grid,
@@ -473,6 +595,8 @@ def _compute_loss(
         txt_ids=text_ids,
         img_ids=image_and_condition_ids,
         return_dict=False,
+        call_ids=call_ids,
+        cuboids_segmasks=cuboids_segmasks,
     )[0]
     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
     return {
@@ -481,6 +605,12 @@ def _compute_loss(
         "condition_latent_norm": cond_latents.float().pow(2).mean().sqrt().detach(),
         "pred_center_abs_mean": centers.float().abs().mean().detach(),
         "pred_log_size_mean": log_sizes.float().mean().detach(),
+        "binding_token_count": torch.tensor(
+            sum(len(token_ids) for sample in call_ids for token_ids in sample),
+            device=clean_latents.device,
+            dtype=torch.float32,
+        ),
+        "binding_mask_pct": cuboids_segmasks.float().mean().mul(100.0).detach(),
     }
 
 
@@ -612,6 +742,8 @@ def main() -> int:
             "condition_latent_norm",
             "pred_center_abs_mean",
             "pred_log_size_mean",
+            "binding_token_count",
+            "binding_mask_pct",
         ],
     )
     _save_state(args.output_dir, step=0, args=args, lora_layers=lora_layers)
@@ -625,6 +757,8 @@ def main() -> int:
         "condition_latent_norm": 0.0,
         "pred_center_abs_mean": 0.0,
         "pred_log_size_mean": 0.0,
+        "binding_token_count": 0.0,
+        "binding_mask_pct": 0.0,
     }
     running_steps = 0
     optimizer.zero_grad(set_to_none=True)
