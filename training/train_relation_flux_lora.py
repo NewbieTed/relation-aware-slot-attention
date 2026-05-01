@@ -383,7 +383,8 @@ def _compute_loss(
         )
         encoder_device = getattr(pipeline, "_encoder_device", device)
         prompt_embeds, pooled_prompt_embeds, text_ids = pipeline.encode_prompt(
-            batch["prompts"],
+            prompt=batch["prompts"],
+            prompt_2=batch["prompts"],
             device=torch.device(encoder_device),
             num_images_per_prompt=1,
             max_sequence_length=max_sequence_length,

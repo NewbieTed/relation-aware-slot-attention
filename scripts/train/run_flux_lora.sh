@@ -19,12 +19,15 @@ INIT_GRAPH_ENCODER="${INIT_GRAPH_ENCODER:-$ROOT_DIR/outputs/train/graph_pretrain
 MODEL_ID="${MODEL_ID:-black-forest-labs/FLUX.1-dev}"
 DEVICE="${DEVICE:-auto}"
 MIXED_PRECISION="${MIXED_PRECISION:-bf16}"
+IMAGE_SIZE="${IMAGE_SIZE:-512}"
+OSCR_SIZE="${OSCR_SIZE:-512}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
 LEARNING_RATE="${LEARNING_RATE:-1e-5}"
 MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-24000}"
 LORA_RANK="${LORA_RANK:-128}"
 LORA_ALPHA="${LORA_ALPHA:-128}"
+MAX_SEQUENCE_LENGTH="${MAX_SEQUENCE_LENGTH:-512}"
 SAVE_EVERY="${SAVE_EVERY:-4000}"
 EVAL_EVERY="${EVAL_EVERY:-1000}"
 LOW_VRAM="${LOW_VRAM:-0}"
@@ -37,12 +40,15 @@ CMD=(
   --model-id "$MODEL_ID" \
   --device "$DEVICE" \
   --mixed-precision "$MIXED_PRECISION" \
+  --image-size "$IMAGE_SIZE" \
+  --oscr-size "$OSCR_SIZE" \
   --batch-size "$BATCH_SIZE" \
   --gradient-accumulation-steps "$GRADIENT_ACCUMULATION_STEPS" \
   --learning-rate "$LEARNING_RATE" \
   --max-train-steps "$MAX_TRAIN_STEPS" \
   --lora-rank "$LORA_RANK" \
   --lora-alpha "$LORA_ALPHA" \
+  --max-sequence-length "$MAX_SEQUENCE_LENGTH" \
   --save-every "$SAVE_EVERY" \
   --eval-every "$EVAL_EVERY"
 )
