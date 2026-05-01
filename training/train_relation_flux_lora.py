@@ -497,7 +497,10 @@ def main() -> int:
     else:
         pipeline.to(device)
     if hasattr(pipeline.transformer, "enable_gradient_checkpointing"):
-        pipeline.transformer.enable_gradient_checkpointing()
+        try:
+            pipeline.transformer.enable_gradient_checkpointing()
+        except TypeError:
+            pipeline.transformer._set_gradient_checkpointing(enable=True)
     pipeline.vae.requires_grad_(False)
     pipeline.text_encoder.requires_grad_(False)
     pipeline.text_encoder_2.requires_grad_(False)
