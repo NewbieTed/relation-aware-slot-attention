@@ -64,6 +64,11 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lora-alpha", type=float, default=128.0)
     parser.add_argument("--max-sequence-length", type=int, default=512)
     parser.add_argument("--guidance-scale", type=float, default=3.5)
+    parser.add_argument(
+        "--low-vram",
+        action="store_true",
+        help="Keep frozen text encoders/GNN on CPU and offload the VAE between encodes.",
+    )
     parser.add_argument("--prompt-prefix", type=str, default="a photo of")
     parser.add_argument("--limit-rows", type=int, default=None)
     parser.add_argument("--eval-fraction", type=float, default=0.1)
@@ -229,12 +234,13 @@ def _graph_3d_boxes(
     graph_encoder: GraphSlotEncoder,
     device: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    graph_device = getattr(pipeline, "_graph_device", device)
     max_nodes = max(len(graph["nodes"]) for graph in batch["scene_graphs"])
     centers, slot_mask = bbox_centers_after_crop(
         batch["metadata"],
         batch["image_sizes"],
         max_nodes=max_nodes,
-        device=torch.device(device),
+        device=torch.device(graph_device),
     )
     scene_graph_batch = build_batched_scene_graphs(
         batch["scene_graphs"],
@@ -246,9 +252,13 @@ def _graph_3d_boxes(
         text_encoder=pipeline.text_encoder,
         scene_graph_batch=scene_graph_batch,
         graph_encoder=graph_encoder,
-        device=device,
+        device=graph_device,
     )
-    return conditioning.slot_positions, conditioning.slot_log_sizes_3d, conditioning.slot_mask
+    return (
+        conditioning.slot_positions.to(device),
+        conditioning.slot_log_sizes_3d.to(device),
+        conditioning.slot_mask.to(device),
+    )
 
 
 def _encode_packed_latents(
@@ -259,7 +269,14 @@ def _encode_packed_latents(
     device: str,
     dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor, tuple[int, int]]:
+    vae_device = next(pipeline.vae.parameters()).device
+    if str(vae_device) != device:
+        pipeline.vae.to(device=device, dtype=dtype)
     latents = pipeline.vae.encode(images.to(device=device, dtype=dtype)).latent_dist.sample()
+    if getattr(pipeline, "_low_vram", False):
+        pipeline.vae.to("cpu")
+        if device == "cuda":
+            torch.cuda.empty_cache()
     latents = (latents - pipeline.vae.config.shift_factor) * pipeline.vae.config.scaling_factor
     batch_size, channels, height, width = latents.shape
     packed = pipeline._pack_latents(latents, batch_size, channels, height, width)
@@ -345,12 +362,16 @@ def _compute_loss(
             device=device,
             dtype=dtype,
         )
+        encoder_device = getattr(pipeline, "_encoder_device", device)
         prompt_embeds, pooled_prompt_embeds, text_ids = pipeline.encode_prompt(
             batch["prompts"],
-            device=torch.device(device),
+            device=torch.device(encoder_device),
             num_images_per_prompt=1,
             max_sequence_length=max_sequence_length,
         )
+        prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
+        pooled_prompt_embeds = pooled_prompt_embeds.to(device=device, dtype=dtype)
+        text_ids = text_ids.to(device=device)
         cond_latents, _cond_ids, cond_grid_tensor, centers, log_sizes = _build_condition_latents(
             batch=batch,
             pipeline=pipeline,
@@ -459,13 +480,24 @@ def main() -> int:
         FluxAttnProcessor2_0,
     ) = _import_seethrough3d_flux()
 
-    pipeline = FluxPipeline.from_pretrained(args.model_id, torch_dtype=dtype)
+    pipeline = FluxPipeline.from_pretrained(args.model_id, transformer=None, torch_dtype=dtype)
     pipeline.transformer = FluxTransformer2DModel.from_pretrained(
         args.model_id,
         subfolder="transformer",
         torch_dtype=dtype,
     )
-    pipeline.to(device)
+    pipeline._low_vram = args.low_vram
+    pipeline._encoder_device = "cpu" if args.low_vram else device
+    pipeline._graph_device = "cpu" if args.low_vram else device
+    if args.low_vram:
+        pipeline.text_encoder.to("cpu")
+        pipeline.text_encoder_2.to("cpu")
+        pipeline.vae.to("cpu")
+        pipeline.transformer.to(device=device, dtype=dtype)
+    else:
+        pipeline.to(device)
+    if hasattr(pipeline.transformer, "enable_gradient_checkpointing"):
+        pipeline.transformer.enable_gradient_checkpointing()
     pipeline.vae.requires_grad_(False)
     pipeline.text_encoder.requires_grad_(False)
     pipeline.text_encoder_2.requires_grad_(False)
@@ -489,7 +521,7 @@ def main() -> int:
         text_hidden_dim=pipeline.text_encoder.config.hidden_size,
         slot_dim=args.slot_dim,
         gnn_layers=args.gnn_layers,
-        device=device,
+        device=pipeline._graph_device,
     )
     trainable_params = [p for p in pipeline.transformer.parameters() if p.requires_grad]
     print(f"Trainable FLUX LoRA parameters: {sum(p.numel() for p in trainable_params) / 1_000_000:.2f}M")

@@ -6,7 +6,9 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
 DEFAULT_PYTHON="python3"
-if [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
+if [[ -x "$ROOT_DIR/.venv-flux/bin/python" ]]; then
+  DEFAULT_PYTHON="$ROOT_DIR/.venv-flux/bin/python"
+elif [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
   DEFAULT_PYTHON="$ROOT_DIR/.venv/bin/python"
 fi
 
@@ -23,8 +25,12 @@ LEARNING_RATE="${LEARNING_RATE:-1e-5}"
 MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-24000}"
 LORA_RANK="${LORA_RANK:-128}"
 LORA_ALPHA="${LORA_ALPHA:-128}"
+SAVE_EVERY="${SAVE_EVERY:-4000}"
+EVAL_EVERY="${EVAL_EVERY:-1000}"
+LOW_VRAM="${LOW_VRAM:-0}"
 
-"$PYTHON_BIN" -m training.train_relation_flux_lora \
+CMD=(
+  "$PYTHON_BIN" -m training.train_relation_flux_lora
   --dataset-dir "$DATASET_DIR" \
   --output-dir "$OUTPUT_DIR" \
   --init-graph-encoder "$INIT_GRAPH_ENCODER" \
@@ -37,4 +43,12 @@ LORA_ALPHA="${LORA_ALPHA:-128}"
   --max-train-steps "$MAX_TRAIN_STEPS" \
   --lora-rank "$LORA_RANK" \
   --lora-alpha "$LORA_ALPHA" \
-  "$@"
+  --save-every "$SAVE_EVERY" \
+  --eval-every "$EVAL_EVERY"
+)
+
+if [[ "$LOW_VRAM" == "1" ]]; then
+  CMD+=(--low-vram)
+fi
+
+"${CMD[@]}" "$@"
