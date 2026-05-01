@@ -27,6 +27,7 @@ LEARNING_RATE="${LEARNING_RATE:-1e-5}"
 MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-24000}"
 LORA_RANK="${LORA_RANK:-128}"
 LORA_ALPHA="${LORA_ALPHA:-128}"
+FLUX_QUANTIZATION="${FLUX_QUANTIZATION:-none}"
 MAX_SEQUENCE_LENGTH="${MAX_SEQUENCE_LENGTH:-512}"
 SAVE_EVERY="${SAVE_EVERY:-4000}"
 EVAL_EVERY="${EVAL_EVERY:-1000}"
@@ -49,6 +50,7 @@ CMD=(
   --max-train-steps "$MAX_TRAIN_STEPS" \
   --lora-rank "$LORA_RANK" \
   --lora-alpha "$LORA_ALPHA" \
+  --flux-quantization "$FLUX_QUANTIZATION" \
   --max-sequence-length "$MAX_SEQUENCE_LENGTH" \
   --save-every "$SAVE_EVERY" \
   --eval-every "$EVAL_EVERY"

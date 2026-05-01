@@ -62,6 +62,12 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gnn-layers", type=int, default=2)
     parser.add_argument("--lora-rank", type=int, default=128)
     parser.add_argument("--lora-alpha", type=float, default=128.0)
+    parser.add_argument(
+        "--flux-quantization",
+        choices=("none", "8bit", "4bit"),
+        default="none",
+        help="Optionally load the frozen FLUX transformer with bitsandbytes quantization.",
+    )
     parser.add_argument("--max-sequence-length", type=int, default=512)
     parser.add_argument("--guidance-scale", type=float, default=3.5)
     parser.add_argument(
@@ -93,6 +99,7 @@ def _save_state(output_dir: Path, *, step: int, args: argparse.Namespace, lora_l
         "init_graph_encoder": str(args.init_graph_encoder),
         "lora_rank": args.lora_rank,
         "lora_alpha": args.lora_alpha,
+        "flux_quantization": args.flux_quantization,
         "lora_layers": lora_layers,
         "oscr_size": args.oscr_size,
     }
@@ -222,6 +229,36 @@ def _enable_gradient_checkpointing_compat(transformer: Any) -> None:
 
     if hasattr(transformer, "gradient_checkpointing"):
         transformer.gradient_checkpointing = True
+
+
+def _build_flux_quantization_config(mode: str, dtype: torch.dtype) -> Any | None:
+    """Create a bitsandbytes config for quantized frozen FLUX weights."""
+
+    if mode == "none":
+        return None
+    try:
+        from diffusers import BitsAndBytesConfig
+    except ImportError as exc:
+        raise ImportError(
+            "FLUX quantization requires a recent diffusers with BitsAndBytesConfig."
+        ) from exc
+    try:
+        __import__("bitsandbytes")
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "FLUX quantization requires bitsandbytes. Install with "
+            "`python -m pip install bitsandbytes` in .venv-flux."
+        ) from exc
+
+    if mode == "8bit":
+        return BitsAndBytesConfig(load_in_8bit=True)
+    compute_dtype = torch.bfloat16 if dtype == torch.bfloat16 else torch.float16
+    return BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=compute_dtype,
+        bnb_4bit_use_double_quant=True,
+    )
 
 
 def _load_graph_encoder(
@@ -506,10 +543,17 @@ def main() -> int:
     ) = _import_seethrough3d_flux()
 
     pipeline = FluxPipeline.from_pretrained(args.model_id, transformer=None, torch_dtype=dtype)
+    quantization_config = _build_flux_quantization_config(args.flux_quantization, dtype)
+    transformer_kwargs: dict[str, Any] = {
+        "subfolder": "transformer",
+        "torch_dtype": dtype,
+    }
+    if quantization_config is not None:
+        transformer_kwargs["quantization_config"] = quantization_config
+        transformer_kwargs["device_map"] = {"": device}
     pipeline.transformer = FluxTransformer2DModel.from_pretrained(
         args.model_id,
-        subfolder="transformer",
-        torch_dtype=dtype,
+        **transformer_kwargs,
     )
     pipeline._low_vram = args.low_vram
     pipeline._encoder_device = "cpu" if args.low_vram else device
@@ -518,9 +562,15 @@ def main() -> int:
         pipeline.text_encoder.to("cpu")
         pipeline.text_encoder_2.to("cpu")
         pipeline.vae.to("cpu")
-        pipeline.transformer.to(device=device, dtype=dtype)
+        if quantization_config is None:
+            pipeline.transformer.to(device=device, dtype=dtype)
     else:
-        pipeline.to(device)
+        if quantization_config is None:
+            pipeline.to(device)
+        else:
+            pipeline.vae.to(device=device, dtype=dtype)
+            pipeline.text_encoder.to(device)
+            pipeline.text_encoder_2.to(device)
     if args.gradient_checkpointing:
         _enable_gradient_checkpointing_compat(pipeline.transformer)
     pipeline.vae.requires_grad_(False)
