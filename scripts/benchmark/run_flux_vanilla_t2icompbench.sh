@@ -31,6 +31,8 @@ SEED="${SEED:-42}"
 OUTPUT_DIR="${OUTPUT_DIR:-$ROOT_DIR/outputs/eval/flux_vanilla_${BENCHMARK}}"
 PROMPT_FILE="${PROMPT_FILE:-}"
 COPY_INSTEAD_OF_SYMLINK="${COPY_INSTEAD_OF_SYMLINK:-0}"
+PRUNE_SAMPLES_KEEP="${PRUNE_SAMPLES_KEEP:-}"
+PRUNE_SAMPLES_SEED="${PRUNE_SAMPLES_SEED:-42}"
 
 if [[ -z "$PROMPT_FILE" ]]; then
   case "$BENCHMARK" in
@@ -83,6 +85,9 @@ EVAL_CMD=(
 
 if [[ "$COPY_INSTEAD_OF_SYMLINK" == "1" ]]; then
   EVAL_CMD+=(--copy-instead-of-symlink)
+fi
+if [[ -n "$PRUNE_SAMPLES_KEEP" ]]; then
+  EVAL_CMD+=(--prune-samples-keep "$PRUNE_SAMPLES_KEEP" --prune-samples-seed "$PRUNE_SAMPLES_SEED")
 fi
 
 "${EVAL_CMD[@]}"
