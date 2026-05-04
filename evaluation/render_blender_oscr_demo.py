@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +47,25 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-z", type=float, default=4.3)
     parser.add_argument("--limit", type=int, default=None)
     return parser
+
+
+def _script_argv() -> list[str] | None:
+    """Return arguments intended for this script when launched by Blender.
+
+    ``blender --background --python script.py -- --flag value`` keeps Blender's
+    own arguments in ``sys.argv``. Standard argparse would try to parse all of
+    them, so we explicitly keep only the portion after ``--``. Some Blender
+    builds strip the marker, so we also support finding the first known script
+    flag as a fallback.
+    """
+
+    if "--" in sys.argv:
+        return sys.argv[sys.argv.index("--") + 1 :]
+    known_flags = {"--records-json", "--output-dir"}
+    for index, value in enumerate(sys.argv):
+        if value in known_flags:
+            return sys.argv[index:]
+    return None
 
 
 def _safe_name(prompt: str, index: int) -> str:
@@ -278,7 +298,7 @@ def _render_record(record: dict[str, Any], *, args: argparse.Namespace, index: i
 
 
 def main() -> int:
-    args = make_parser().parse_args()
+    args = make_parser().parse_args(_script_argv())
     args.output_dir.mkdir(parents=True, exist_ok=True)
     records = json.loads(args.records_json.read_text())
     if args.limit is not None:
