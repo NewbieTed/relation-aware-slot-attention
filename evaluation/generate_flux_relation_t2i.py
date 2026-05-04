@@ -154,6 +154,13 @@ def _load_pipeline(args: argparse.Namespace, device: str, dtype: torch.dtype) ->
     return pipeline, quantization_config
 
 
+def _pipeline_execution_device(pipeline: Any, fallback: str) -> torch.device:
+    execution_device = getattr(pipeline, "_execution_device", None)
+    if execution_device is None:
+        return torch.device(fallback)
+    return torch.device(execution_device)
+
+
 @torch.no_grad()
 def _predict_condition(
     *,
@@ -248,7 +255,12 @@ def main() -> int:
         )
         for repeat_index in range(args.samples_per_prompt):
             seed = args.seed + prompt_index * args.samples_per_prompt + repeat_index
-            generator = torch.Generator(device=device).manual_seed(seed) if device != "mps" else None
+            generator_device = _pipeline_execution_device(pipeline, device)
+            generator = (
+                torch.Generator(device=generator_device).manual_seed(seed)
+                if generator_device.type != "mps"
+                else None
+            )
             image = pipeline(
                 prompt=prompt,
                 prompt_2=prompt,
