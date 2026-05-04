@@ -62,6 +62,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ground", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--shadows", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--transparent-background", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--background", choices=("black", "white"), default="white")
     parser.add_argument("--limit", type=int, default=None)
     return parser
 
@@ -255,7 +256,7 @@ def _setup_scene(args: argparse.Namespace) -> None:
     scene.view_settings.exposure = 0.0
     scene.view_settings.gamma = 1.0
     scene.world = bpy.data.worlds.new("OSCRWorld")
-    scene.world.color = (0.0, 0.0, 0.0)
+    scene.world.color = (1.0, 1.0, 1.0) if args.background == "white" else (0.0, 0.0, 0.0)
 
     bpy.ops.object.light_add(type="AREA", location=(0, -4.0, 5.5))
     light = bpy.context.object
