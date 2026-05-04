@@ -49,6 +49,30 @@ def make_parser() -> argparse.ArgumentParser:
         default=0.18,
         help="How strongly predicted z-size shifts the back face up-left.",
     )
+    parser.add_argument(
+        "--front-alpha",
+        type=int,
+        default=18,
+        help="RGBA alpha for front cuboid faces in the fixed-corner demo.",
+    )
+    parser.add_argument(
+        "--side-alpha",
+        type=int,
+        default=12,
+        help="RGBA alpha for side/top cuboid faces in the fixed-corner demo.",
+    )
+    parser.add_argument(
+        "--back-alpha",
+        type=int,
+        default=8,
+        help="RGBA alpha for back cuboid faces in the fixed-corner demo.",
+    )
+    parser.add_argument(
+        "--edge-alpha",
+        type=int,
+        default=210,
+        help="RGBA alpha for cuboid edges in the fixed-corner demo.",
+    )
     return parser
 
 
@@ -149,6 +173,10 @@ def render_fixed_corner_oscr(
     labels: list[str],
     image_size: int,
     depth_offset_scale: float,
+    front_alpha: int,
+    side_alpha: int,
+    back_alpha: int,
+    edge_alpha: int,
 ) -> Image.Image:
     """Render a deterministic top-left/front cuboid projection.
 
@@ -185,14 +213,15 @@ def render_fixed_corner_oscr(
         x0, y0, x1, y1 = front
         bx0, by0, bx1, by1 = back
         color = COLORS[slot_index % len(COLORS)]
-        face = _hex_to_rgba(color, 72 + min(draw_order * 12, 48))
-        back_face = _hex_to_rgba(color, 38)
-        edge = _hex_to_rgba(color, 230)
+        face = _hex_to_rgba(color, max(0, min(255, front_alpha)))
+        side_face = _hex_to_rgba(color, max(0, min(255, side_alpha)))
+        back_face = _hex_to_rgba(color, max(0, min(255, back_alpha)))
+        edge = _hex_to_rgba(color, max(0, min(255, edge_alpha)))
 
         # Visible side faces: top and left are emphasized to make the fixed
         # top-left/front corner readable.
-        draw.polygon([(bx0, by0), (bx1, by1), (x1, y1), (x0, y0)], fill=_hex_to_rgba(color, 34))
-        draw.polygon([(bx0, by0), (x0, y0), (x0, y1), (bx0, by1)], fill=_hex_to_rgba(color, 46))
+        draw.polygon([(bx0, by0), (bx1, by1), (x1, y1), (x0, y0)], fill=side_face)
+        draw.polygon([(bx0, by0), (x0, y0), (x0, y1), (bx0, by1)], fill=side_face)
         draw.rectangle(back, fill=back_face, outline=edge, width=2)
         draw.rectangle(front, fill=face, outline=edge, width=3)
         for start, end in [((bx0, by0), (x0, y0)), ((bx1, by1), (x1, y1)), ((bx0, by1), (x0, y1)), ((bx1, by0), (x1, y0))]:
@@ -313,6 +342,10 @@ def main() -> int:
             labels=labels,
             image_size=args.image_size,
             depth_offset_scale=args.depth_offset_scale,
+            front_alpha=args.front_alpha,
+            side_alpha=args.side_alpha,
+            back_alpha=args.back_alpha,
+            edge_alpha=args.edge_alpha,
         )
         stem = _safe_name(prompt, index)
         current_path = args.output_dir / f"{stem}_current_oscr.png"
