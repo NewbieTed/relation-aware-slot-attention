@@ -32,12 +32,16 @@ OBJECT_COLORS = [
 ]
 
 RGB_FACE_COLORS = [
-    (0.0, 0.0, 1.0),  # -X
-    (1.0, 0.0, 0.0),  # +X
-    (0.0, 0.5, 0.0),  # -Y / front-ish
-    (0.0, 0.5, 0.0),  # +Y / back-ish
-    (0.0, 0.5, 0.0),  # -Z / bottom
-    (0.0, 0.5, 0.0),  # +Z / top
+    # SeeThrough3D's get_primitive_object_translucent_rgb builds:
+    # green faces for the first four cube polygons, blue for the fifth, red
+    # for the sixth, then reorders to [blue, red, green, green, green, green].
+    # Keep this order rather than guessing Blender's world-space face normals.
+    (0.0, 0.0, 0.5),
+    (0.5, 0.0, 0.0),
+    (0.0, 0.5, 0.0),
+    (0.0, 0.5, 0.0),
+    (0.0, 0.5, 0.0),
+    (0.0, 0.5, 0.0),
 ]
 
 
@@ -49,6 +53,12 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--world-scale", type=float, default=3.5)
     parser.add_argument("--depth-scale", type=float, default=3.0)
     parser.add_argument("--face-alpha", type=float, default=0.025)
+    parser.add_argument(
+        "--face-alpha-scale",
+        type=float,
+        default=1.0,
+        help="Debug brightness multiplier applied to the SeeThrough-style face alpha.",
+    )
     parser.add_argument("--edge-radius", type=float, default=0.012)
     parser.add_argument("--orthographic-scale", type=float, default=7.0)
     parser.add_argument("--camera-x", type=float, default=4.2)
@@ -130,8 +140,9 @@ def _make_face_material(
     if not shadow:
         mat.use_nodes = True
     bsdf = mat.node_tree.nodes.get("Principled BSDF")
+    display_alpha = max(0.0, min(1.0, alpha))
     if bsdf is not None:
-        bsdf.inputs["Base Color"].default_value = (*color, alpha)
+        bsdf.inputs["Base Color"].default_value = (*color, display_alpha)
         bsdf.inputs["Alpha"].default_value = alpha
         bsdf.inputs["Roughness"].default_value = 0.72
         if "Emission Color" in bsdf.inputs:
@@ -307,12 +318,13 @@ def _render_record(record: dict[str, Any], *, args: argparse.Namespace, index: i
         bpy.context.view_layer.update()
         cube.visible_shadow = bool(args.shadows)
         face_colors = RGB_FACE_COLORS if args.rgb_faces else [object_color] * 6
+        face_alpha = args.face_alpha * args.face_alpha_scale
         for face_index, color in enumerate(face_colors):
             cube.data.materials.append(
                 _make_face_material(
                     f"face_mat_{slot_index}_{label}_{face_index}",
                     color,
-                    args.face_alpha,
+                    face_alpha,
                     shadow=args.shadows,
                 )
             )
