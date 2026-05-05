@@ -89,6 +89,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt-prefix", type=str, default="a photo of")
     parser.add_argument("--condition-renderer", choices=("seethrough", "legacy"), default="seethrough")
     parser.add_argument("--oscr-face-alpha", type=float, default=0.10)
+    parser.add_argument("--oscr-azimuth-degrees", type=float, default=180.0)
     parser.add_argument("--limit-rows", type=int, default=None)
     parser.add_argument("--eval-fraction", type=float, default=0.1)
     parser.add_argument("--test-fraction", type=float, default=0.1)
@@ -115,6 +116,7 @@ def _save_state(output_dir: Path, *, step: int, args: argparse.Namespace, lora_l
         "oscr_size": args.oscr_size,
         "condition_renderer": args.condition_renderer,
         "oscr_face_alpha": args.oscr_face_alpha,
+        "oscr_azimuth_degrees": args.oscr_azimuth_degrees,
     }
     (output_dir / "training_state.json").write_text(json.dumps(payload, indent=2))
 
@@ -439,6 +441,7 @@ def _build_condition_latents(
     oscr_size: int,
     condition_renderer: str,
     oscr_face_alpha: float,
+    oscr_azimuth_degrees: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     centers, log_sizes, slot_mask = _graph_3d_boxes(
         batch=batch,
@@ -455,6 +458,7 @@ def _build_condition_latents(
             image_size=oscr_size,
             mask_size=cond_token_grid,
             face_alpha=oscr_face_alpha,
+            azimuth_degrees=oscr_azimuth_degrees,
         )
     else:
         oscr = render_oscr_boxes(
@@ -470,6 +474,7 @@ def _build_condition_latents(
             image_size=oscr_size,
             mask_size=cond_token_grid,
             face_alpha=oscr_face_alpha,
+            azimuth_degrees=oscr_azimuth_degrees,
         )
     cond_latents, cond_ids, cond_grid = _encode_packed_latents(
         pipeline=pipeline,
@@ -494,6 +499,7 @@ def _compute_loss(
     max_sequence_length: int,
     condition_renderer: str,
     oscr_face_alpha: float,
+    oscr_azimuth_degrees: float,
     prompt_prefix: str,
 ) -> dict[str, torch.Tensor]:
     pixel_values = batch["pixel_values"].to(device=device, dtype=dtype)
@@ -515,6 +521,7 @@ def _compute_loss(
             oscr_size=oscr_size,
             condition_renderer=condition_renderer,
             oscr_face_alpha=oscr_face_alpha,
+            oscr_azimuth_degrees=oscr_azimuth_degrees,
         )
         binding_prompts, call_ids, cuboids_segmasks = _build_binding_inputs(
             batch=batch,
@@ -609,6 +616,7 @@ def _run_eval_samples(
     max_sequence_length: int,
     condition_renderer: str,
     oscr_face_alpha: float,
+    oscr_azimuth_degrees: float,
     prompt_prefix: str,
     sample_count: int,
     inference_steps: int,
@@ -663,6 +671,7 @@ def _run_eval_samples(
                 image_size=oscr_size,
                 mask_size=cond_grid,
                 face_alpha=oscr_face_alpha,
+                azimuth_degrees=oscr_azimuth_degrees,
             )
             oscr_viz, _ = render_seethrough_oscr_and_masks(
                 centers=centers,
@@ -671,6 +680,7 @@ def _run_eval_samples(
                 image_size=oscr_size,
                 mask_size=cond_grid,
                 face_alpha=max(oscr_face_alpha, 0.25),
+                azimuth_degrees=oscr_azimuth_degrees,
             )
         else:
             oscr = render_oscr_boxes(
@@ -686,6 +696,7 @@ def _run_eval_samples(
                 image_size=oscr_size,
                 mask_size=cond_grid,
                 face_alpha=oscr_face_alpha,
+                azimuth_degrees=oscr_azimuth_degrees,
             )
             oscr_viz, _ = render_seethrough_oscr_and_masks(
                 centers=centers,
@@ -694,6 +705,7 @@ def _run_eval_samples(
                 image_size=oscr_size,
                 mask_size=cond_grid,
                 face_alpha=0.25,
+                azimuth_degrees=oscr_azimuth_degrees,
             )
         binding_prompt = build_binding_prompt(
             original_prompt=item.prompt,
@@ -916,6 +928,7 @@ def main() -> int:
                 max_sequence_length=args.max_sequence_length,
                 condition_renderer=args.condition_renderer,
                 oscr_face_alpha=args.oscr_face_alpha,
+                oscr_azimuth_degrees=args.oscr_azimuth_degrees,
                 prompt_prefix=args.prompt_prefix,
             )
             loss = metrics["loss"] / args.gradient_accumulation_steps
@@ -971,6 +984,7 @@ def main() -> int:
                         max_sequence_length=args.max_sequence_length,
                         condition_renderer=args.condition_renderer,
                         oscr_face_alpha=args.oscr_face_alpha,
+                        oscr_azimuth_degrees=args.oscr_azimuth_degrees,
                         prompt_prefix=args.prompt_prefix,
                         sample_count=args.eval_sample_count,
                         inference_steps=args.eval_inference_steps,

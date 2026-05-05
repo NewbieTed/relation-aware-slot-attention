@@ -58,6 +58,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lora-alpha", type=float, default=32.0)
     parser.add_argument("--condition-renderer", choices=("seethrough", "legacy"), default="seethrough")
     parser.add_argument("--oscr-face-alpha", type=float, default=0.10)
+    parser.add_argument("--oscr-azimuth-degrees", type=float, default=180.0)
     parser.add_argument("--prompt-prefix", type=str, default="a photo of")
     return parser
 
@@ -189,6 +190,7 @@ def _predict_condition(
     max_sequence_length: int,
     condition_renderer: str,
     oscr_face_alpha: float,
+    oscr_azimuth_degrees: float,
     prompt_prefix: str,
 ) -> tuple[Any, Any, str, list[list[torch.Tensor]], torch.Tensor, dict[str, Any]]:
     scene_graph = parse_prompt_to_scene_graph(prompt)
@@ -216,6 +218,7 @@ def _predict_condition(
             image_size=oscr_size,
             mask_size=cond_grid,
             face_alpha=oscr_face_alpha,
+            azimuth_degrees=oscr_azimuth_degrees,
         )
         oscr_viz, _ = render_seethrough_oscr_and_masks(
             centers=centers,
@@ -224,6 +227,7 @@ def _predict_condition(
             image_size=oscr_size,
             mask_size=cond_grid,
             face_alpha=max(oscr_face_alpha, 0.25),
+            azimuth_degrees=oscr_azimuth_degrees,
         )
     else:
         oscr = render_oscr_boxes(
@@ -239,6 +243,7 @@ def _predict_condition(
             image_size=oscr_size,
             mask_size=cond_grid,
             face_alpha=oscr_face_alpha,
+            azimuth_degrees=oscr_azimuth_degrees,
         )
         oscr_viz, _ = render_seethrough_oscr_and_masks(
             centers=centers,
@@ -247,6 +252,7 @@ def _predict_condition(
             image_size=oscr_size,
             mask_size=cond_grid,
             face_alpha=0.25,
+            azimuth_degrees=oscr_azimuth_degrees,
         )
     binding_prompt = build_binding_prompt(
         original_prompt=prompt,
@@ -312,6 +318,7 @@ def main() -> int:
             max_sequence_length=args.max_sequence_length,
             condition_renderer=args.condition_renderer,
             oscr_face_alpha=args.oscr_face_alpha,
+            oscr_azimuth_degrees=args.oscr_azimuth_degrees,
             prompt_prefix=args.prompt_prefix,
         )
         condition_dir = args.output_dir / "conditions"
@@ -372,6 +379,7 @@ def main() -> int:
         "low_vram": args.low_vram,
         "condition_renderer": args.condition_renderer,
         "oscr_face_alpha": args.oscr_face_alpha,
+        "oscr_azimuth_degrees": args.oscr_azimuth_degrees,
         "prompt_prefix": args.prompt_prefix,
         "seed": args.seed,
     }

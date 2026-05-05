@@ -64,6 +64,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-x", type=float, default=-4.2)
     parser.add_argument("--camera-y", type=float, default=-7.0)
     parser.add_argument("--camera-z", type=float, default=4.3)
+    parser.add_argument("--azimuth-degrees", type=float, default=180.0)
     parser.add_argument("--engine", choices=("cycles", "eevee"), default="cycles")
     parser.add_argument("--samples", type=int, default=32)
     parser.add_argument(
@@ -333,6 +334,8 @@ def _render_record(record: dict[str, Any], *, args: argparse.Namespace, index: i
         cube = bpy.context.object
         cube.name = f"cuboid_{slot_index}_{label}"
         cube.dimensions = dims
+        bpy.context.view_layer.update()
+        cube.rotation_euler[2] = math.radians(args.azimuth_degrees)
         bpy.context.view_layer.update()
         cube.visible_shadow = bool(args.shadows)
         face_colors = _paper_face_colors()

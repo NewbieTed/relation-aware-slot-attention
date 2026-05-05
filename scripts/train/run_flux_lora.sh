@@ -38,6 +38,7 @@ LOW_VRAM="${LOW_VRAM:-0}"
 GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-0}"
 CONDITION_RENDERER="${CONDITION_RENDERER:-seethrough}"
 OSCR_FACE_ALPHA="${OSCR_FACE_ALPHA:-0.10}"
+OSCR_AZIMUTH_DEGREES="${OSCR_AZIMUTH_DEGREES:-180}"
 PROMPT_PREFIX="${PROMPT_PREFIX:-a photo of}"
 
 CMD=(
@@ -61,6 +62,7 @@ CMD=(
   --prompt-prefix "$PROMPT_PREFIX" \
   --condition-renderer "$CONDITION_RENDERER" \
   --oscr-face-alpha "$OSCR_FACE_ALPHA" \
+  --oscr-azimuth-degrees "$OSCR_AZIMUTH_DEGREES" \
   --save-every "$SAVE_EVERY" \
   --eval-every "$EVAL_EVERY" \
   --eval-sample-count "$EVAL_SAMPLE_COUNT" \

@@ -160,13 +160,24 @@ def _camera_basis() -> tuple[list[float], list[float], list[float], list[float]]
     return camera, right, up, forward
 
 
-def _corners(center: list[float], dims: list[float]) -> list[list[float]]:
+def _corners(center: list[float], dims: list[float], *, azimuth_degrees: float = 180.0) -> list[list[float]]:
     hx, hy, hz = dims[0] * 0.5, dims[1] * 0.5, dims[2] * 0.5
-    return [
-        [center[0] + sx * hx, center[1] + sy * hy, center[2] + sz * hz]
+    angle = torch.deg2rad(torch.tensor(float(azimuth_degrees))).item()
+    cos_a = torch.cos(torch.tensor(angle)).item()
+    sin_a = torch.sin(torch.tensor(angle)).item()
+    local_offsets = [
+        [sx * hx, sy * hy, sz * hz]
         for sx in (-1.0, 1.0)
         for sy in (-1.0, 1.0)
         for sz in (-1.0, 1.0)
+    ]
+    return [
+        [
+            center[0] + offset[0] * cos_a - offset[1] * sin_a,
+            center[1] + offset[0] * sin_a + offset[1] * cos_a,
+            center[2] + offset[2],
+        ]
+        for offset in local_offsets
     ]
 
 
@@ -222,6 +233,7 @@ def render_seethrough_oscr_and_masks(
     image_size: int,
     mask_size: tuple[int, int] | None = None,
     face_alpha: float = 0.10,
+    azimuth_degrees: float = 180.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Render paper-style cuboid OSCR images and per-object masks.
 
@@ -255,7 +267,7 @@ def render_seethrough_oscr_and_masks(
                 centers_cpu[batch_index, slot_index].tolist(),
                 sizes_cpu[batch_index, slot_index].tolist(),
             )
-            projected, depths = _project(_corners(center, dims), image_size)
+            projected, depths = _project(_corners(center, dims, azimuth_degrees=azimuth_degrees), image_size)
             mask_draw = ImageDraw.Draw(subject_mask)
             for face in FACES:
                 indices = face[:4]

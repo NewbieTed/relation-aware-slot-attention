@@ -34,6 +34,7 @@ LORA_RANK="${LORA_RANK:-32}"
 LORA_ALPHA="${LORA_ALPHA:-32}"
 CONDITION_RENDERER="${CONDITION_RENDERER:-seethrough}"
 OSCR_FACE_ALPHA="${OSCR_FACE_ALPHA:-0.10}"
+OSCR_AZIMUTH_DEGREES="${OSCR_AZIMUTH_DEGREES:-180}"
 PROMPT_PREFIX="${PROMPT_PREFIX:-a photo of}"
 OUTPUT_DIR="${OUTPUT_DIR:-$ROOT_DIR/outputs/eval/flux_relation_${BENCHMARK}}"
 PROMPT_FILE="${PROMPT_FILE:-}"
@@ -76,6 +77,7 @@ GEN_CMD=(
   --lora-alpha "$LORA_ALPHA"
   --condition-renderer "$CONDITION_RENDERER"
   --oscr-face-alpha "$OSCR_FACE_ALPHA"
+  --oscr-azimuth-degrees "$OSCR_AZIMUTH_DEGREES"
   --prompt-prefix "$PROMPT_PREFIX"
 )
 
