@@ -179,7 +179,13 @@ def _set_pipeline_execution_device(pipeline: Any, device: str) -> None:
     try:
         object.__setattr__(pipeline, "_execution_device", torch.device(device))
     except Exception:
-        pipeline._execution_device = torch.device(device)
+        try:
+            pipeline._execution_device = torch.device(device)
+        except Exception:
+            print(
+                "Warning: could not override pipeline._execution_device; "
+                "continuing with diffusers-managed execution device."
+            )
 
 
 @torch.no_grad()
