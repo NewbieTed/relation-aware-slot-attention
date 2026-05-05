@@ -69,9 +69,10 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rgb-faces", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--face-color-mode",
-        choices=("paper_orange_blue_green", "seethrough_order", "normal_rgb", "object"),
-        default="paper_orange_blue_green",
+        choices=("paper_red_blue_green", "paper_orange_blue_green", "seethrough_order", "normal_rgb", "object"),
+        default="paper_red_blue_green",
         help=(
+            "paper_red_blue_green uses red for the camera/front face, blue for left, and green otherwise; "
             "paper_orange_blue_green uses orange for the camera/front face, blue for left, and green otherwise; "
             "seethrough_order copies the repo's cube polygon material order; "
             "normal_rgb colors faces by actual local normals for easier OSCR readability."
@@ -194,12 +195,14 @@ def _normal_rgb_color(normal: Vector) -> tuple[float, float, float]:
     return (0.95, 0.05, 0.85) if normal.z > 0 else (0.05, 0.80, 0.85)
 
 
-def _paper_face_color(normal: Vector) -> tuple[float, float, float]:
-    """Approximate paper OSCR coloring: front orange, left blue, others green."""
+def _paper_face_color(normal: Vector, *, front: str) -> tuple[float, float, float]:
+    """Approximate paper OSCR coloring with configurable front face color."""
 
     axis = max(range(3), key=lambda index: abs(normal[index]))
     if axis == 1 and normal.y < 0:
-        return (1.00, 0.48, 0.05)
+        if front == "orange":
+            return (1.00, 0.48, 0.05)
+        return (1.00, 0.05, 0.05)
     if axis == 0 and normal.x < 0:
         return (0.05, 0.28, 1.00)
     return (0.05, 0.82, 0.18)
@@ -354,7 +357,9 @@ def _render_record(record: dict[str, Any], *, args: argparse.Namespace, index: i
         elif args.face_color_mode == "seethrough_order":
             face_colors = RGB_FACE_COLORS
         elif args.face_color_mode == "paper_orange_blue_green":
-            face_colors = [_paper_face_color(polygon.normal) for polygon in cube.data.polygons]
+            face_colors = [_paper_face_color(polygon.normal, front="orange") for polygon in cube.data.polygons]
+        elif args.face_color_mode == "paper_red_blue_green":
+            face_colors = [_paper_face_color(polygon.normal, front="red") for polygon in cube.data.polygons]
         else:
             face_colors = [_normal_rgb_color(polygon.normal) for polygon in cube.data.polygons]
         face_alpha = args.face_alpha * args.face_alpha_scale
