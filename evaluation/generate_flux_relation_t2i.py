@@ -381,6 +381,16 @@ def main() -> int:
         oscr_viz_name = f"{prompt_name}_oscr_viz.png"
         oscr_viz_image.save(condition_dir / oscr_viz_name)
         layout["oscr_viz_file"] = str(Path("conditions") / oscr_viz_name)
+        encoder_device = "cpu" if args.low_vram else device
+        prompt_embeds, pooled_prompt_embeds, _text_ids = pipeline.encode_prompt(
+            prompt=binding_prompt,
+            prompt_2=binding_prompt,
+            device=torch.device(encoder_device),
+            num_images_per_prompt=1,
+            max_sequence_length=args.max_sequence_length,
+        )
+        prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
+        pooled_prompt_embeds = pooled_prompt_embeds.to(device=device, dtype=dtype)
         for repeat_index in range(args.samples_per_prompt):
             seed = args.seed + prompt_index * args.samples_per_prompt + repeat_index
             generator_device = _pipeline_execution_device(pipeline, device)
@@ -390,8 +400,10 @@ def main() -> int:
                 else None
             )
             image = pipeline(
-                prompt=binding_prompt,
-                prompt_2=binding_prompt,
+                prompt=None,
+                prompt_2=None,
+                prompt_embeds=prompt_embeds,
+                pooled_prompt_embeds=pooled_prompt_embeds,
                 height=args.image_size,
                 width=args.image_size,
                 num_inference_steps=args.num_inference_steps,

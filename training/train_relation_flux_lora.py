@@ -861,9 +861,21 @@ def _run_eval_samples(
             if generator_device.type != "mps"
             else None
         )
-        image = pipeline(
+        encoder_device = getattr(pipeline, "_encoder_device", device)
+        prompt_embeds, pooled_prompt_embeds, _text_ids = pipeline.encode_prompt(
             prompt=binding_prompt.prompt,
             prompt_2=binding_prompt.prompt,
+            device=torch.device(encoder_device),
+            num_images_per_prompt=1,
+            max_sequence_length=max_sequence_length,
+        )
+        prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
+        pooled_prompt_embeds = pooled_prompt_embeds.to(device=device, dtype=dtype)
+        image = pipeline(
+            prompt=None,
+            prompt_2=None,
+            prompt_embeds=prompt_embeds,
+            pooled_prompt_embeds=pooled_prompt_embeds,
             height=image_size,
             width=image_size,
             num_inference_steps=inference_steps,
