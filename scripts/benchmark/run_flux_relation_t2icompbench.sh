@@ -32,6 +32,9 @@ LIMIT_PROMPTS="${LIMIT_PROMPTS:-}"
 SEED="${SEED:-42}"
 LORA_RANK="${LORA_RANK:-32}"
 LORA_ALPHA="${LORA_ALPHA:-32}"
+CONDITION_RENDERER="${CONDITION_RENDERER:-seethrough}"
+OSCR_FACE_ALPHA="${OSCR_FACE_ALPHA:-0.10}"
+PROMPT_PREFIX="${PROMPT_PREFIX:-a photo of}"
 OUTPUT_DIR="${OUTPUT_DIR:-$ROOT_DIR/outputs/eval/flux_relation_${BENCHMARK}}"
 PROMPT_FILE="${PROMPT_FILE:-}"
 COPY_INSTEAD_OF_SYMLINK="${COPY_INSTEAD_OF_SYMLINK:-0}"
@@ -71,6 +74,9 @@ GEN_CMD=(
   --seed "$SEED"
   --lora-rank "$LORA_RANK"
   --lora-alpha "$LORA_ALPHA"
+  --condition-renderer "$CONDITION_RENDERER"
+  --oscr-face-alpha "$OSCR_FACE_ALPHA"
+  --prompt-prefix "$PROMPT_PREFIX"
 )
 
 if [[ "$LOW_VRAM" == "1" ]]; then

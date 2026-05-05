@@ -22,8 +22,12 @@ from training.runtime import (
     set_seed,
 )
 from training.scene_graph import build_batched_scene_graphs
+from training.seethrough_condition import (
+    build_binding_prompt,
+    call_ids_from_binding_prompt,
+    render_seethrough_oscr_and_masks,
+)
 from training.train_relation_flux_lora import (
-    _build_binding_inputs,
     _build_flux_quantization_config,
     _import_seethrough3d_flux,
     _install_condition_lora_processors,
@@ -52,6 +56,9 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gnn-layers", type=int, default=2)
     parser.add_argument("--lora-rank", type=int, default=32)
     parser.add_argument("--lora-alpha", type=float, default=32.0)
+    parser.add_argument("--condition-renderer", choices=("seethrough", "legacy"), default="seethrough")
+    parser.add_argument("--oscr-face-alpha", type=float, default=0.10)
+    parser.add_argument("--prompt-prefix", type=str, default="a photo of")
     return parser
 
 
@@ -151,6 +158,7 @@ def _load_pipeline(args: argparse.Namespace, device: str, dtype: torch.dtype) ->
         raise FileNotFoundError(f"Missing FLUX LoRA checkpoint: {lora_path}")
     pipeline.transformer.load_state_dict(torch.load(lora_path, map_location=device), strict=False)
     pipeline.transformer.eval()
+    _set_pipeline_execution_device(pipeline, device)
     return pipeline, quantization_config
 
 
@@ -159,6 +167,15 @@ def _pipeline_execution_device(pipeline: Any, fallback: str) -> torch.device:
     if execution_device is None:
         return torch.device(fallback)
     return torch.device(execution_device)
+
+
+def _set_pipeline_execution_device(pipeline: Any, device: str) -> None:
+    """Force SeeThrough3D FLUX to prepare inference latents on the transformer device."""
+
+    try:
+        object.__setattr__(pipeline, "_execution_device", torch.device(device))
+    except Exception:
+        pipeline._execution_device = torch.device(device)
 
 
 @torch.no_grad()
@@ -170,7 +187,10 @@ def _predict_condition(
     device: str,
     oscr_size: int,
     max_sequence_length: int,
-) -> tuple[Any, list[list[torch.Tensor]], torch.Tensor, dict[str, Any]]:
+    condition_renderer: str,
+    oscr_face_alpha: float,
+    prompt_prefix: str,
+) -> tuple[str, Any, list[list[torch.Tensor]], torch.Tensor, dict[str, Any]]:
     scene_graph = parse_prompt_to_scene_graph(prompt)
     node_count = len(scene_graph["nodes"])
     targets = torch.zeros(1, node_count, 3, device=device)
@@ -187,26 +207,48 @@ def _predict_condition(
     centers = conditioning.slot_positions.to(device)
     log_sizes = conditioning.slot_log_sizes_3d.to(device)
     slot_mask = conditioning.slot_mask.to(device)
-    oscr = render_oscr_boxes(
-        centers=centers,
-        log_sizes=log_sizes,
-        slot_mask=slot_mask,
-        image_size=oscr_size,
-    )
     cond_grid = (oscr_size // 16, oscr_size // 16)
-    batch = {"prompts": [prompt], "scene_graphs": [scene_graph]}
-    call_ids, cuboids_segmasks = _build_binding_inputs(
-        batch=batch,
-        pipeline=pipeline,
-        centers=centers,
-        log_sizes=log_sizes,
-        slot_mask=slot_mask,
-        cond_grid=cond_grid,
-        max_sequence_length=max_sequence_length,
-        device=device,
+    if condition_renderer == "seethrough":
+        oscr, cuboids_segmasks = render_seethrough_oscr_and_masks(
+            centers=centers,
+            log_sizes=log_sizes,
+            slot_mask=slot_mask,
+            image_size=oscr_size,
+            mask_size=cond_grid,
+            face_alpha=oscr_face_alpha,
+        )
+    else:
+        oscr = render_oscr_boxes(
+            centers=centers,
+            log_sizes=log_sizes,
+            slot_mask=slot_mask,
+            image_size=oscr_size,
+        )
+        _, cuboids_segmasks = render_seethrough_oscr_and_masks(
+            centers=centers,
+            log_sizes=log_sizes,
+            slot_mask=slot_mask,
+            image_size=oscr_size,
+            mask_size=cond_grid,
+            face_alpha=oscr_face_alpha,
+        )
+    binding_prompt = build_binding_prompt(
+        original_prompt=prompt,
+        scene_graph=scene_graph,
+        prefix=prompt_prefix,
     )
+    call_ids = [
+        call_ids_from_binding_prompt(
+            tokenizer=pipeline.tokenizer_2,
+            binding_prompt=binding_prompt,
+            max_sequence_length=max_sequence_length,
+            device=device,
+        )
+    ]
+    cuboids_segmasks = cuboids_segmasks.to(device=device, dtype=torch.uint8)
     layout = {
         "prompt": prompt,
+        "binding_prompt": binding_prompt.prompt,
         "nodes": scene_graph["nodes"],
         "edges": scene_graph["edges"],
         "predicted_centers": centers[0].detach().cpu().tolist(),
@@ -214,7 +256,7 @@ def _predict_condition(
         "binding_token_count": sum(len(ids) for sample in call_ids for ids in sample),
         "binding_mask_pct": float(cuboids_segmasks.float().mean().mul(100.0).item()),
     }
-    return _tensor_to_pil(oscr[0]), call_ids, cuboids_segmasks, layout
+    return _tensor_to_pil(oscr[0]), binding_prompt.prompt, call_ids, cuboids_segmasks, layout
 
 
 def main() -> int:
@@ -245,13 +287,16 @@ def main() -> int:
     sample_index = 0
     for prompt_index, prompt in enumerate(tqdm(prompts, desc="RelationFluxGeneration")):
         prompt_name = _safe_prompt_for_filename(prompt)
-        oscr_image, call_ids, cuboids_segmasks, layout = _predict_condition(
+        oscr_image, binding_prompt, call_ids, cuboids_segmasks, layout = _predict_condition(
             prompt=prompt,
             pipeline=pipeline,
             graph_encoder=graph_encoder,
             device=device,
             oscr_size=args.oscr_size,
             max_sequence_length=args.max_sequence_length,
+            condition_renderer=args.condition_renderer,
+            oscr_face_alpha=args.oscr_face_alpha,
+            prompt_prefix=args.prompt_prefix,
         )
         for repeat_index in range(args.samples_per_prompt):
             seed = args.seed + prompt_index * args.samples_per_prompt + repeat_index
@@ -262,8 +307,8 @@ def main() -> int:
                 else None
             )
             image = pipeline(
-                prompt=prompt,
-                prompt_2=prompt,
+                prompt=binding_prompt,
+                prompt_2=binding_prompt,
                 height=args.image_size,
                 width=args.image_size,
                 num_inference_steps=args.num_inference_steps,
@@ -304,6 +349,9 @@ def main() -> int:
         "mixed_precision": args.mixed_precision,
         "flux_quantization": args.flux_quantization,
         "low_vram": args.low_vram,
+        "condition_renderer": args.condition_renderer,
+        "oscr_face_alpha": args.oscr_face_alpha,
+        "prompt_prefix": args.prompt_prefix,
         "seed": args.seed,
     }
     (args.output_dir / "run_config.json").write_text(json.dumps(run_config, indent=2))

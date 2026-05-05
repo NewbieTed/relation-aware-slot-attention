@@ -39,6 +39,11 @@ from .runtime import (
     set_seed,
 )
 from .scene_graph import build_batched_scene_graphs
+from .seethrough_condition import (
+    build_binding_prompt,
+    call_ids_from_binding_prompt,
+    render_seethrough_oscr_and_masks,
+)
 
 DEFAULT_FLUX_MODEL_ID = "black-forest-labs/FLUX.1-dev"
 
@@ -82,11 +87,16 @@ def make_parser() -> argparse.ArgumentParser:
         help="Enable transformer gradient checkpointing. Disabled by default because SeeThrough3D checkpointing currently does not support condition kwargs on some versions.",
     )
     parser.add_argument("--prompt-prefix", type=str, default="a photo of")
+    parser.add_argument("--condition-renderer", choices=("seethrough", "legacy"), default="seethrough")
+    parser.add_argument("--oscr-face-alpha", type=float, default=0.10)
     parser.add_argument("--limit-rows", type=int, default=None)
     parser.add_argument("--eval-fraction", type=float, default=0.1)
     parser.add_argument("--test-fraction", type=float, default=0.1)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--eval-every", type=int, default=1000)
+    parser.add_argument("--eval-sample-count", type=int, default=0)
+    parser.add_argument("--eval-inference-steps", type=int, default=12)
+    parser.add_argument("--eval-sample-seed", type=int, default=1234)
     parser.add_argument("--save-every", type=int, default=4000)
     parser.add_argument("--disable-tqdm", action="store_true")
     return parser
@@ -103,6 +113,8 @@ def _save_state(output_dir: Path, *, step: int, args: argparse.Namespace, lora_l
         "flux_quantization": args.flux_quantization,
         "lora_layers": lora_layers,
         "oscr_size": args.oscr_size,
+        "condition_renderer": args.condition_renderer,
+        "oscr_face_alpha": args.oscr_face_alpha,
     }
     (output_dir / "training_state.json").write_text(json.dumps(payload, indent=2))
 
@@ -262,6 +274,15 @@ def _build_flux_quantization_config(mode: str, dtype: torch.dtype) -> Any | None
     )
 
 
+def _set_pipeline_execution_device(pipeline: Any, device: str) -> None:
+    """Keep quantized FLUX inference from preparing CPU latents for a CUDA transformer."""
+
+    try:
+        object.__setattr__(pipeline, "_execution_device", torch.device(device))
+    except Exception:
+        pipeline._execution_device = torch.device(device)
+
+
 def _load_graph_encoder(
     *,
     path: Path,
@@ -371,115 +392,40 @@ def _resize_condition_ids(
     return ids.reshape(cond_h * cond_w, 3)
 
 
-def _find_label_token_ids(
-    *,
-    tokenizer: Any,
-    prompt: str,
-    label: str,
-    max_sequence_length: int,
-) -> list[int]:
-    """Find T5 token positions that overlap an object label in the prompt."""
-
-    prompt_lower = prompt.lower()
-    label_lower = label.lower().replace("_", " ")
-    match = re.search(rf"\b{re.escape(label_lower)}\b", prompt_lower)
-    try:
-        encoded = tokenizer(
-            prompt,
-            padding="max_length",
-            max_length=max_sequence_length,
-            truncation=True,
-            return_offsets_mapping=True,
-            return_tensors="pt",
-        )
-    except (NotImplementedError, TypeError):
-        encoded = tokenizer(
-            prompt,
-            padding="max_length",
-            max_length=max_sequence_length,
-            truncation=True,
-            return_tensors="pt",
-        )
-    if match is not None and hasattr(encoded, "offset_mapping"):
-        start, end = match.span()
-        ids = [
-            index
-            for index, (token_start, token_end) in enumerate(encoded.offset_mapping[0].tolist())
-            if token_end > start and token_start < end
-        ]
-        if ids:
-            return ids
-
-    prompt_ids = encoded.input_ids[0].tolist()
-    label_ids = tokenizer(
-        label_lower,
-        add_special_tokens=False,
-        return_tensors="pt",
-    ).input_ids[0].tolist()
-    if label_ids:
-        for index in range(0, max(0, len(prompt_ids) - len(label_ids) + 1)):
-            if prompt_ids[index : index + len(label_ids)] == label_ids:
-                return list(range(index, index + len(label_ids)))
-    return []
-
-
 def _build_binding_inputs(
     *,
     batch: dict[str, Any],
     pipeline: Any,
-    centers: torch.Tensor,
-    log_sizes: torch.Tensor,
     slot_mask: torch.Tensor,
-    cond_grid: tuple[int, int],
+    cuboid_masks: torch.Tensor,
     max_sequence_length: int,
     device: str,
-) -> tuple[list[list[torch.Tensor]], torch.Tensor]:
-    """Build SeeThrough3D call ids and cuboid masks from GNN boxes."""
+    prompt_prefix: str,
+) -> tuple[list[str], list[list[torch.Tensor]], torch.Tensor]:
+    """Build SeeThrough3D-style prompts, call ids, and cuboid masks."""
 
-    cond_h, cond_w = cond_grid
-    y_coords = (torch.arange(cond_h, device=device, dtype=torch.float32) + 0.5) / cond_h * 2.0 - 1.0
-    x_coords = (torch.arange(cond_w, device=device, dtype=torch.float32) + 0.5) / cond_w * 2.0 - 1.0
-    yy, xx = torch.meshgrid(y_coords, x_coords, indexing="ij")
-    sizes = log_sizes.float().exp().clamp(min=0.03, max=2.0)
+    binding_prompts: list[str] = []
     batch_call_ids: list[list[torch.Tensor]] = []
-    max_subjects = centers.shape[1]
-    cuboid_masks = torch.zeros(
-        centers.shape[0],
-        max_subjects,
-        cond_h,
-        cond_w,
-        device=device,
-        dtype=torch.uint8,
-    )
-
     for batch_index, (prompt, scene_graph) in enumerate(zip(batch["prompts"], batch["scene_graphs"])):
+        binding_prompt = build_binding_prompt(
+            original_prompt=str(prompt),
+            scene_graph=scene_graph,
+            prefix=prompt_prefix,
+        )
+        binding_prompts.append(binding_prompt.prompt)
+        span_call_ids = call_ids_from_binding_prompt(
+            tokenizer=pipeline.tokenizer_2,
+            binding_prompt=binding_prompt,
+            max_sequence_length=max_sequence_length,
+            device=device,
+        )
         sample_call_ids: list[torch.Tensor] = []
-        for node_index, node in enumerate(scene_graph["nodes"]):
-            if node_index >= centers.shape[1] or not bool(slot_mask[batch_index, node_index].item()):
+        for node_index, token_ids in enumerate(span_call_ids):
+            if node_index >= slot_mask.shape[1] or not bool(slot_mask[batch_index, node_index].item()):
                 continue
-            label = str(node["label"])
-            token_ids = _find_label_token_ids(
-                tokenizer=pipeline.tokenizer_2,
-                prompt=str(prompt),
-                label=label,
-                max_sequence_length=max_sequence_length,
-            )
-            sample_call_ids.append(torch.tensor(token_ids, device=device, dtype=torch.long))
-            center = centers[batch_index, node_index].float()
-            size = sizes[batch_index, node_index]
-            mask = (
-                (xx >= center[0] - size[0])
-                & (xx <= center[0] + size[0])
-                & (yy >= center[1] - size[1])
-                & (yy <= center[1] + size[1])
-            )
-            if not bool(mask.any().item()):
-                cx = int(torch.clamp(((center[0] + 1.0) * 0.5 * cond_w).round(), 0, cond_w - 1).item())
-                cy = int(torch.clamp(((center[1] + 1.0) * 0.5 * cond_h).round(), 0, cond_h - 1).item())
-                mask[cy, cx] = True
-            cuboid_masks[batch_index, len(sample_call_ids) - 1] = mask.to(torch.uint8)
+            sample_call_ids.append(token_ids)
         batch_call_ids.append(sample_call_ids)
-    return batch_call_ids, cuboid_masks
+    return binding_prompts, batch_call_ids, cuboid_masks.to(device=device, dtype=torch.uint8)
 
 
 @torch.no_grad()
@@ -491,19 +437,40 @@ def _build_condition_latents(
     device: str,
     dtype: torch.dtype,
     oscr_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    condition_renderer: str,
+    oscr_face_alpha: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     centers, log_sizes, slot_mask = _graph_3d_boxes(
         batch=batch,
         pipeline=pipeline,
         graph_encoder=graph_encoder,
         device=device,
     )
-    oscr = render_oscr_boxes(
-        centers=centers,
-        log_sizes=log_sizes,
-        slot_mask=slot_mask,
-        image_size=oscr_size,
-    )
+    cond_token_grid = (oscr_size // 16, oscr_size // 16)
+    if condition_renderer == "seethrough":
+        oscr, cuboid_masks = render_seethrough_oscr_and_masks(
+            centers=centers,
+            log_sizes=log_sizes,
+            slot_mask=slot_mask,
+            image_size=oscr_size,
+            mask_size=cond_token_grid,
+            face_alpha=oscr_face_alpha,
+        )
+    else:
+        oscr = render_oscr_boxes(
+            centers=centers,
+            log_sizes=log_sizes,
+            slot_mask=slot_mask,
+            image_size=oscr_size,
+        )
+        _, cuboid_masks = render_seethrough_oscr_and_masks(
+            centers=centers,
+            log_sizes=log_sizes,
+            slot_mask=slot_mask,
+            image_size=oscr_size,
+            mask_size=cond_token_grid,
+            face_alpha=oscr_face_alpha,
+        )
     cond_latents, cond_ids, cond_grid = _encode_packed_latents(
         pipeline=pipeline,
         images=oscr,
@@ -511,7 +478,7 @@ def _build_condition_latents(
         device=device,
         dtype=dtype,
     )
-    return cond_latents, cond_ids, torch.tensor(cond_grid, device=device), centers, log_sizes, slot_mask
+    return cond_latents, cond_ids, torch.tensor(cond_grid, device=device), centers, log_sizes, slot_mask, cuboid_masks
 
 
 def _compute_loss(
@@ -525,6 +492,9 @@ def _compute_loss(
     oscr_size: int,
     guidance_scale: float,
     max_sequence_length: int,
+    condition_renderer: str,
+    oscr_face_alpha: float,
+    prompt_prefix: str,
 ) -> dict[str, torch.Tensor]:
     pixel_values = batch["pixel_values"].to(device=device, dtype=dtype)
     with torch.no_grad():
@@ -536,9 +506,28 @@ def _compute_loss(
             dtype=dtype,
         )
         encoder_device = getattr(pipeline, "_encoder_device", device)
+        cond_latents, _cond_ids, cond_grid_tensor, centers, log_sizes, slot_mask, cuboid_masks = _build_condition_latents(
+            batch=batch,
+            pipeline=pipeline,
+            graph_encoder=graph_encoder,
+            device=device,
+            dtype=dtype,
+            oscr_size=oscr_size,
+            condition_renderer=condition_renderer,
+            oscr_face_alpha=oscr_face_alpha,
+        )
+        binding_prompts, call_ids, cuboids_segmasks = _build_binding_inputs(
+            batch=batch,
+            pipeline=pipeline,
+            slot_mask=slot_mask,
+            cuboid_masks=cuboid_masks,
+            max_sequence_length=max_sequence_length,
+            device=device,
+            prompt_prefix=prompt_prefix,
+        )
         prompt_embeds, pooled_prompt_embeds, text_ids = pipeline.encode_prompt(
-            prompt=batch["prompts"],
-            prompt_2=batch["prompts"],
+            prompt=binding_prompts,
+            prompt_2=binding_prompts,
             device=torch.device(encoder_device),
             num_images_per_prompt=1,
             max_sequence_length=max_sequence_length,
@@ -546,25 +535,7 @@ def _compute_loss(
         prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
         pooled_prompt_embeds = pooled_prompt_embeds.to(device=device, dtype=dtype)
         text_ids = text_ids.to(device=device)
-        cond_latents, _cond_ids, cond_grid_tensor, centers, log_sizes, slot_mask = _build_condition_latents(
-            batch=batch,
-            pipeline=pipeline,
-            graph_encoder=graph_encoder,
-            device=device,
-            dtype=dtype,
-            oscr_size=oscr_size,
-        )
         cond_grid = (int(cond_grid_tensor[0].item()), int(cond_grid_tensor[1].item()))
-        call_ids, cuboids_segmasks = _build_binding_inputs(
-            batch=batch,
-            pipeline=pipeline,
-            centers=centers,
-            log_sizes=log_sizes,
-            slot_mask=slot_mask,
-            cond_grid=cond_grid,
-            max_sequence_length=max_sequence_length,
-            device=device,
-        )
         cond_ids = _resize_condition_ids(
             cond_grid=cond_grid,
             image_grid=image_grid,
@@ -612,6 +583,155 @@ def _compute_loss(
         ),
         "binding_mask_pct": cuboids_segmasks.float().mean().mul(100.0).detach(),
     }
+
+
+def _tensor_to_pil(image: torch.Tensor) -> Any:
+    from PIL import Image
+
+    array = image.detach().float().add(1.0).mul(127.5).clamp(0, 255)
+    array = array.permute(1, 2, 0).to(torch.uint8).cpu().numpy()
+    return Image.fromarray(array)
+
+
+@torch.no_grad()
+def _run_eval_samples(
+    *,
+    step: int,
+    eval_dataset: Any,
+    pipeline: Any,
+    graph_encoder: GraphSlotEncoder,
+    output_dir: Path,
+    device: str,
+    dtype: torch.dtype,
+    image_size: int,
+    oscr_size: int,
+    guidance_scale: float,
+    max_sequence_length: int,
+    condition_renderer: str,
+    oscr_face_alpha: float,
+    prompt_prefix: str,
+    sample_count: int,
+    inference_steps: int,
+    seed: int,
+) -> None:
+    """Generate small qualitative samples using the already-loaded pipeline."""
+
+    if sample_count <= 0 or len(eval_dataset) == 0:
+        return
+    was_training = pipeline.transformer.training
+    pipeline.transformer.eval()
+    sample_dir = output_dir / "eval_samples" / f"step-{step:06d}"
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    records: list[dict[str, Any]] = []
+
+    for sample_index in range(min(sample_count, len(eval_dataset))):
+        item = eval_dataset[sample_index]
+        graph_device = getattr(pipeline, "_graph_device", device)
+        slot_targets = torch.zeros(
+            1,
+            len(item.scene_graph["nodes"]),
+            3,
+            device=torch.device(graph_device),
+        )
+        slot_mask = torch.ones(
+            1,
+            len(item.scene_graph["nodes"]),
+            device=torch.device(graph_device),
+            dtype=torch.bool,
+        )
+        scene_graph_batch = build_batched_scene_graphs(
+            [item.scene_graph],
+            slot_targets=slot_targets,
+            slot_mask=slot_mask,
+        )
+        conditioning = build_slot_conditioning(
+            tokenizer=pipeline.tokenizer,
+            text_encoder=pipeline.text_encoder,
+            scene_graph_batch=scene_graph_batch,
+            graph_encoder=graph_encoder,
+            device=graph_device,
+        )
+        centers = conditioning.slot_positions.to(device)
+        log_sizes = conditioning.slot_log_sizes_3d.to(device)
+        slot_mask = conditioning.slot_mask.to(device)
+        cond_grid = (oscr_size // 16, oscr_size // 16)
+        if condition_renderer == "seethrough":
+            oscr, cuboids_segmasks = render_seethrough_oscr_and_masks(
+                centers=centers,
+                log_sizes=log_sizes,
+                slot_mask=slot_mask,
+                image_size=oscr_size,
+                mask_size=cond_grid,
+                face_alpha=oscr_face_alpha,
+            )
+        else:
+            oscr = render_oscr_boxes(
+                centers=centers,
+                log_sizes=log_sizes,
+                slot_mask=slot_mask,
+                image_size=oscr_size,
+            )
+            _, cuboids_segmasks = render_seethrough_oscr_and_masks(
+                centers=centers,
+                log_sizes=log_sizes,
+                slot_mask=slot_mask,
+                image_size=oscr_size,
+                mask_size=cond_grid,
+                face_alpha=oscr_face_alpha,
+            )
+        binding_prompt = build_binding_prompt(
+            original_prompt=item.prompt,
+            scene_graph=item.scene_graph,
+            prefix=prompt_prefix,
+        )
+        call_ids = [
+            call_ids_from_binding_prompt(
+                tokenizer=pipeline.tokenizer_2,
+                binding_prompt=binding_prompt,
+                max_sequence_length=max_sequence_length,
+                device=device,
+            )
+        ]
+        generator_device = getattr(pipeline, "_execution_device", torch.device(device))
+        generator_device = torch.device(generator_device)
+        generator = (
+            torch.Generator(device=generator_device).manual_seed(seed + step * 1000 + sample_index)
+            if generator_device.type != "mps"
+            else None
+        )
+        image = pipeline(
+            prompt=binding_prompt.prompt,
+            prompt_2=binding_prompt.prompt,
+            height=image_size,
+            width=image_size,
+            num_inference_steps=inference_steps,
+            guidance_scale=guidance_scale,
+            generator=generator,
+            max_sequence_length=max_sequence_length,
+            spatial_images=[_tensor_to_pil(oscr[0])],
+            subject_images=[],
+            cond_size=oscr_size,
+            call_ids=call_ids,
+            cuboids_segmasks=cuboids_segmasks.to(device=device, dtype=torch.uint8),
+        ).images[0]
+        image_path = sample_dir / f"sample_{sample_index:02d}.png"
+        oscr_path = sample_dir / f"sample_{sample_index:02d}_oscr.png"
+        image.save(image_path)
+        _tensor_to_pil(oscr[0]).save(oscr_path)
+        records.append(
+            {
+                "prompt": item.prompt,
+                "binding_prompt": binding_prompt.prompt,
+                "image": str(image_path),
+                "oscr": str(oscr_path),
+                "predicted_centers": centers[0].detach().cpu().tolist(),
+                "predicted_sizes_3d": log_sizes[0].exp().detach().cpu().tolist(),
+                "binding_mask_pct": float(cuboids_segmasks.float().mean().mul(100.0).item()),
+            }
+        )
+    (sample_dir / "samples.json").write_text(json.dumps(records, indent=2))
+    if was_training:
+        pipeline.transformer.train()
 
 
 def _save_checkpoint(
@@ -701,6 +821,7 @@ def main() -> int:
             pipeline.vae.to(device=device, dtype=dtype)
             pipeline.text_encoder.to(device)
             pipeline.text_encoder_2.to(device)
+    _set_pipeline_execution_device(pipeline, device)
     if args.gradient_checkpointing:
         _enable_gradient_checkpointing_compat(pipeline.transformer)
     pipeline.vae.requires_grad_(False)
@@ -774,6 +895,9 @@ def main() -> int:
                 oscr_size=args.oscr_size,
                 guidance_scale=args.guidance_scale,
                 max_sequence_length=args.max_sequence_length,
+                condition_renderer=args.condition_renderer,
+                oscr_face_alpha=args.oscr_face_alpha,
+                prompt_prefix=args.prompt_prefix,
             )
             loss = metrics["loss"] / args.gradient_accumulation_steps
             if scaler.is_enabled():
@@ -813,6 +937,30 @@ def main() -> int:
                     )
                     _save_state(args.output_dir, step=global_step, args=args, lora_layers=lora_layers)
                     print(f"Saved FLUX LoRA checkpoint to {checkpoint}")
+                if args.eval_sample_count > 0 and global_step % args.eval_every == 0:
+                    _run_eval_samples(
+                        step=global_step,
+                        eval_dataset=datasets["eval"],
+                        pipeline=pipeline,
+                        graph_encoder=graph_encoder,
+                        output_dir=args.output_dir,
+                        device=device,
+                        dtype=dtype,
+                        image_size=args.image_size,
+                        oscr_size=args.oscr_size,
+                        guidance_scale=args.guidance_scale,
+                        max_sequence_length=args.max_sequence_length,
+                        condition_renderer=args.condition_renderer,
+                        oscr_face_alpha=args.oscr_face_alpha,
+                        prompt_prefix=args.prompt_prefix,
+                        sample_count=args.eval_sample_count,
+                        inference_steps=args.eval_inference_steps,
+                        seed=args.eval_sample_seed,
+                    )
+                    print(
+                        "Saved eval samples to "
+                        f"{args.output_dir / 'eval_samples' / f'step-{global_step:06d}'}"
+                    )
                 if global_step >= args.max_train_steps:
                     break
         else:

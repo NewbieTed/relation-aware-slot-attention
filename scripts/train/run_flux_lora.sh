@@ -31,8 +31,14 @@ FLUX_QUANTIZATION="${FLUX_QUANTIZATION:-none}"
 MAX_SEQUENCE_LENGTH="${MAX_SEQUENCE_LENGTH:-512}"
 SAVE_EVERY="${SAVE_EVERY:-4000}"
 EVAL_EVERY="${EVAL_EVERY:-1000}"
+EVAL_SAMPLE_COUNT="${EVAL_SAMPLE_COUNT:-0}"
+EVAL_INFERENCE_STEPS="${EVAL_INFERENCE_STEPS:-12}"
+EVAL_SAMPLE_SEED="${EVAL_SAMPLE_SEED:-1234}"
 LOW_VRAM="${LOW_VRAM:-0}"
 GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-0}"
+CONDITION_RENDERER="${CONDITION_RENDERER:-seethrough}"
+OSCR_FACE_ALPHA="${OSCR_FACE_ALPHA:-0.10}"
+PROMPT_PREFIX="${PROMPT_PREFIX:-a photo of}"
 
 CMD=(
   "$PYTHON_BIN" -m training.train_relation_flux_lora
@@ -52,8 +58,14 @@ CMD=(
   --lora-alpha "$LORA_ALPHA" \
   --flux-quantization "$FLUX_QUANTIZATION" \
   --max-sequence-length "$MAX_SEQUENCE_LENGTH" \
+  --prompt-prefix "$PROMPT_PREFIX" \
+  --condition-renderer "$CONDITION_RENDERER" \
+  --oscr-face-alpha "$OSCR_FACE_ALPHA" \
   --save-every "$SAVE_EVERY" \
-  --eval-every "$EVAL_EVERY"
+  --eval-every "$EVAL_EVERY" \
+  --eval-sample-count "$EVAL_SAMPLE_COUNT" \
+  --eval-inference-steps "$EVAL_INFERENCE_STEPS" \
+  --eval-sample-seed "$EVAL_SAMPLE_SEED"
 )
 
 if [[ "$LOW_VRAM" == "1" ]]; then
