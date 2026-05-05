@@ -16,6 +16,7 @@ import json
 import math
 import os
 import re
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -42,6 +43,7 @@ from .scene_graph import build_batched_scene_graphs
 from .seethrough_condition import (
     build_binding_prompt,
     call_ids_from_binding_prompt,
+    render_blender_oscr_conditions,
     render_seethrough_oscr_and_masks,
 )
 
@@ -87,7 +89,7 @@ def make_parser() -> argparse.ArgumentParser:
         help="Enable transformer gradient checkpointing. Disabled by default because SeeThrough3D checkpointing currently does not support condition kwargs on some versions.",
     )
     parser.add_argument("--prompt-prefix", type=str, default="a photo of")
-    parser.add_argument("--condition-renderer", choices=("seethrough", "legacy"), default="seethrough")
+    parser.add_argument("--condition-renderer", choices=("seethrough", "legacy", "blender"), default="seethrough")
     parser.add_argument("--oscr-face-alpha", type=float, default=0.10)
     parser.add_argument("--oscr-azimuth-degrees", type=float, default=0.0)
     parser.add_argument("--limit-rows", type=int, default=None)
@@ -98,6 +100,10 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-sample-count", type=int, default=0)
     parser.add_argument("--eval-inference-steps", type=int, default=12)
     parser.add_argument("--eval-sample-seed", type=int, default=1234)
+    parser.add_argument("--eval-blender-oscr", action="store_true")
+    parser.add_argument("--blender-bin", type=str, default="blender")
+    parser.add_argument("--eval-blender-face-alpha", type=float, default=0.25)
+    parser.add_argument("--blender-cache-dir", type=Path, default=None)
     parser.add_argument("--save-every", type=int, default=4000)
     parser.add_argument("--disable-tqdm", action="store_true")
     return parser
@@ -442,6 +448,8 @@ def _build_condition_latents(
     condition_renderer: str,
     oscr_face_alpha: float,
     oscr_azimuth_degrees: float,
+    blender_bin: str,
+    blender_cache_dir: Path,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     centers, log_sizes, slot_mask = _graph_3d_boxes(
         batch=batch,
@@ -452,6 +460,28 @@ def _build_condition_latents(
     cond_token_grid = (oscr_size // 16, oscr_size // 16)
     if condition_renderer == "seethrough":
         oscr, cuboid_masks = render_seethrough_oscr_and_masks(
+            centers=centers,
+            log_sizes=log_sizes,
+            slot_mask=slot_mask,
+            image_size=oscr_size,
+            mask_size=cond_token_grid,
+            face_alpha=oscr_face_alpha,
+            azimuth_degrees=oscr_azimuth_degrees,
+        )
+    elif condition_renderer == "blender":
+        oscr = render_blender_oscr_conditions(
+            centers=centers,
+            log_sizes=log_sizes,
+            slot_mask=slot_mask,
+            scene_graphs=batch["scene_graphs"],
+            prompts=batch["prompts"],
+            image_size=oscr_size,
+            face_alpha=oscr_face_alpha,
+            azimuth_degrees=oscr_azimuth_degrees,
+            blender_bin=blender_bin,
+            cache_dir=blender_cache_dir,
+        )
+        _, cuboid_masks = render_seethrough_oscr_and_masks(
             centers=centers,
             log_sizes=log_sizes,
             slot_mask=slot_mask,
@@ -500,6 +530,8 @@ def _compute_loss(
     condition_renderer: str,
     oscr_face_alpha: float,
     oscr_azimuth_degrees: float,
+    blender_bin: str,
+    blender_cache_dir: Path,
     prompt_prefix: str,
 ) -> dict[str, torch.Tensor]:
     pixel_values = batch["pixel_values"].to(device=device, dtype=dtype)
@@ -522,6 +554,8 @@ def _compute_loss(
             condition_renderer=condition_renderer,
             oscr_face_alpha=oscr_face_alpha,
             oscr_azimuth_degrees=oscr_azimuth_degrees,
+            blender_bin=blender_bin,
+            blender_cache_dir=blender_cache_dir,
         )
         binding_prompts, call_ids, cuboids_segmasks = _build_binding_inputs(
             batch=batch,
@@ -600,6 +634,53 @@ def _tensor_to_pil(image: torch.Tensor) -> Any:
     return Image.fromarray(array)
 
 
+def _render_eval_blender_oscr(
+    *,
+    records_path: Path,
+    output_dir: Path,
+    blender_bin: str,
+    image_size: int,
+    face_alpha: float,
+    azimuth_degrees: float,
+) -> None:
+    """Render Blender OSCR previews for eval samples without interrupting training on failure."""
+
+    script_path = Path(__file__).resolve().parents[1] / "evaluation" / "render_blender_oscr_demo.py"
+    cmd = [
+        blender_bin,
+        "--background",
+        "--python",
+        str(script_path),
+        "--",
+        "--records-json",
+        str(records_path),
+        "--output-dir",
+        str(output_dir),
+        "--image-size",
+        str(image_size),
+        "--face-alpha",
+        str(face_alpha),
+        "--azimuth-degrees",
+        str(azimuth_degrees),
+        "--background",
+        "white",
+        "--engine",
+        "eevee",
+        "--samples",
+        "64",
+        "--no-edges",
+        "--no-labels",
+        "--no-ground",
+        "--no-shadows",
+    ]
+    try:
+        subprocess.run(cmd, check=True)
+    except FileNotFoundError:
+        print(f"Warning: Blender executable not found: {blender_bin}. Skipping Blender OSCR eval preview.")
+    except subprocess.CalledProcessError as exc:
+        print(f"Warning: Blender OSCR eval preview failed with exit code {exc.returncode}.")
+
+
 @torch.no_grad()
 def _run_eval_samples(
     *,
@@ -621,6 +702,10 @@ def _run_eval_samples(
     sample_count: int,
     inference_steps: int,
     seed: int,
+    eval_blender_oscr: bool,
+    blender_bin: str,
+    blender_cache_dir: Path,
+    eval_blender_face_alpha: float,
 ) -> None:
     """Generate small qualitative samples using the already-loaded pipeline."""
 
@@ -631,6 +716,7 @@ def _run_eval_samples(
     sample_dir = output_dir / "eval_samples" / f"step-{step:06d}"
     sample_dir.mkdir(parents=True, exist_ok=True)
     records: list[dict[str, Any]] = []
+    blender_records: list[dict[str, Any]] = []
 
     for sample_index in range(min(sample_count, len(eval_dataset))):
         item = eval_dataset[sample_index]
@@ -680,6 +766,40 @@ def _run_eval_samples(
                 image_size=oscr_size,
                 mask_size=cond_grid,
                 face_alpha=max(oscr_face_alpha, 0.25),
+                azimuth_degrees=oscr_azimuth_degrees,
+            )
+        elif condition_renderer == "blender":
+            oscr = render_blender_oscr_conditions(
+                centers=centers,
+                log_sizes=log_sizes,
+                slot_mask=slot_mask,
+                scene_graphs=[item.scene_graph],
+                prompts=[item.prompt],
+                image_size=oscr_size,
+                face_alpha=oscr_face_alpha,
+                azimuth_degrees=oscr_azimuth_degrees,
+                blender_bin=blender_bin,
+                cache_dir=blender_cache_dir,
+            )
+            oscr_viz = render_blender_oscr_conditions(
+                centers=centers,
+                log_sizes=log_sizes,
+                slot_mask=slot_mask,
+                scene_graphs=[item.scene_graph],
+                prompts=[item.prompt],
+                image_size=oscr_size,
+                face_alpha=max(oscr_face_alpha, eval_blender_face_alpha),
+                azimuth_degrees=oscr_azimuth_degrees,
+                blender_bin=blender_bin,
+                cache_dir=blender_cache_dir,
+            )
+            _, cuboids_segmasks = render_seethrough_oscr_and_masks(
+                centers=centers,
+                log_sizes=log_sizes,
+                slot_mask=slot_mask,
+                image_size=oscr_size,
+                mask_size=cond_grid,
+                face_alpha=oscr_face_alpha,
                 azimuth_degrees=oscr_azimuth_degrees,
             )
         else:
@@ -748,6 +868,7 @@ def _run_eval_samples(
         image.save(image_path)
         _tensor_to_pil(oscr[0]).save(oscr_path)
         _tensor_to_pil(oscr_viz[0]).save(oscr_viz_path)
+        labels = [str(node["label"]).replace("_", " ") for node in item.scene_graph["nodes"]]
         records.append(
             {
                 "prompt": item.prompt,
@@ -760,7 +881,30 @@ def _run_eval_samples(
                 "binding_mask_pct": float(cuboids_segmasks.float().mean().mul(100.0).item()),
             }
         )
+        blender_records.append(
+            {
+                "prompt": item.prompt,
+                "scene_graph": item.scene_graph,
+                "labels": labels,
+                "predicted_centers": centers[0].detach().cpu().to(torch.float32).tolist(),
+                "predicted_sizes": log_sizes[0].detach().cpu().to(torch.float32).exp().tolist(),
+                "oscr": str(oscr_path),
+                "oscr_viz": str(oscr_viz_path),
+                "image": str(image_path),
+            }
+        )
     (sample_dir / "samples.json").write_text(json.dumps(records, indent=2))
+    blender_records_path = sample_dir / "blender_oscr_records.json"
+    blender_records_path.write_text(json.dumps(blender_records, indent=2))
+    if eval_blender_oscr:
+        _render_eval_blender_oscr(
+            records_path=blender_records_path,
+            output_dir=sample_dir / "blender_oscr",
+            blender_bin=blender_bin,
+            image_size=oscr_size,
+            face_alpha=eval_blender_face_alpha,
+            azimuth_degrees=oscr_azimuth_degrees,
+        )
     if was_training:
         pipeline.transformer.train()
 
@@ -929,6 +1073,8 @@ def main() -> int:
                 condition_renderer=args.condition_renderer,
                 oscr_face_alpha=args.oscr_face_alpha,
                 oscr_azimuth_degrees=args.oscr_azimuth_degrees,
+                blender_bin=args.blender_bin,
+                blender_cache_dir=args.blender_cache_dir or (args.output_dir / "blender_condition_cache"),
                 prompt_prefix=args.prompt_prefix,
             )
             loss = metrics["loss"] / args.gradient_accumulation_steps
@@ -989,6 +1135,10 @@ def main() -> int:
                         sample_count=args.eval_sample_count,
                         inference_steps=args.eval_inference_steps,
                         seed=args.eval_sample_seed,
+                        eval_blender_oscr=args.eval_blender_oscr,
+                        blender_bin=args.blender_bin,
+                        blender_cache_dir=args.blender_cache_dir or (args.output_dir / "blender_condition_cache"),
+                        eval_blender_face_alpha=args.eval_blender_face_alpha,
                     )
                     print(
                         "Saved eval samples to "

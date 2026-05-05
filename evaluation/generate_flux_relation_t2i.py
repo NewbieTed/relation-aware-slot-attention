@@ -25,6 +25,7 @@ from training.scene_graph import build_batched_scene_graphs
 from training.seethrough_condition import (
     build_binding_prompt,
     call_ids_from_binding_prompt,
+    render_blender_oscr_conditions,
     render_seethrough_oscr_and_masks,
 )
 from training.train_relation_flux_lora import (
@@ -56,9 +57,11 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gnn-layers", type=int, default=2)
     parser.add_argument("--lora-rank", type=int, default=32)
     parser.add_argument("--lora-alpha", type=float, default=32.0)
-    parser.add_argument("--condition-renderer", choices=("seethrough", "legacy"), default="seethrough")
+    parser.add_argument("--condition-renderer", choices=("seethrough", "legacy", "blender"), default="seethrough")
     parser.add_argument("--oscr-face-alpha", type=float, default=0.10)
     parser.add_argument("--oscr-azimuth-degrees", type=float, default=0.0)
+    parser.add_argument("--blender-bin", type=str, default="blender")
+    parser.add_argument("--blender-cache-dir", type=Path, default=None)
     parser.add_argument("--prompt-prefix", type=str, default="a photo of")
     return parser
 
@@ -191,6 +194,8 @@ def _predict_condition(
     condition_renderer: str,
     oscr_face_alpha: float,
     oscr_azimuth_degrees: float,
+    blender_bin: str,
+    blender_cache_dir: Path,
     prompt_prefix: str,
 ) -> tuple[Any, Any, str, list[list[torch.Tensor]], torch.Tensor, dict[str, Any]]:
     scene_graph = parse_prompt_to_scene_graph(prompt)
@@ -227,6 +232,40 @@ def _predict_condition(
             image_size=oscr_size,
             mask_size=cond_grid,
             face_alpha=max(oscr_face_alpha, 0.25),
+            azimuth_degrees=oscr_azimuth_degrees,
+        )
+    elif condition_renderer == "blender":
+        oscr = render_blender_oscr_conditions(
+            centers=centers,
+            log_sizes=log_sizes,
+            slot_mask=slot_mask,
+            scene_graphs=[scene_graph],
+            prompts=[prompt],
+            image_size=oscr_size,
+            face_alpha=oscr_face_alpha,
+            azimuth_degrees=oscr_azimuth_degrees,
+            blender_bin=blender_bin,
+            cache_dir=blender_cache_dir,
+        )
+        oscr_viz = render_blender_oscr_conditions(
+            centers=centers,
+            log_sizes=log_sizes,
+            slot_mask=slot_mask,
+            scene_graphs=[scene_graph],
+            prompts=[prompt],
+            image_size=oscr_size,
+            face_alpha=max(oscr_face_alpha, 0.25),
+            azimuth_degrees=oscr_azimuth_degrees,
+            blender_bin=blender_bin,
+            cache_dir=blender_cache_dir,
+        )
+        _, cuboids_segmasks = render_seethrough_oscr_and_masks(
+            centers=centers,
+            log_sizes=log_sizes,
+            slot_mask=slot_mask,
+            image_size=oscr_size,
+            mask_size=cond_grid,
+            face_alpha=oscr_face_alpha,
             azimuth_degrees=oscr_azimuth_degrees,
         )
     else:
@@ -319,6 +358,8 @@ def main() -> int:
             condition_renderer=args.condition_renderer,
             oscr_face_alpha=args.oscr_face_alpha,
             oscr_azimuth_degrees=args.oscr_azimuth_degrees,
+            blender_bin=args.blender_bin,
+            blender_cache_dir=args.blender_cache_dir or (args.output_dir / "blender_condition_cache"),
             prompt_prefix=args.prompt_prefix,
         )
         condition_dir = args.output_dir / "conditions"
@@ -380,6 +421,8 @@ def main() -> int:
         "condition_renderer": args.condition_renderer,
         "oscr_face_alpha": args.oscr_face_alpha,
         "oscr_azimuth_degrees": args.oscr_azimuth_degrees,
+        "blender_bin": args.blender_bin,
+        "blender_cache_dir": str(args.blender_cache_dir or (args.output_dir / "blender_condition_cache")),
         "prompt_prefix": args.prompt_prefix,
         "seed": args.seed,
     }

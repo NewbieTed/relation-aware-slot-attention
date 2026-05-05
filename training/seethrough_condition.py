@@ -9,7 +9,12 @@ list prompt.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import shutil
+import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -291,3 +296,151 @@ def render_seethrough_oscr_and_masks(
         all_masks.append(stacked_masks)
 
     return torch.stack(oscr_images, dim=0).to(centers.device), torch.stack(all_masks, dim=0).to(centers.device)
+
+
+def _labels_from_scene_graph(scene_graph: dict[str, Any]) -> list[str]:
+    return [str(node["label"]).replace("_", " ") for node in scene_graph["nodes"]]
+
+
+def _blender_cache_key(
+    *,
+    labels: list[str],
+    centers: list[list[float]],
+    sizes: list[list[float]],
+    image_size: int,
+    face_alpha: float,
+    azimuth_degrees: float,
+) -> str:
+    payload = {
+        "labels": labels,
+        "centers": [[round(float(value), 5) for value in row] for row in centers],
+        "sizes": [[round(float(value), 5) for value in row] for row in sizes],
+        "image_size": image_size,
+        "face_alpha": round(float(face_alpha), 6),
+        "azimuth_degrees": round(float(azimuth_degrees), 4),
+        "renderer_version": "blender_condition_v1_paper_face_order",
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:24]
+
+
+def _pil_to_condition_tensor(path: Path) -> torch.Tensor:
+    image = Image.open(path).convert("RGB")
+    array = torch.from_numpy(__import__("numpy").array(image)).permute(2, 0, 1).float()
+    return array.div(127.5).sub(1.0)
+
+
+def render_blender_oscr_conditions(
+    *,
+    centers: torch.Tensor,
+    log_sizes: torch.Tensor,
+    slot_mask: torch.Tensor,
+    scene_graphs: list[dict[str, Any]],
+    prompts: list[str],
+    image_size: int,
+    face_alpha: float,
+    azimuth_degrees: float,
+    blender_bin: str,
+    cache_dir: Path,
+) -> torch.Tensor:
+    """Render SeeThrough3D-style Blender OSCR images and return tensors in ``[-1, 1]``.
+
+    The model-condition path uses this when ``condition_renderer=blender``.
+    Rendered PNGs are cached by predicted boxes, labels, alpha, azimuth, and
+    image size because the frozen GNN makes these deterministic.
+    """
+
+    centers_cpu = centers.detach().cpu().float()
+    sizes_cpu = log_sizes.detach().cpu().float().exp().clamp(min=0.03, max=2.0)
+    mask_cpu = slot_mask.detach().cpu()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    image_paths: list[Path] = []
+    records_to_render: list[dict[str, Any]] = []
+    cache_targets: list[Path] = []
+
+    for batch_index, scene_graph in enumerate(scene_graphs):
+        labels = _labels_from_scene_graph(scene_graph)
+        valid_centers: list[list[float]] = []
+        valid_sizes: list[list[float]] = []
+        valid_labels: list[str] = []
+        for slot_index, label in enumerate(labels):
+            if slot_index >= mask_cpu.shape[1] or not bool(mask_cpu[batch_index, slot_index].item()):
+                continue
+            valid_labels.append(label)
+            valid_centers.append(centers_cpu[batch_index, slot_index].tolist())
+            valid_sizes.append(sizes_cpu[batch_index, slot_index].tolist())
+        cache_key = _blender_cache_key(
+            labels=valid_labels,
+            centers=valid_centers,
+            sizes=valid_sizes,
+            image_size=image_size,
+            face_alpha=face_alpha,
+            azimuth_degrees=azimuth_degrees,
+        )
+        target_path = cache_dir / f"{cache_key}.png"
+        image_paths.append(target_path)
+        if target_path.exists():
+            continue
+        cache_targets.append(target_path)
+        records_to_render.append(
+            {
+                "prompt": f"{batch_index}_{cache_key}_{prompts[batch_index]}",
+                "scene_graph": scene_graph,
+                "labels": valid_labels,
+                "predicted_centers": valid_centers,
+                "predicted_sizes": valid_sizes,
+            }
+        )
+
+    if records_to_render:
+        render_root = cache_dir / f"render_{hashlib.sha256(str(cache_targets).encode('utf-8')).hexdigest()[:12]}"
+        render_root.mkdir(parents=True, exist_ok=True)
+        records_path = render_root / "records.json"
+        records_path.write_text(json.dumps(records_to_render, indent=2))
+        script_path = Path(__file__).resolve().parents[1] / "evaluation" / "render_blender_oscr_demo.py"
+        cmd = [
+            blender_bin,
+            "--background",
+            "--python",
+            str(script_path),
+            "--",
+            "--records-json",
+            str(records_path),
+            "--output-dir",
+            str(render_root),
+            "--image-size",
+            str(image_size),
+            "--face-alpha",
+            str(face_alpha),
+            "--azimuth-degrees",
+            str(azimuth_degrees),
+            "--background",
+            "white",
+            "--engine",
+            "eevee",
+            "--samples",
+            "64",
+            "--no-edges",
+            "--no-labels",
+            "--no-ground",
+            "--no-shadows",
+        ]
+        try:
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"Blender executable not found for condition rendering: {blender_bin}") from exc
+        except subprocess.CalledProcessError as exc:
+            stderr_tail = "\n".join((exc.stderr or "").splitlines()[-20:])
+            raise RuntimeError(f"Blender condition rendering failed with exit code {exc.returncode}:\n{stderr_tail}") from exc
+        manifest_path = render_root / "blender_oscr_manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        if len(manifest) != len(cache_targets):
+            raise RuntimeError(
+                f"Blender rendered {len(manifest)} OSCR images, expected {len(cache_targets)}."
+            )
+        for item, target_path in zip(manifest, cache_targets):
+            shutil.copyfile(item["output"], target_path)
+        if result.stdout:
+            print(result.stdout.strip().splitlines()[-1])
+
+    images = [_pil_to_condition_tensor(path) for path in image_paths]
+    return torch.stack(images, dim=0).to(centers.device)

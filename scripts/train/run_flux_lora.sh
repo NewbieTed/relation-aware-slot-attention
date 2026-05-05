@@ -34,6 +34,10 @@ EVAL_EVERY="${EVAL_EVERY:-1000}"
 EVAL_SAMPLE_COUNT="${EVAL_SAMPLE_COUNT:-0}"
 EVAL_INFERENCE_STEPS="${EVAL_INFERENCE_STEPS:-12}"
 EVAL_SAMPLE_SEED="${EVAL_SAMPLE_SEED:-1234}"
+EVAL_BLENDER_OSCR="${EVAL_BLENDER_OSCR:-0}"
+BLENDER_BIN="${BLENDER_BIN:-blender}"
+EVAL_BLENDER_FACE_ALPHA="${EVAL_BLENDER_FACE_ALPHA:-0.25}"
+BLENDER_CACHE_DIR="${BLENDER_CACHE_DIR:-}"
 LOW_VRAM="${LOW_VRAM:-0}"
 GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-0}"
 CONDITION_RENDERER="${CONDITION_RENDERER:-seethrough}"
@@ -67,7 +71,9 @@ CMD=(
   --eval-every "$EVAL_EVERY" \
   --eval-sample-count "$EVAL_SAMPLE_COUNT" \
   --eval-inference-steps "$EVAL_INFERENCE_STEPS" \
-  --eval-sample-seed "$EVAL_SAMPLE_SEED"
+  --eval-sample-seed "$EVAL_SAMPLE_SEED" \
+  --blender-bin "$BLENDER_BIN" \
+  --eval-blender-face-alpha "$EVAL_BLENDER_FACE_ALPHA"
 )
 
 if [[ "$LOW_VRAM" == "1" ]]; then
@@ -75,6 +81,12 @@ if [[ "$LOW_VRAM" == "1" ]]; then
 fi
 if [[ "$GRADIENT_CHECKPOINTING" == "1" ]]; then
   CMD+=(--gradient-checkpointing)
+fi
+if [[ "$EVAL_BLENDER_OSCR" == "1" ]]; then
+  CMD+=(--eval-blender-oscr)
+fi
+if [[ -n "$BLENDER_CACHE_DIR" ]]; then
+  CMD+=(--blender-cache-dir "$BLENDER_CACHE_DIR")
 fi
 
 "${CMD[@]}" "$@"

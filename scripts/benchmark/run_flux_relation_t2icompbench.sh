@@ -35,6 +35,8 @@ LORA_ALPHA="${LORA_ALPHA:-32}"
 CONDITION_RENDERER="${CONDITION_RENDERER:-seethrough}"
 OSCR_FACE_ALPHA="${OSCR_FACE_ALPHA:-0.10}"
 OSCR_AZIMUTH_DEGREES="${OSCR_AZIMUTH_DEGREES:-0}"
+BLENDER_BIN="${BLENDER_BIN:-blender}"
+BLENDER_CACHE_DIR="${BLENDER_CACHE_DIR:-}"
 PROMPT_PREFIX="${PROMPT_PREFIX:-a photo of}"
 OUTPUT_DIR="${OUTPUT_DIR:-$ROOT_DIR/outputs/eval/flux_relation_${BENCHMARK}}"
 PROMPT_FILE="${PROMPT_FILE:-}"
@@ -78,6 +80,7 @@ GEN_CMD=(
   --condition-renderer "$CONDITION_RENDERER"
   --oscr-face-alpha "$OSCR_FACE_ALPHA"
   --oscr-azimuth-degrees "$OSCR_AZIMUTH_DEGREES"
+  --blender-bin "$BLENDER_BIN"
   --prompt-prefix "$PROMPT_PREFIX"
 )
 
@@ -86,6 +89,9 @@ if [[ "$LOW_VRAM" == "1" ]]; then
 fi
 if [[ -n "$LIMIT_PROMPTS" ]]; then
   GEN_CMD+=(--limit-prompts "$LIMIT_PROMPTS")
+fi
+if [[ -n "$BLENDER_CACHE_DIR" ]]; then
+  GEN_CMD+=(--blender-cache-dir "$BLENDER_CACHE_DIR")
 fi
 
 "${GEN_CMD[@]}"
