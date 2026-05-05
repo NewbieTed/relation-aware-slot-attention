@@ -16,20 +16,25 @@ from .graph_modules import (
     build_slot_conditioning,
     embedding_alignment_loss,
     inverse_relation_regularizer,
+    log_size_3d_loss,
     log_sigma_loss,
     pooled_label_embeddings,
     relation_loss,
 )
-from .graph_targets import bbox_centers_after_crop, bbox_log_sigmas_after_crop
+from .graph_targets import (
+    bbox_centers_after_crop,
+    bbox_log_sigmas_after_crop,
+    bbox_log_sizes_3d_after_crop,
+)
 from .metrics import MetricsLogger, write_split_manifest
-from .scene_graph import build_batched_scene_graphs
-from .train_sd15_lora import (
-    DEFAULT_MODEL_ID,
-    _is_tqdm_disabled,
+from .runtime import (
+    DEFAULT_FLUX_MODEL_ID,
     choose_weight_dtype,
+    is_tqdm_disabled,
     resolve_torch_device,
     set_seed,
 )
+from .scene_graph import build_batched_scene_graphs
 
 
 def _save_state(output_dir: Path, *, step: int, args: argparse.Namespace) -> None:
@@ -45,6 +50,7 @@ def _save_state(output_dir: Path, *, step: int, args: argparse.Namespace) -> Non
         "embedding_loss_weight": args.embedding_loss_weight,
         "inverse_relation_loss_weight": args.inverse_relation_loss_weight,
         "box_loss_weight": args.box_loss_weight,
+        "box3d_loss_weight": args.box3d_loss_weight,
     }
     (output_dir / "training_state.json").write_text(json.dumps(payload, indent=2))
 
@@ -69,7 +75,7 @@ def make_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--dataset-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--model-id", type=str, default=DEFAULT_MODEL_ID)
+    parser.add_argument("--model-id", type=str, default=DEFAULT_FLUX_MODEL_ID)
     parser.add_argument("--device", choices=("auto", "cpu", "mps", "cuda"), default="auto")
     parser.add_argument("--mixed-precision", choices=("no", "fp16", "bf16"), default="fp16")
     parser.add_argument("--batch-size", type=int, default=8)
@@ -91,6 +97,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--embedding-loss-weight", type=float, default=0.25)
     parser.add_argument("--inverse-relation-loss-weight", type=float, default=0.0)
     parser.add_argument("--box-loss-weight", type=float, default=0.0)
+    parser.add_argument("--box3d-loss-weight", type=float, default=0.0)
     parser.add_argument("--disable-tqdm", action="store_true")
     return parser
 
@@ -107,6 +114,7 @@ def _compute_graph_batch_losses(
     embedding_loss_weight: float,
     inverse_relation_loss_weight: float,
     box_loss_weight: float,
+    box3d_loss_weight: float = 0.0,
 ) -> dict[str, torch.Tensor]:
     max_nodes = max(len(graph["nodes"]) for graph in batch["scene_graphs"])  # type: ignore[index]
     slot_targets, slot_mask = bbox_centers_after_crop(
@@ -116,6 +124,12 @@ def _compute_graph_batch_losses(
         device=torch.device(device),
     )
     log_sigma_targets, _ = bbox_log_sigmas_after_crop(
+        batch["metadata"],  # type: ignore[arg-type]
+        batch["image_sizes"],  # type: ignore[arg-type]
+        max_nodes=max_nodes,
+        device=torch.device(device),
+    )
+    log_size_3d_targets, _ = bbox_log_sizes_3d_after_crop(
         batch["metadata"],  # type: ignore[arg-type]
         batch["image_sizes"],  # type: ignore[arg-type]
         max_nodes=max_nodes,
@@ -160,6 +174,11 @@ def _compute_graph_batch_losses(
         log_sigma_targets,
         conditioning.slot_mask,
     )
+    box3d_loss = log_size_3d_loss(
+        conditioning.slot_log_sizes_3d,
+        log_size_3d_targets,
+        conditioning.slot_mask,
+    )
     inverse_loss = inverse_relation_regularizer(graph_encoder)
     total_loss = (
         position_loss_weight * position_loss
@@ -167,6 +186,7 @@ def _compute_graph_batch_losses(
         + embedding_loss_weight * semantic_loss
         + inverse_relation_loss_weight * inverse_loss
         + box_loss_weight * box_loss
+        + box3d_loss_weight * box3d_loss
     )
     return {
         "loss": total_loss,
@@ -175,6 +195,7 @@ def _compute_graph_batch_losses(
         "embedding_loss": semantic_loss,
         "inverse_relation_loss": inverse_loss,
         "box_loss": box_loss,
+        "box3d_loss": box3d_loss,
     }
 
 
@@ -191,6 +212,7 @@ def _evaluate_graph_encoder(
     embedding_loss_weight: float,
     inverse_relation_loss_weight: float,
     box_loss_weight: float,
+    box3d_loss_weight: float,
 ) -> dict[str, float]:
     graph_encoder.eval()
     totals = {
@@ -200,6 +222,7 @@ def _evaluate_graph_encoder(
         "embedding_loss": 0.0,
         "inverse_relation_loss": 0.0,
         "box_loss": 0.0,
+        "box3d_loss": 0.0,
     }
     batch_count = 0
     for batch in dataloader:
@@ -214,6 +237,7 @@ def _evaluate_graph_encoder(
             embedding_loss_weight=embedding_loss_weight,
             inverse_relation_loss_weight=inverse_relation_loss_weight,
             box_loss_weight=box_loss_weight,
+            box3d_loss_weight=box3d_loss_weight,
         )
         for key in totals:
             totals[key] += float(metrics[key].item())
@@ -306,11 +330,12 @@ def main() -> int:
             "embedding_loss",
             "inverse_relation_loss",
             "box_loss",
+            "box3d_loss",
         ],
     )
     progress_bar = tqdm(
         total=args.max_train_steps,
-        disable=_is_tqdm_disabled(args),
+        disable=is_tqdm_disabled(args),
         desc="GraphPretraining",
     )
 
@@ -322,6 +347,7 @@ def main() -> int:
         "embedding_loss": 0.0,
         "inverse_relation_loss": 0.0,
         "box_loss": 0.0,
+        "box3d_loss": 0.0,
     }
     running_steps = 0
     while global_step < args.max_train_steps:
@@ -337,6 +363,7 @@ def main() -> int:
                 embedding_loss_weight=args.embedding_loss_weight,
                 inverse_relation_loss_weight=args.inverse_relation_loss_weight,
                 box_loss_weight=args.box_loss_weight,
+                box3d_loss_weight=args.box3d_loss_weight,
             )
             loss = metrics["loss"]
 
@@ -365,6 +392,7 @@ def main() -> int:
                     "embedding_loss": running["embedding_loss"] / running_steps,
                     "inverse_relation_loss": running["inverse_relation_loss"] / running_steps,
                     "box_loss": running["box_loss"] / running_steps,
+                    "box3d_loss": running["box3d_loss"] / running_steps,
                 }
                 metrics_logger.log(train_log)
                 progress_bar.set_postfix(
@@ -373,6 +401,7 @@ def main() -> int:
                     sem=f"{train_log['embedding_loss']:.4f}",
                     inv=f"{train_log['inverse_relation_loss']:.4f}",
                     box=f"{train_log['box_loss']:.4f}",
+                    box3d=f"{train_log['box3d_loss']:.4f}",
                 )
                 running = {key: 0.0 for key in running}
                 running_steps = 0
@@ -392,6 +421,7 @@ def main() -> int:
                         embedding_loss_weight=args.embedding_loss_weight,
                         inverse_relation_loss_weight=args.inverse_relation_loss_weight,
                         box_loss_weight=args.box_loss_weight,
+                        box3d_loss_weight=args.box3d_loss_weight,
                     ),
                 }
                 metrics_logger.log(eval_log)
@@ -402,7 +432,8 @@ def main() -> int:
                     f"rel={eval_log['relation_loss']:.4f}, "
                     f"sem={eval_log['embedding_loss']:.4f}, "
                     f"inv={eval_log['inverse_relation_loss']:.4f}, "
-                    f"box={eval_log['box_loss']:.4f}"
+                    f"box={eval_log['box_loss']:.4f}, "
+                    f"box3d={eval_log['box3d_loss']:.4f}"
                 )
 
             if global_step % args.save_every == 0:
@@ -439,6 +470,7 @@ def main() -> int:
                 embedding_loss_weight=args.embedding_loss_weight,
                 inverse_relation_loss_weight=args.inverse_relation_loss_weight,
                 box_loss_weight=args.box_loss_weight,
+                box3d_loss_weight=args.box3d_loss_weight,
             ),
         }
         metrics_logger.log(test_log)
@@ -449,7 +481,8 @@ def main() -> int:
             f"rel={test_log['relation_loss']:.4f}, "
             f"sem={test_log['embedding_loss']:.4f}, "
             f"inv={test_log['inverse_relation_loss']:.4f}, "
-            f"box={test_log['box_loss']:.4f})"
+            f"box={test_log['box_loss']:.4f}, "
+            f"box3d={test_log['box3d_loss']:.4f})"
         )
     _save_state(args.output_dir, step=global_step, args=args)
     print(f"Graph pretraining finished at step {global_step}.")

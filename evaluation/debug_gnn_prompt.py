@@ -9,9 +9,9 @@ from typing import Any
 import torch
 from transformers import CLIPTextModel, CLIPTokenizer
 
-from evaluation.generate import MODEL_REGISTRY, load_graph_encoder, resolve_torch_device
 from evaluation.prompt_parser import parse_prompt_to_scene_graph
 from training.graph_modules import GraphSlotEncoder, mean_pool_hidden
+from training.runtime import DEFAULT_FLUX_MODEL_ID, load_graph_encoder, resolve_torch_device
 from training.scene_graph import RELATION_VOCAB, build_batched_scene_graphs
 
 
@@ -21,8 +21,7 @@ def make_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--prompt", type=str, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--model", choices=sorted(MODEL_REGISTRY.keys()), default="sd15")
-    parser.add_argument("--model-id", type=str, default=None)
+    parser.add_argument("--model-id", type=str, default=DEFAULT_FLUX_MODEL_ID)
     parser.add_argument("--graph-encoder-path", type=Path, required=True)
     parser.add_argument("--device", choices=("auto", "cpu", "mps", "cuda"), default="auto")
     parser.add_argument("--max-vector-elements-print", type=int, default=16)
@@ -437,9 +436,8 @@ def main() -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     device = resolve_torch_device(args.device)
-    model_id = args.model_id or MODEL_REGISTRY[args.model]
-    tokenizer = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer")
-    text_encoder = CLIPTextModel.from_pretrained(model_id, subfolder="text_encoder").to(device)
+    tokenizer = CLIPTokenizer.from_pretrained(args.model_id, subfolder="tokenizer")
+    text_encoder = CLIPTextModel.from_pretrained(args.model_id, subfolder="text_encoder").to(device)
     text_encoder.eval()
 
     graph_encoder = load_graph_encoder(

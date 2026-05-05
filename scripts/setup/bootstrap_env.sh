@@ -51,7 +51,7 @@ fi
 VENV_PYTHON="$VENV_DIR/bin/python"
 
 "$VENV_PYTHON" -m pip install --upgrade pip "setuptools<82" wheel
-"$VENV_PYTHON" -m pip install -e ".[eval]"
+"$VENV_PYTHON" -m pip install -e ".[eval,flux]"
 "$VENV_PYTHON" -m pip install "ruamel.yaml==0.17.32" spacy gdown
 
 if ! "$VENV_PYTHON" -c "import spacy; spacy.load('en_core_web_sm')" >/dev/null 2>&1; then
