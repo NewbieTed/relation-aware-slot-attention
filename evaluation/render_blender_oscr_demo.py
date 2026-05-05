@@ -66,17 +66,11 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-z", type=float, default=4.3)
     parser.add_argument("--engine", choices=("cycles", "eevee"), default="cycles")
     parser.add_argument("--samples", type=int, default=32)
-    parser.add_argument("--rgb-faces", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
-        "--face-color-mode",
-        choices=("paper_red_blue_green", "paper_orange_blue_green", "seethrough_order", "normal_rgb", "object"),
-        default="paper_red_blue_green",
-        help=(
-            "paper_red_blue_green uses red for the camera/front face, blue for left, and green otherwise; "
-            "paper_orange_blue_green uses orange for the camera/front face, blue for left, and green otherwise; "
-            "seethrough_order copies the repo's cube polygon material order; "
-            "normal_rgb colors faces by actual local normals for easier OSCR readability."
-        ),
+        "--rgb-faces",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Kept for backwards compatibility; face colors are hardcoded to red-front, blue-left, green-other.",
     )
     parser.add_argument("--edges", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--labels", action=argparse.BooleanOptionalAction, default=False)
@@ -184,24 +178,11 @@ def _make_emission_material(name: str, color: tuple[float, float, float], alpha:
     return mat
 
 
-def _normal_rgb_color(normal: Vector) -> tuple[float, float, float]:
-    """Map a Blender face normal to a stable RGB cuboid-face color."""
-
-    axis = max(range(3), key=lambda index: abs(normal[index]))
-    if axis == 0:
-        return (0.95, 0.05, 0.05) if normal.x > 0 else (0.10, 0.35, 1.00)
-    if axis == 1:
-        return (0.05, 0.75, 0.12) if normal.y > 0 else (0.95, 0.80, 0.05)
-    return (0.95, 0.05, 0.85) if normal.z > 0 else (0.05, 0.80, 0.85)
-
-
-def _paper_face_color(normal: Vector, *, front: str) -> tuple[float, float, float]:
-    """Approximate paper OSCR coloring with configurable front face color."""
+def _paper_face_color(normal: Vector) -> tuple[float, float, float]:
+    """Hardcoded OSCR face colors: front red, left blue, others green."""
 
     axis = max(range(3), key=lambda index: abs(normal[index]))
     if axis == 1 and normal.y < 0:
-        if front == "orange":
-            return (1.00, 0.48, 0.05)
         return (1.00, 0.05, 0.05)
     if axis == 0 and normal.x < 0:
         return (0.05, 0.28, 1.00)
@@ -352,16 +333,7 @@ def _render_record(record: dict[str, Any], *, args: argparse.Namespace, index: i
         cube.dimensions = dims
         bpy.context.view_layer.update()
         cube.visible_shadow = bool(args.shadows)
-        if args.face_color_mode == "object" or not args.rgb_faces:
-            face_colors = [object_color] * 6
-        elif args.face_color_mode == "seethrough_order":
-            face_colors = RGB_FACE_COLORS
-        elif args.face_color_mode == "paper_orange_blue_green":
-            face_colors = [_paper_face_color(polygon.normal, front="orange") for polygon in cube.data.polygons]
-        elif args.face_color_mode == "paper_red_blue_green":
-            face_colors = [_paper_face_color(polygon.normal, front="red") for polygon in cube.data.polygons]
-        else:
-            face_colors = [_normal_rgb_color(polygon.normal) for polygon in cube.data.polygons]
+        face_colors = [_paper_face_color(polygon.normal) for polygon in cube.data.polygons]
         face_alpha = args.face_alpha * args.face_alpha_scale
         for face_index, color in enumerate(face_colors):
             cube.data.materials.append(
