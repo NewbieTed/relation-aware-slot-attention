@@ -734,6 +734,12 @@ def _run_eval_samples(
 
     if sample_count <= 0 or len(eval_dataset) == 0:
         return
+    if getattr(pipeline, "_low_vram", False):
+        print(
+            "Skipping eval image generation because --low-vram keeps VAE/text encoders on CPU. "
+            "Use LOW_VRAM=0 to generate eval images with the already-loaded FLUX pipeline."
+        )
+        return
     was_training = pipeline.transformer.training
     pipeline.transformer.eval()
     sample_dir = output_dir / "eval_samples" / f"step-{step:06d}"
