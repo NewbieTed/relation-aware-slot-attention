@@ -176,16 +176,24 @@ def _pipeline_execution_device(pipeline: Any, fallback: str) -> torch.device:
 def _set_pipeline_execution_device(pipeline: Any, device: str) -> None:
     """Force SeeThrough3D FLUX to prepare inference latents on the transformer device."""
 
-    try:
-        object.__setattr__(pipeline, "_execution_device", torch.device(device))
-    except Exception:
-        try:
-            pipeline._execution_device = torch.device(device)
-        except Exception:
-            print(
-                "Warning: could not override pipeline._execution_device; "
-                "continuing with diffusers-managed execution device."
-            )
+    forced_device = torch.device(device)
+    object.__setattr__(pipeline, "_forced_execution_device", forced_device)
+    if getattr(pipeline.__class__, "_relation_forced_execution_device", False):
+        return
+
+    base_cls = pipeline.__class__
+
+    class ForcedExecutionDevicePipeline(base_cls):  # type: ignore[misc, valid-type]
+        _relation_forced_execution_device = True
+
+        @property
+        def _execution_device(self) -> torch.device:  # type: ignore[override]
+            forced = getattr(self, "_forced_execution_device", None)
+            if forced is not None:
+                return torch.device(forced)
+            return super()._execution_device
+
+    object.__setattr__(pipeline, "__class__", ForcedExecutionDevicePipeline)
 
 
 @torch.no_grad()
