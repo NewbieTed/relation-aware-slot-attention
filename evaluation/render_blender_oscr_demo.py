@@ -178,15 +178,17 @@ def _make_emission_material(name: str, color: tuple[float, float, float], alpha:
     return mat
 
 
-def _paper_face_color(normal: Vector) -> tuple[float, float, float]:
-    """Hardcoded OSCR face colors: front red, left blue, others green."""
+def _paper_face_colors() -> list[tuple[float, float, float]]:
+    """Match SeeThrough3D's fixed Blender material-order face colors."""
 
-    axis = max(range(3), key=lambda index: abs(normal[index]))
-    if axis == 1 and normal.y < 0:
-        return (1.00, 0.05, 0.05)
-    if axis == 0 and normal.x < 0:
-        return (0.05, 0.28, 1.00)
-    return (0.05, 0.82, 0.18)
+    return [
+        (0.0, 0.0, 0.5),
+        (0.5, 0.0, 0.0),
+        (0.0, 0.5, 0.0),
+        (0.0, 0.5, 0.0),
+        (0.0, 0.5, 0.0),
+        (0.0, 0.5, 0.0),
+    ]
 
 
 def _create_edge(start: Vector, end: Vector, *, radius: float, material: bpy.types.Material, name: str) -> None:
@@ -333,7 +335,7 @@ def _render_record(record: dict[str, Any], *, args: argparse.Namespace, index: i
         cube.dimensions = dims
         bpy.context.view_layer.update()
         cube.visible_shadow = bool(args.shadows)
-        face_colors = [_paper_face_color(polygon.normal) for polygon in cube.data.polygons]
+        face_colors = _paper_face_colors()
         face_alpha = args.face_alpha * args.face_alpha_scale
         for face_index, color in enumerate(face_colors):
             cube.data.materials.append(

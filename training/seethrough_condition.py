@@ -17,9 +17,9 @@ import torch.nn.functional as F
 from PIL import Image, ImageDraw
 
 
-FRONT_RED = (255, 13, 13)
-LEFT_BLUE = (13, 71, 255)
-OTHER_GREEN = (13, 209, 46)
+PAPER_RED = (128, 0, 0)
+PAPER_BLUE = (0, 0, 128)
+PAPER_GREEN = (0, 128, 0)
 
 
 @dataclass(frozen=True)
@@ -185,12 +185,15 @@ def _project(points: list[list[float]], image_size: int) -> tuple[list[tuple[flo
 
 
 FACES: tuple[tuple[int, int, int, int, tuple[int, int, int]], ...] = (
-    (0, 1, 3, 2, LEFT_BLUE),
-    (4, 6, 7, 5, OTHER_GREEN),
-    (0, 4, 5, 1, FRONT_RED),
-    (2, 3, 7, 6, OTHER_GREEN),
-    (0, 2, 6, 4, OTHER_GREEN),
-    (1, 5, 7, 3, OTHER_GREEN),
+    # SeeThrough3D colors Blender cube faces by material index, not by
+    # camera-facing geometry. Its reordered material list is:
+    # [blue, red, green, green, green, green].
+    (0, 1, 3, 2, PAPER_BLUE),
+    (4, 6, 7, 5, PAPER_RED),
+    (0, 4, 5, 1, PAPER_GREEN),
+    (2, 3, 7, 6, PAPER_GREEN),
+    (0, 2, 6, 4, PAPER_GREEN),
+    (1, 5, 7, 3, PAPER_GREEN),
 )
 
 
