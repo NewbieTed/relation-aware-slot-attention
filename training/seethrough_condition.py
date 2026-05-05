@@ -160,7 +160,7 @@ def _camera_basis() -> tuple[list[float], list[float], list[float], list[float]]
     return camera, right, up, forward
 
 
-def _corners(center: list[float], dims: list[float], *, azimuth_degrees: float = 180.0) -> list[list[float]]:
+def _corners(center: list[float], dims: list[float], *, azimuth_degrees: float = 0.0) -> list[list[float]]:
     hx, hy, hz = dims[0] * 0.5, dims[1] * 0.5, dims[2] * 0.5
     angle = torch.deg2rad(torch.tensor(float(azimuth_degrees))).item()
     cos_a = torch.cos(torch.tensor(angle)).item()
@@ -233,7 +233,7 @@ def render_seethrough_oscr_and_masks(
     image_size: int,
     mask_size: tuple[int, int] | None = None,
     face_alpha: float = 0.10,
-    azimuth_degrees: float = 180.0,
+    azimuth_degrees: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Render paper-style cuboid OSCR images and per-object masks.
 

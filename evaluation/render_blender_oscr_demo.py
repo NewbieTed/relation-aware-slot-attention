@@ -64,7 +64,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-x", type=float, default=-4.2)
     parser.add_argument("--camera-y", type=float, default=-7.0)
     parser.add_argument("--camera-z", type=float, default=4.3)
-    parser.add_argument("--azimuth-degrees", type=float, default=180.0)
+    parser.add_argument("--azimuth-degrees", type=float, default=0.0)
     parser.add_argument("--engine", choices=("cycles", "eevee"), default="cycles")
     parser.add_argument("--samples", type=int, default=32)
     parser.add_argument(

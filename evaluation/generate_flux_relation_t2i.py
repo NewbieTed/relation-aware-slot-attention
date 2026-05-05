@@ -58,7 +58,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lora-alpha", type=float, default=32.0)
     parser.add_argument("--condition-renderer", choices=("seethrough", "legacy"), default="seethrough")
     parser.add_argument("--oscr-face-alpha", type=float, default=0.10)
-    parser.add_argument("--oscr-azimuth-degrees", type=float, default=180.0)
+    parser.add_argument("--oscr-azimuth-degrees", type=float, default=0.0)
     parser.add_argument("--prompt-prefix", type=str, default="a photo of")
     return parser
 
