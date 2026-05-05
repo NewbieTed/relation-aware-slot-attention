@@ -61,7 +61,7 @@ def make_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--edge-radius", type=float, default=0.012)
     parser.add_argument("--orthographic-scale", type=float, default=7.0)
-    parser.add_argument("--camera-x", type=float, default=4.2)
+    parser.add_argument("--camera-x", type=float, default=-4.2)
     parser.add_argument("--camera-y", type=float, default=-7.0)
     parser.add_argument("--camera-z", type=float, default=4.3)
     parser.add_argument("--engine", choices=("cycles", "eevee"), default="cycles")
