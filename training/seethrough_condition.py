@@ -186,8 +186,8 @@ def _project(points: list[list[float]], image_size: int) -> tuple[list[tuple[flo
 
 FACES: tuple[tuple[int, int, int, int, tuple[int, int, int]], ...] = (
     (0, 1, 3, 2, LEFT_BLUE),
-    (4, 6, 7, 5, FRONT_RED),
-    (0, 4, 5, 1, OTHER_GREEN),
+    (4, 6, 7, 5, OTHER_GREEN),
+    (0, 4, 5, 1, FRONT_RED),
     (2, 3, 7, 6, OTHER_GREEN),
     (0, 2, 6, 4, OTHER_GREEN),
     (1, 5, 7, 3, OTHER_GREEN),
@@ -262,7 +262,7 @@ def render_seethrough_oscr_and_masks(
                 face_items.append((mean_depth, slot_index, points, color))
                 mask_draw.polygon(points, fill=255)
 
-        for _depth, _slot_index, points, color in sorted(face_items, key=lambda item: item[0]):
+        for _depth, _slot_index, points, color in sorted(face_items, key=lambda item: item[0], reverse=True):
             face_draw.polygon(points, fill=(*color, alpha))
         image = Image.alpha_composite(image, face_layer).convert("RGB")
         oscr = torch.from_numpy(__import__("numpy").array(image)).permute(2, 0, 1).float()
