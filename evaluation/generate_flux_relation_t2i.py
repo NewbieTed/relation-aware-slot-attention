@@ -196,6 +196,15 @@ def _set_pipeline_execution_device(pipeline: Any, device: str) -> None:
     object.__setattr__(pipeline, "__class__", ForcedExecutionDevicePipeline)
 
 
+def _text_encoder_device(pipeline: Any) -> torch.device:
+    """Return the real text-encoder device for low-VRAM prompt pre-encoding."""
+
+    try:
+        return next(pipeline.text_encoder.parameters()).device
+    except StopIteration:
+        return torch.device("cpu")
+
+
 @torch.no_grad()
 def _predict_condition(
     *,
@@ -381,11 +390,11 @@ def main() -> int:
         oscr_viz_name = f"{prompt_name}_oscr_viz.png"
         oscr_viz_image.save(condition_dir / oscr_viz_name)
         layout["oscr_viz_file"] = str(Path("conditions") / oscr_viz_name)
-        encoder_device = "cpu" if args.low_vram else device
+        encoder_device = _text_encoder_device(pipeline)
         prompt_embeds, pooled_prompt_embeds, _text_ids = pipeline.encode_prompt(
             prompt=binding_prompt,
             prompt_2=binding_prompt,
-            device=torch.device(encoder_device),
+            device=encoder_device,
             num_images_per_prompt=1,
             max_sequence_length=args.max_sequence_length,
         )

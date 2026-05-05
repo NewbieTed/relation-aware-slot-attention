@@ -305,6 +305,15 @@ def _set_pipeline_execution_device(pipeline: Any, device: str) -> None:
     object.__setattr__(pipeline, "__class__", ForcedExecutionDevicePipeline)
 
 
+def _text_encoder_device(pipeline: Any) -> torch.device:
+    """Return the real device of the text encoders, independent of pipeline execution device."""
+
+    try:
+        return next(pipeline.text_encoder.parameters()).device
+    except StopIteration:
+        return torch.device("cpu")
+
+
 def _load_graph_encoder(
     *,
     path: Path,
@@ -557,7 +566,7 @@ def _compute_loss(
             device=device,
             dtype=dtype,
         )
-        encoder_device = getattr(pipeline, "_encoder_device", device)
+        encoder_device = _text_encoder_device(pipeline)
         cond_latents, _cond_ids, cond_grid_tensor, centers, log_sizes, slot_mask, cuboid_masks = _build_condition_latents(
             batch=batch,
             pipeline=pipeline,
@@ -583,7 +592,7 @@ def _compute_loss(
         prompt_embeds, pooled_prompt_embeds, text_ids = pipeline.encode_prompt(
             prompt=binding_prompts,
             prompt_2=binding_prompts,
-            device=torch.device(encoder_device),
+            device=encoder_device,
             num_images_per_prompt=1,
             max_sequence_length=max_sequence_length,
         )
@@ -861,11 +870,11 @@ def _run_eval_samples(
             if generator_device.type != "mps"
             else None
         )
-        encoder_device = getattr(pipeline, "_encoder_device", device)
+        encoder_device = _text_encoder_device(pipeline)
         prompt_embeds, pooled_prompt_embeds, _text_ids = pipeline.encode_prompt(
             prompt=binding_prompt.prompt,
             prompt_2=binding_prompt.prompt,
-            device=torch.device(encoder_device),
+            device=encoder_device,
             num_images_per_prompt=1,
             max_sequence_length=max_sequence_length,
         )
