@@ -664,6 +664,14 @@ def _run_eval_samples(
                 mask_size=cond_grid,
                 face_alpha=oscr_face_alpha,
             )
+            oscr_viz, _ = render_seethrough_oscr_and_masks(
+                centers=centers,
+                log_sizes=log_sizes,
+                slot_mask=slot_mask,
+                image_size=oscr_size,
+                mask_size=cond_grid,
+                face_alpha=max(oscr_face_alpha, 0.25),
+            )
         else:
             oscr = render_oscr_boxes(
                 centers=centers,
@@ -678,6 +686,14 @@ def _run_eval_samples(
                 image_size=oscr_size,
                 mask_size=cond_grid,
                 face_alpha=oscr_face_alpha,
+            )
+            oscr_viz, _ = render_seethrough_oscr_and_masks(
+                centers=centers,
+                log_sizes=log_sizes,
+                slot_mask=slot_mask,
+                image_size=oscr_size,
+                mask_size=cond_grid,
+                face_alpha=0.25,
             )
         binding_prompt = build_binding_prompt(
             original_prompt=item.prompt,
@@ -716,14 +732,17 @@ def _run_eval_samples(
         ).images[0]
         image_path = sample_dir / f"sample_{sample_index:02d}.png"
         oscr_path = sample_dir / f"sample_{sample_index:02d}_oscr.png"
+        oscr_viz_path = sample_dir / f"sample_{sample_index:02d}_oscr_viz.png"
         image.save(image_path)
         _tensor_to_pil(oscr[0]).save(oscr_path)
+        _tensor_to_pil(oscr_viz[0]).save(oscr_viz_path)
         records.append(
             {
                 "prompt": item.prompt,
                 "binding_prompt": binding_prompt.prompt,
                 "image": str(image_path),
                 "oscr": str(oscr_path),
+                "oscr_viz": str(oscr_viz_path),
                 "predicted_centers": centers[0].detach().cpu().tolist(),
                 "predicted_sizes_3d": log_sizes[0].exp().detach().cpu().tolist(),
                 "binding_mask_pct": float(cuboids_segmasks.float().mean().mul(100.0).item()),

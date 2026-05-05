@@ -190,7 +190,7 @@ def _predict_condition(
     condition_renderer: str,
     oscr_face_alpha: float,
     prompt_prefix: str,
-) -> tuple[str, Any, list[list[torch.Tensor]], torch.Tensor, dict[str, Any]]:
+) -> tuple[Any, Any, str, list[list[torch.Tensor]], torch.Tensor, dict[str, Any]]:
     scene_graph = parse_prompt_to_scene_graph(prompt)
     node_count = len(scene_graph["nodes"])
     targets = torch.zeros(1, node_count, 3, device=device)
@@ -217,6 +217,14 @@ def _predict_condition(
             mask_size=cond_grid,
             face_alpha=oscr_face_alpha,
         )
+        oscr_viz, _ = render_seethrough_oscr_and_masks(
+            centers=centers,
+            log_sizes=log_sizes,
+            slot_mask=slot_mask,
+            image_size=oscr_size,
+            mask_size=cond_grid,
+            face_alpha=max(oscr_face_alpha, 0.25),
+        )
     else:
         oscr = render_oscr_boxes(
             centers=centers,
@@ -231,6 +239,14 @@ def _predict_condition(
             image_size=oscr_size,
             mask_size=cond_grid,
             face_alpha=oscr_face_alpha,
+        )
+        oscr_viz, _ = render_seethrough_oscr_and_masks(
+            centers=centers,
+            log_sizes=log_sizes,
+            slot_mask=slot_mask,
+            image_size=oscr_size,
+            mask_size=cond_grid,
+            face_alpha=0.25,
         )
     binding_prompt = build_binding_prompt(
         original_prompt=prompt,
@@ -256,7 +272,7 @@ def _predict_condition(
         "binding_token_count": sum(len(ids) for sample in call_ids for ids in sample),
         "binding_mask_pct": float(cuboids_segmasks.float().mean().mul(100.0).item()),
     }
-    return _tensor_to_pil(oscr[0]), binding_prompt.prompt, call_ids, cuboids_segmasks, layout
+    return _tensor_to_pil(oscr[0]), _tensor_to_pil(oscr_viz[0]), binding_prompt.prompt, call_ids, cuboids_segmasks, layout
 
 
 def main() -> int:
@@ -287,7 +303,7 @@ def main() -> int:
     sample_index = 0
     for prompt_index, prompt in enumerate(tqdm(prompts, desc="RelationFluxGeneration")):
         prompt_name = _safe_prompt_for_filename(prompt)
-        oscr_image, binding_prompt, call_ids, cuboids_segmasks, layout = _predict_condition(
+        oscr_image, oscr_viz_image, binding_prompt, call_ids, cuboids_segmasks, layout = _predict_condition(
             prompt=prompt,
             pipeline=pipeline,
             graph_encoder=graph_encoder,
@@ -298,6 +314,11 @@ def main() -> int:
             oscr_face_alpha=args.oscr_face_alpha,
             prompt_prefix=args.prompt_prefix,
         )
+        condition_dir = args.output_dir / "conditions"
+        condition_dir.mkdir(parents=True, exist_ok=True)
+        oscr_viz_name = f"{prompt_name}_oscr_viz.png"
+        oscr_viz_image.save(condition_dir / oscr_viz_name)
+        layout["oscr_viz_file"] = str(Path("conditions") / oscr_viz_name)
         for repeat_index in range(args.samples_per_prompt):
             seed = args.seed + prompt_index * args.samples_per_prompt + repeat_index
             generator_device = _pipeline_execution_device(pipeline, device)

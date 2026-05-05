@@ -186,8 +186,8 @@ def _project(points: list[list[float]], image_size: int) -> tuple[list[tuple[flo
 
 FACES: tuple[tuple[int, int, int, int, tuple[int, int, int]], ...] = (
     (0, 1, 3, 2, LEFT_BLUE),
-    (4, 6, 7, 5, OTHER_GREEN),
-    (0, 4, 5, 1, FRONT_RED),
+    (4, 6, 7, 5, FRONT_RED),
+    (0, 4, 5, 1, OTHER_GREEN),
     (2, 3, 7, 6, OTHER_GREEN),
     (0, 2, 6, 4, OTHER_GREEN),
     (1, 5, 7, 3, OTHER_GREEN),

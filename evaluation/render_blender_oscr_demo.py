@@ -182,10 +182,10 @@ def _paper_face_color(normal: Vector) -> tuple[float, float, float]:
     """Hardcoded OSCR face colors: front red, left blue, others green."""
 
     axis = max(range(3), key=lambda index: abs(normal[index]))
-    if axis == 1 and normal.y < 0:
-        return (1.00, 0.05, 0.05)
     if axis == 0 and normal.x < 0:
         return (0.05, 0.28, 1.00)
+    if axis == 0 and normal.x > 0:
+        return (1.00, 0.05, 0.05)
     return (0.05, 0.82, 0.18)
 
 
