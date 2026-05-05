@@ -104,6 +104,8 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--blender-bin", type=str, default="blender")
     parser.add_argument("--eval-blender-face-alpha", type=float, default=0.25)
     parser.add_argument("--blender-cache-dir", type=Path, default=None)
+    parser.add_argument("--external-eval-gpu", type=str, default=None)
+    parser.add_argument("--external-eval-python", type=str, default=None)
     parser.add_argument("--save-every", type=int, default=4000)
     parser.add_argument("--disable-tqdm", action="store_true")
     return parser
@@ -966,6 +968,80 @@ def _save_checkpoint(
     return checkpoint_dir
 
 
+def _run_external_eval_samples(
+    *,
+    step: int,
+    checkpoint_dir: Path,
+    eval_dataset: Any,
+    output_dir: Path,
+    args: argparse.Namespace,
+) -> None:
+    """Launch sample generation in a separate process, optionally on another GPU."""
+
+    if args.eval_sample_count <= 0 or len(eval_dataset) == 0:
+        return
+    eval_root = output_dir / "eval_samples" / f"step-{step:06d}" / "external_generation"
+    eval_root.mkdir(parents=True, exist_ok=True)
+    prompt_file = eval_root / "prompts.txt"
+    prompts = [eval_dataset[index].prompt for index in range(min(args.eval_sample_count, len(eval_dataset)))]
+    prompt_file.write_text("\n".join(prompts) + "\n")
+
+    python_bin = args.external_eval_python or sys.executable
+    cmd = [
+        python_bin,
+        "-m",
+        "evaluation.generate_flux_relation_t2i",
+        "--prompt-file",
+        str(prompt_file),
+        "--checkpoint-dir",
+        str(checkpoint_dir),
+        "--output-dir",
+        str(eval_root),
+        "--model-id",
+        args.model_id,
+        "--device",
+        "cuda" if args.external_eval_gpu is not None else args.device,
+        "--mixed-precision",
+        args.mixed_precision,
+        "--flux-quantization",
+        args.flux_quantization,
+        "--image-size",
+        str(args.image_size),
+        "--oscr-size",
+        str(args.oscr_size),
+        "--num-inference-steps",
+        str(args.eval_inference_steps),
+        "--guidance-scale",
+        str(args.guidance_scale),
+        "--max-sequence-length",
+        str(args.max_sequence_length),
+        "--samples-per-prompt",
+        "1",
+        "--seed",
+        str(args.eval_sample_seed + step),
+        "--lora-rank",
+        str(args.lora_rank),
+        "--lora-alpha",
+        str(args.lora_alpha),
+        "--condition-renderer",
+        args.condition_renderer,
+        "--oscr-face-alpha",
+        str(args.oscr_face_alpha),
+        "--oscr-azimuth-degrees",
+        str(args.oscr_azimuth_degrees),
+        "--blender-bin",
+        args.blender_bin,
+        "--prompt-prefix",
+        args.prompt_prefix,
+    ]
+    blender_cache_dir = args.blender_cache_dir or (output_dir / "blender_condition_cache")
+    cmd.extend(["--blender-cache-dir", str(blender_cache_dir)])
+    env = os.environ.copy()
+    if args.external_eval_gpu is not None:
+        env["CUDA_VISIBLE_DEVICES"] = str(args.external_eval_gpu)
+    subprocess.run(cmd, check=True, env=env)
+
+
 def main() -> int:
     args = make_parser().parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -1157,30 +1233,46 @@ def main() -> int:
                     _save_state(args.output_dir, step=global_step, args=args, lora_layers=lora_layers)
                     print(f"Saved FLUX LoRA checkpoint to {checkpoint}")
                 if args.eval_sample_count > 0 and global_step % args.eval_every == 0:
-                    _run_eval_samples(
-                        step=global_step,
-                        eval_dataset=datasets["eval"],
-                        pipeline=pipeline,
-                        graph_encoder=graph_encoder,
-                        output_dir=args.output_dir,
-                        device=device,
-                        dtype=dtype,
-                        image_size=args.image_size,
-                        oscr_size=args.oscr_size,
-                        guidance_scale=args.guidance_scale,
-                        max_sequence_length=args.max_sequence_length,
-                        condition_renderer=args.condition_renderer,
-                        oscr_face_alpha=args.oscr_face_alpha,
-                        oscr_azimuth_degrees=args.oscr_azimuth_degrees,
-                        prompt_prefix=args.prompt_prefix,
-                        sample_count=args.eval_sample_count,
-                        inference_steps=args.eval_inference_steps,
-                        seed=args.eval_sample_seed,
-                        eval_blender_oscr=args.eval_blender_oscr,
-                        blender_bin=args.blender_bin,
-                        blender_cache_dir=args.blender_cache_dir or (args.output_dir / "blender_condition_cache"),
-                        eval_blender_face_alpha=args.eval_blender_face_alpha,
-                    )
+                    if args.external_eval_gpu is not None:
+                        checkpoint = _save_checkpoint(
+                            output_dir=args.output_dir,
+                            step=global_step,
+                            pipeline=pipeline,
+                            graph_encoder=graph_encoder,
+                            optimizer=optimizer,
+                        )
+                        _run_external_eval_samples(
+                            step=global_step,
+                            checkpoint_dir=checkpoint,
+                            eval_dataset=datasets["eval"],
+                            output_dir=args.output_dir,
+                            args=args,
+                        )
+                    else:
+                        _run_eval_samples(
+                            step=global_step,
+                            eval_dataset=datasets["eval"],
+                            pipeline=pipeline,
+                            graph_encoder=graph_encoder,
+                            output_dir=args.output_dir,
+                            device=device,
+                            dtype=dtype,
+                            image_size=args.image_size,
+                            oscr_size=args.oscr_size,
+                            guidance_scale=args.guidance_scale,
+                            max_sequence_length=args.max_sequence_length,
+                            condition_renderer=args.condition_renderer,
+                            oscr_face_alpha=args.oscr_face_alpha,
+                            oscr_azimuth_degrees=args.oscr_azimuth_degrees,
+                            prompt_prefix=args.prompt_prefix,
+                            sample_count=args.eval_sample_count,
+                            inference_steps=args.eval_inference_steps,
+                            seed=args.eval_sample_seed,
+                            eval_blender_oscr=args.eval_blender_oscr,
+                            blender_bin=args.blender_bin,
+                            blender_cache_dir=args.blender_cache_dir or (args.output_dir / "blender_condition_cache"),
+                            eval_blender_face_alpha=args.eval_blender_face_alpha,
+                        )
                     print(
                         "Saved eval samples to "
                         f"{args.output_dir / 'eval_samples' / f'step-{global_step:06d}'}"
