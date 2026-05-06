@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 from evaluation.prompt_parser import parse_prompt_to_scene_graph
+from training.config import parse_args_with_config
 from training.graph_modules import GraphSlotEncoder, build_slot_conditioning
 from training.oscr_renderer import render_oscr_boxes
 from training.runtime import (
@@ -465,7 +466,7 @@ def _predict_condition(
 
 
 def main() -> int:
-    args = make_parser().parse_args()
+    args = parse_args_with_config(make_parser(), section="generate")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     samples_dir = args.output_dir / "samples"
     samples_dir.mkdir(parents=True, exist_ok=True)
