@@ -22,6 +22,22 @@ def _load_raw_config(path: Path) -> dict[str, Any]:
     raise ValueError(f"Unsupported config file extension: {path}. Use .json, .yaml, or .yml.")
 
 
+def _flatten_config(config: dict[str, Any]) -> dict[str, Any]:
+    flattened: dict[str, Any] = {}
+    for key, value in config.items():
+        normalized_key = str(key).replace("-", "_")
+        if isinstance(value, dict):
+            for nested_key, nested_value in _flatten_config(value).items():
+                if nested_key in flattened:
+                    raise ValueError(f"Duplicate config key after flattening: {nested_key}")
+                flattened[nested_key] = nested_value
+        else:
+            if normalized_key in flattened:
+                raise ValueError(f"Duplicate config key after flattening: {normalized_key}")
+            flattened[normalized_key] = value
+    return flattened
+
+
 def _section_config(raw: dict[str, Any], section: str) -> dict[str, Any]:
     config: dict[str, Any] = {}
     common = raw.get("common")
@@ -32,7 +48,7 @@ def _section_config(raw: dict[str, Any], section: str) -> dict[str, Any]:
         config.update(selected)
     if not config:
         config = raw
-    return {str(key).replace("-", "_"): value for key, value in config.items()}
+    return _flatten_config(config)
 
 
 def _coerce_value(action: argparse.Action, value: Any) -> Any:
