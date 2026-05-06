@@ -17,7 +17,8 @@ T2I_ROOT="${T2I_ROOT:-$ROOT_DIR/external/T2I-CompBench}"
 FLUX_PYTHON="${FLUX_PYTHON:-$DEFAULT_FLUX_PYTHON}"
 T2I_PYTHON="${T2I_PYTHON:-$ROOT_DIR/.venv-t2i/bin/python}"
 MODEL_ID="${MODEL_ID:-black-forest-labs/FLUX.1-dev}"
-CHECKPOINT_DIR="${CHECKPOINT_DIR:?Set CHECKPOINT_DIR to a relation-aware FLUX checkpoint directory.}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-}"
+GRAPH_ENCODER_PATH="${GRAPH_ENCODER_PATH:-}"
 DEVICE="${DEVICE:-cuda}"
 MIXED_PRECISION="${MIXED_PRECISION:-bf16}"
 FLUX_QUANTIZATION="${FLUX_QUANTIZATION:-4bit}"
@@ -33,6 +34,9 @@ LIMIT_PROMPTS="${LIMIT_PROMPTS:-}"
 SEED="${SEED:-42}"
 LORA_RANK="${LORA_RANK:-32}"
 LORA_ALPHA="${LORA_ALPHA:-32}"
+EXTERNAL_LORA_SAFETENSORS="${EXTERNAL_LORA_SAFETENSORS:-}"
+USE_OFFICIAL_SEETHROUGH3D_LORA="${USE_OFFICIAL_SEETHROUGH3D_LORA:-0}"
+OFFICIAL_LORA_CACHE_DIR="${OFFICIAL_LORA_CACHE_DIR:-}"
 CONDITION_RENDERER="${CONDITION_RENDERER:-seethrough}"
 OSCR_FACE_ALPHA="${OSCR_FACE_ALPHA:-0.10}"
 OSCR_AZIMUTH_DEGREES="${OSCR_AZIMUTH_DEGREES:-0}"
@@ -63,7 +67,6 @@ fi
 GEN_CMD=(
   "$FLUX_PYTHON" -m evaluation.generate_flux_relation_t2i
   --prompt-file "$PROMPT_FILE"
-  --checkpoint-dir "$CHECKPOINT_DIR"
   --output-dir "$OUTPUT_DIR"
   --model-id "$MODEL_ID"
   --device "$DEVICE"
@@ -85,8 +88,23 @@ GEN_CMD=(
   --prompt-prefix "$PROMPT_PREFIX"
 )
 
+if [[ -n "$CHECKPOINT_DIR" ]]; then
+  GEN_CMD+=(--checkpoint-dir "$CHECKPOINT_DIR")
+fi
+if [[ -n "$GRAPH_ENCODER_PATH" ]]; then
+  GEN_CMD+=(--graph-encoder-path "$GRAPH_ENCODER_PATH")
+fi
 if [[ "$LOW_VRAM" == "1" ]]; then
   GEN_CMD+=(--low-vram)
+fi
+if [[ "$USE_OFFICIAL_SEETHROUGH3D_LORA" == "1" ]]; then
+  GEN_CMD+=(--use-official-seethrough3d-lora)
+fi
+if [[ -n "$EXTERNAL_LORA_SAFETENSORS" ]]; then
+  GEN_CMD+=(--external-lora-safetensors "$EXTERNAL_LORA_SAFETENSORS")
+fi
+if [[ -n "$OFFICIAL_LORA_CACHE_DIR" ]]; then
+  GEN_CMD+=(--official-lora-cache-dir "$OFFICIAL_LORA_CACHE_DIR")
 fi
 if [[ -n "$LIMIT_PROMPTS" ]]; then
   GEN_CMD+=(--limit-prompts "$LIMIT_PROMPTS")

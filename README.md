@@ -70,3 +70,30 @@ python3 -m evaluation.generate_flux_relation \
 
 The generation utility saves the generated image, the rendered OSCR condition,
 and a JSON file containing predicted centers and 3D sizes.
+
+## Official SeeThrough3D LoRA Baseline
+
+The T2I-CompBench FLUX relation generator can also download and use the released
+SeeThrough3D LoRA from Hugging Face. This keeps our GNN-predicted boxes but
+replaces our trained LoRA with the official SeeThrough3D condition adapter:
+
+```bash
+python3 -m evaluation.generate_flux_relation_t2i \
+  --prompt-file external/T2I-CompBench/examples/dataset/spatial_val.txt \
+  --graph-encoder-path outputs/train/graph_pretrain_flux_3dbox_gpu7/final/graph_encoder.pt \
+  --output-dir outputs/eval/flux_official_seethrough3d_quick \
+  --use-official-seethrough3d-lora \
+  --flux-quantization 4bit \
+  --low-vram \
+  --lora-rank 128 \
+  --lora-alpha 128 \
+  --image-size 384 \
+  --oscr-size 256 \
+  --oscr-render-size 512 \
+  --condition-renderer blender
+```
+
+The official LoRA checkpoint is downloaded from
+`va1bhavagrawa1/seethrough3d-flux.1-weights` using the model-card path
+`checkpoints/seethrough3d_release/lora.safetensors`. Set `HF_HOME` or
+`--official-lora-cache-dir` to keep the download out of home-directory quota.

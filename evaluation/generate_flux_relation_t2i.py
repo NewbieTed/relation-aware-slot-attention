@@ -35,11 +35,25 @@ from training.train_relation_flux_lora import (
     _install_condition_lora_processors,
 )
 
+OFFICIAL_SEETHROUGH3D_LORA_REPO = "va1bhavagrawa1/seethrough3d-flux.1-weights"
+OFFICIAL_SEETHROUGH3D_LORA_FILENAME = "checkpoints/seethrough3d_release/lora.safetensors"
+
 
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Generate relation-aware FLUX images for a T2I prompt file.")
     parser.add_argument("--prompt-file", type=Path, required=True)
-    parser.add_argument("--checkpoint-dir", type=Path, required=True)
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=Path,
+        default=None,
+        help="Relation-aware checkpoint directory. Used for flux_lora.pt and graph_encoder.pt unless overridden.",
+    )
+    parser.add_argument(
+        "--graph-encoder-path",
+        type=Path,
+        default=None,
+        help="Optional graph encoder checkpoint path. Useful when using an external SeeThrough3D LoRA.",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--model-id", type=str, default=DEFAULT_FLUX_MODEL_ID)
     parser.add_argument("--device", choices=("auto", "cpu", "mps", "cuda"), default="auto")
@@ -58,6 +72,25 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gnn-layers", type=int, default=2)
     parser.add_argument("--lora-rank", type=int, default=32)
     parser.add_argument("--lora-alpha", type=float, default=32.0)
+    parser.add_argument(
+        "--external-lora-safetensors",
+        type=Path,
+        default=None,
+        help="Optional SeeThrough3D-format LoRA .safetensors checkpoint to use instead of checkpoint-dir/flux_lora.pt.",
+    )
+    parser.add_argument(
+        "--use-official-seethrough3d-lora",
+        action="store_true",
+        help="Download and use the released SeeThrough3D FLUX LoRA from Hugging Face.",
+    )
+    parser.add_argument("--official-seethrough3d-lora-repo", type=str, default=OFFICIAL_SEETHROUGH3D_LORA_REPO)
+    parser.add_argument("--official-seethrough3d-lora-filename", type=str, default=OFFICIAL_SEETHROUGH3D_LORA_FILENAME)
+    parser.add_argument(
+        "--official-lora-cache-dir",
+        type=Path,
+        default=None,
+        help="Optional Hugging Face cache directory for the released SeeThrough3D LoRA.",
+    )
     parser.add_argument("--condition-renderer", choices=("seethrough", "legacy", "blender"), default="seethrough")
     parser.add_argument("--oscr-face-alpha", type=float, default=0.10)
     parser.add_argument("--oscr-azimuth-degrees", type=float, default=0.0)
@@ -112,6 +145,66 @@ def _load_graph_encoder(
     return encoder
 
 
+def _download_official_lora(args: argparse.Namespace) -> Path:
+    """Download the released SeeThrough3D LoRA using the model-card path."""
+
+    try:
+        from huggingface_hub import hf_hub_download
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "Downloading the official SeeThrough3D LoRA requires huggingface_hub. "
+            "Install the FLUX extras with `python -m pip install -e '.[flux]'`."
+        ) from exc
+    path = hf_hub_download(
+        repo_id=args.official_seethrough3d_lora_repo,
+        filename=args.official_seethrough3d_lora_filename,
+        repo_type="model",
+        cache_dir=str(args.official_lora_cache_dir) if args.official_lora_cache_dir is not None else None,
+    )
+    return Path(path)
+
+
+def _resolve_lora_path(args: argparse.Namespace) -> Path:
+    if args.use_official_seethrough3d_lora:
+        return _download_official_lora(args)
+    if args.external_lora_safetensors is not None:
+        if not args.external_lora_safetensors.exists():
+            raise FileNotFoundError(f"Missing external LoRA checkpoint: {args.external_lora_safetensors}")
+        return args.external_lora_safetensors
+    if args.checkpoint_dir is None:
+        raise ValueError(
+            "Pass --checkpoint-dir for a local relation-aware checkpoint, or use "
+            "--use-official-seethrough3d-lora / --external-lora-safetensors."
+        )
+    lora_path = args.checkpoint_dir / "flux_lora.pt"
+    if not lora_path.exists():
+        raise FileNotFoundError(f"Missing FLUX LoRA checkpoint: {lora_path}")
+    return lora_path
+
+
+def _load_lora_state(path: Path) -> dict[str, torch.Tensor]:
+    if path.suffix == ".safetensors":
+        try:
+            from safetensors import safe_open
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "Loading SeeThrough3D .safetensors LoRA weights requires safetensors."
+            ) from exc
+        state: dict[str, torch.Tensor] = {}
+        with safe_open(path, framework="pt", device="cpu") as handle:
+            for key in handle.keys():
+                state[key] = handle.get_tensor(key)
+        return state
+    return torch.load(path, map_location="cpu")
+
+
+def _infer_lora_rank(state: dict[str, torch.Tensor]) -> int | None:
+    for key, value in state.items():
+        if key.endswith(".down.weight") and value.ndim >= 1:
+            return int(value.shape[0])
+    return None
+
+
 def _load_pipeline(args: argparse.Namespace, device: str, dtype: torch.dtype) -> tuple[Any, Any]:
     (
         FluxPipeline,
@@ -148,10 +241,21 @@ def _load_pipeline(args: argparse.Namespace, device: str, dtype: torch.dtype) ->
     pipeline.text_encoder_2.requires_grad_(False)
     pipeline.transformer.requires_grad_(False)
 
+    lora_path = _resolve_lora_path(args)
+    lora_state = _load_lora_state(lora_path)
+    inferred_rank = _infer_lora_rank(lora_state)
+    lora_rank = args.lora_rank
+    lora_alpha = args.lora_alpha
+    if inferred_rank is not None and inferred_rank != args.lora_rank:
+        print(f"Using LoRA rank {inferred_rank} inferred from {lora_path} instead of --lora-rank={args.lora_rank}.")
+        lora_rank = inferred_rank
+    if args.use_official_seethrough3d_lora and inferred_rank is not None:
+        lora_alpha = float(inferred_rank)
+
     _install_condition_lora_processors(
         transformer=pipeline.transformer,
-        rank=args.lora_rank,
-        alpha=args.lora_alpha,
+        rank=lora_rank,
+        alpha=lora_alpha,
         cond_size=args.oscr_size,
         device=device,
         dtype=dtype,
@@ -159,10 +263,11 @@ def _load_pipeline(args: argparse.Namespace, device: str, dtype: torch.dtype) ->
         single_processor_cls=MultiSingleStreamBlockLoraProcessor,
         base_processor_cls=FluxAttnProcessor2_0,
     )
-    lora_path = args.checkpoint_dir / "flux_lora.pt"
-    if not lora_path.exists():
-        raise FileNotFoundError(f"Missing FLUX LoRA checkpoint: {lora_path}")
-    pipeline.transformer.load_state_dict(torch.load(lora_path, map_location=device), strict=False)
+    incompatible = pipeline.transformer.load_state_dict(lora_state, strict=False)
+    print(
+        f"Loaded LoRA from {lora_path} "
+        f"(missing={len(incompatible.missing_keys)}, unexpected={len(incompatible.unexpected_keys)})."
+    )
     pipeline.transformer.eval()
     _set_pipeline_execution_device(pipeline, device)
     return pipeline, quantization_config
@@ -368,7 +473,12 @@ def main() -> int:
     pipeline, _quantization_config = _load_pipeline(args, device=device, dtype=dtype)
 
     graph_device = "cpu" if args.low_vram else device
-    graph_path = args.checkpoint_dir / "graph_encoder.pt"
+    if args.graph_encoder_path is not None:
+        graph_path = args.graph_encoder_path
+    elif args.checkpoint_dir is not None:
+        graph_path = args.checkpoint_dir / "graph_encoder.pt"
+    else:
+        raise ValueError("Pass --graph-encoder-path when using an external/official SeeThrough3D LoRA.")
     if not graph_path.exists():
         raise FileNotFoundError(f"Missing graph encoder checkpoint: {graph_path}")
     graph_encoder = _load_graph_encoder(
@@ -454,7 +564,12 @@ def main() -> int:
 
     run_config = {
         "model_id": args.model_id,
-        "checkpoint_dir": str(args.checkpoint_dir),
+        "checkpoint_dir": str(args.checkpoint_dir) if args.checkpoint_dir is not None else None,
+        "graph_encoder_path": str(graph_path),
+        "external_lora_safetensors": str(args.external_lora_safetensors) if args.external_lora_safetensors else None,
+        "use_official_seethrough3d_lora": args.use_official_seethrough3d_lora,
+        "official_seethrough3d_lora_repo": args.official_seethrough3d_lora_repo,
+        "official_seethrough3d_lora_filename": args.official_seethrough3d_lora_filename,
         "prompt_file": str(args.prompt_file),
         "num_prompts": len(prompts),
         "samples_per_prompt": args.samples_per_prompt,
