@@ -7,9 +7,11 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+from accelerate import Accelerator
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
+from .config import parse_args_with_config
 from .dataset import build_dataset_splits, collate_training_items
 from .graph_modules import (
     GraphSlotEncoder,
@@ -29,9 +31,7 @@ from .graph_targets import (
 from .metrics import MetricsLogger, write_split_manifest
 from .runtime import (
     DEFAULT_FLUX_MODEL_ID,
-    choose_weight_dtype,
     is_tqdm_disabled,
-    resolve_torch_device,
     set_seed,
 )
 from .scene_graph import build_batched_scene_graphs
@@ -67,6 +67,19 @@ def _save_graph_encoder(
     torch.save(graph_encoder.state_dict(), checkpoint_dir / "graph_encoder.pt")
     torch.save(optimizer.state_dict(), checkpoint_dir / "optimizer.pt")
     return checkpoint_dir
+
+
+def _weight_dtype_from_accelerator(accelerator: Accelerator) -> torch.dtype:
+    if accelerator.mixed_precision == "fp16":
+        return torch.float16
+    if accelerator.mixed_precision == "bf16":
+        return torch.bfloat16
+    return torch.float32
+
+
+def _unwrap_graph_encoder(graph_encoder: GraphSlotEncoder, accelerator: Accelerator) -> GraphSlotEncoder:
+    unwrapped = accelerator.unwrap_model(graph_encoder)
+    return getattr(unwrapped, "_orig_mod", unwrapped)
 
 
 def make_parser() -> argparse.ArgumentParser:
@@ -249,11 +262,16 @@ def _evaluate_graph_encoder(
 
 
 def main() -> int:
-    args = make_parser().parse_args()
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-
-    device = resolve_torch_device(args.device)
-    weight_dtype = choose_weight_dtype(device, args.mixed_precision)
+    args = parse_args_with_config(make_parser(), section="gnn")
+    accelerator = Accelerator(
+        mixed_precision=None if args.mixed_precision == "no" else args.mixed_precision,
+        project_dir=str(args.output_dir),
+    )
+    device = str(accelerator.device)
+    weight_dtype = _weight_dtype_from_accelerator(accelerator)
+    if accelerator.is_main_process:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+    accelerator.wait_for_everyone()
     set_seed(args.seed)
     os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
@@ -266,15 +284,16 @@ def main() -> int:
         eval_fraction=args.eval_fraction,
         test_fraction=args.test_fraction,
     )
-    write_split_manifest(
-        args.output_dir,
-        train_rows=datasets["train"].rows,
-        eval_rows=datasets["eval"].rows,
-        test_rows=datasets["test"].rows,
-        seed=args.seed,
-        eval_fraction=args.eval_fraction,
-        test_fraction=args.test_fraction,
-    )
+    if accelerator.is_main_process:
+        write_split_manifest(
+            args.output_dir,
+            train_rows=datasets["train"].rows,
+            eval_rows=datasets["eval"].rows,
+            test_rows=datasets["test"].rows,
+            seed=args.seed,
+            eval_fraction=args.eval_fraction,
+            test_fraction=args.test_fraction,
+        )
     train_dataloader = DataLoader(
         datasets["train"],
         batch_size=args.batch_size,
@@ -317,8 +336,14 @@ def main() -> int:
         graph_encoder.parameters(),
         lr=args.graph_learning_rate,
     )
+    graph_encoder, optimizer, train_dataloader = accelerator.prepare(
+        graph_encoder,
+        optimizer,
+        train_dataloader,
+    )
 
-    _save_state(args.output_dir, step=0, args=args)
+    if accelerator.is_main_process:
+        _save_state(args.output_dir, step=0, args=args)
     metrics_logger = MetricsLogger(
         args.output_dir,
         fieldnames=[
@@ -335,7 +360,7 @@ def main() -> int:
     )
     progress_bar = tqdm(
         total=args.max_train_steps,
-        disable=is_tqdm_disabled(args),
+        disable=is_tqdm_disabled(args) or not accelerator.is_local_main_process,
         desc="GraphPretraining",
     )
 
@@ -373,14 +398,18 @@ def main() -> int:
                 )
 
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+            accelerator.backward(loss)
             optimizer.step()
 
             global_step += 1
             progress_bar.update(1)
             running_steps += 1
+            gathered_metrics = {
+                key: accelerator.gather(metrics[key].detach().float().reshape(1)).mean().item()
+                for key in running
+            }
             for key in running:
-                running[key] += float(metrics[key].item())
+                running[key] += gathered_metrics[key]
 
             if global_step % args.log_every == 0:
                 train_log = {
@@ -394,19 +423,26 @@ def main() -> int:
                     "box_loss": running["box_loss"] / running_steps,
                     "box3d_loss": running["box3d_loss"] / running_steps,
                 }
-                metrics_logger.log(train_log)
-                progress_bar.set_postfix(
-                    pos=f"{train_log['position_loss']:.4f}",
-                    rel=f"{train_log['relation_loss']:.4f}",
-                    sem=f"{train_log['embedding_loss']:.4f}",
-                    inv=f"{train_log['inverse_relation_loss']:.4f}",
-                    box=f"{train_log['box_loss']:.4f}",
-                    box3d=f"{train_log['box3d_loss']:.4f}",
-                )
+                if accelerator.is_main_process:
+                    metrics_logger.log(train_log)
+                if accelerator.is_local_main_process:
+                    progress_bar.set_postfix(
+                        pos=f"{train_log['position_loss']:.4f}",
+                        rel=f"{train_log['relation_loss']:.4f}",
+                        sem=f"{train_log['embedding_loss']:.4f}",
+                        inv=f"{train_log['inverse_relation_loss']:.4f}",
+                        box=f"{train_log['box_loss']:.4f}",
+                        box3d=f"{train_log['box3d_loss']:.4f}",
+                    )
                 running = {key: 0.0 for key in running}
                 running_steps = 0
 
-            if len(datasets["eval"]) > 0 and args.eval_every > 0 and global_step % args.eval_every == 0:
+            if (
+                accelerator.is_main_process
+                and len(datasets["eval"]) > 0
+                and args.eval_every > 0
+                and global_step % args.eval_every == 0
+            ):
                 eval_log = {
                     "step": global_step,
                     "split": "eval",
@@ -414,7 +450,7 @@ def main() -> int:
                         dataloader=eval_dataloader,
                         tokenizer=tokenizer,
                         text_encoder=text_encoder,
-                        graph_encoder=graph_encoder,
+                        graph_encoder=_unwrap_graph_encoder(graph_encoder, accelerator),
                         device=device,
                         position_loss_weight=args.position_loss_weight,
                         relation_loss_weight=args.relation_loss_weight,
@@ -436,11 +472,11 @@ def main() -> int:
                     f"box3d={eval_log['box3d_loss']:.4f}"
                 )
 
-            if global_step % args.save_every == 0:
+            if accelerator.is_main_process and global_step % args.save_every == 0:
                 checkpoint_dir = _save_graph_encoder(
                     args.output_dir,
                     step=global_step,
-                    graph_encoder=graph_encoder,
+                    graph_encoder=_unwrap_graph_encoder(graph_encoder, accelerator),
                     optimizer=optimizer,
                 )
                 _save_state(args.output_dir, step=global_step, args=args)
@@ -453,9 +489,10 @@ def main() -> int:
         break
 
     final_dir = args.output_dir / "final"
-    final_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(graph_encoder.state_dict(), final_dir / "graph_encoder.pt")
-    if len(datasets["test"]) > 0:
+    if accelerator.is_main_process:
+        final_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(_unwrap_graph_encoder(graph_encoder, accelerator).state_dict(), final_dir / "graph_encoder.pt")
+    if accelerator.is_main_process and len(datasets["test"]) > 0:
         test_log = {
             "step": global_step,
             "split": "test",
@@ -463,7 +500,7 @@ def main() -> int:
                 dataloader=test_dataloader,
                 tokenizer=tokenizer,
                 text_encoder=text_encoder,
-                graph_encoder=graph_encoder,
+                graph_encoder=_unwrap_graph_encoder(graph_encoder, accelerator),
                 device=device,
                 position_loss_weight=args.position_loss_weight,
                 relation_loss_weight=args.relation_loss_weight,
@@ -484,8 +521,10 @@ def main() -> int:
             f"box={test_log['box_loss']:.4f}, "
             f"box3d={test_log['box3d_loss']:.4f})"
         )
-    _save_state(args.output_dir, step=global_step, args=args)
-    print(f"Graph pretraining finished at step {global_step}.")
+    if accelerator.is_main_process:
+        _save_state(args.output_dir, step=global_step, args=args)
+        print(f"Graph pretraining finished at step {global_step}.")
+    accelerator.wait_for_everyone()
     return 0
 
 

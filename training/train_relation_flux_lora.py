@@ -16,6 +16,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import types
@@ -24,19 +25,26 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+from accelerate import Accelerator
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
+from .config import parse_args_with_config
 from .dataset import build_dataset_splits, collate_training_items
+from .flux_training_cache import (
+    CachedFluxTrainingDataset,
+    build_expected_manifest,
+    collate_cached_flux_training_items,
+    file_sha256,
+    validate_manifest,
+)
 from .graph_modules import GraphSlotEncoder, build_slot_conditioning
 from .graph_targets import bbox_centers_after_crop
 from .metrics import MetricsLogger, write_split_manifest
 from .oscr_renderer import render_oscr_boxes
 from .runtime import (
-    choose_weight_dtype,
     is_tqdm_disabled,
     normalize_graph_encoder_state_dict,
-    resolve_torch_device,
     set_seed,
 )
 from .scene_graph import build_batched_scene_graphs
@@ -106,6 +114,12 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--blender-cache-dir", type=Path, default=None)
     parser.add_argument("--external-eval-gpu", type=str, default=None)
     parser.add_argument("--external-eval-python", type=str, default=None)
+    parser.add_argument(
+        "--precomputed-cache-dir",
+        type=Path,
+        default=None,
+        help="Use offline-precomputed FLUX training tensors instead of encoding VAE/text/GNN inputs during training.",
+    )
     parser.add_argument("--save-every", type=int, default=4000)
     parser.add_argument("--disable-tqdm", action="store_true")
     return parser
@@ -125,6 +139,7 @@ def _save_state(output_dir: Path, *, step: int, args: argparse.Namespace, lora_l
         "condition_renderer": args.condition_renderer,
         "oscr_face_alpha": args.oscr_face_alpha,
         "oscr_azimuth_degrees": args.oscr_azimuth_degrees,
+        "precomputed_cache_dir": str(args.precomputed_cache_dir) if args.precomputed_cache_dir is not None else None,
     }
     (output_dir / "training_state.json").write_text(json.dumps(payload, indent=2))
 
@@ -314,6 +329,21 @@ def _text_encoder_device(pipeline: Any) -> torch.device:
         return next(pipeline.text_encoder.parameters()).device
     except StopIteration:
         return torch.device("cpu")
+
+
+def _weight_dtype_from_accelerator(accelerator: Accelerator) -> torch.dtype:
+    if accelerator.mixed_precision == "fp16":
+        return torch.float16
+    if accelerator.mixed_precision == "bf16":
+        return torch.bfloat16
+    return torch.float32
+
+
+def _unwrap_transformer(transformer: Any, accelerator: Accelerator | None) -> Any:
+    if accelerator is None:
+        return transformer
+    unwrapped = accelerator.unwrap_model(transformer)
+    return getattr(unwrapped, "_orig_mod", unwrapped)
 
 
 def _load_graph_encoder(
@@ -651,6 +681,65 @@ def _compute_loss(
     }
 
 
+def _compute_cached_loss(
+    *,
+    batch: dict[str, Any],
+    pipeline: Any,
+    device: str,
+    dtype: torch.dtype,
+    guidance_scale: float,
+) -> dict[str, torch.Tensor]:
+    """Compute the FLUX flow loss from offline-precomputed frozen inputs."""
+
+    clean_latents = batch["clean_latents"].to(device=device, dtype=dtype)
+    cond_latents = batch["cond_latents"].to(device=device, dtype=dtype)
+    prompt_embeds = batch["prompt_embeds"].to(device=device, dtype=dtype)
+    pooled_prompt_embeds = batch["pooled_prompt_embeds"].to(device=device, dtype=dtype)
+    text_ids = batch["text_ids"].to(device=device)
+    image_and_condition_ids = batch["image_and_condition_ids"].to(device=device)
+    cuboids_segmasks = batch["cuboids_segmasks"].to(device=device, dtype=torch.uint8)
+    call_ids = [
+        [token_ids.to(device=device, dtype=torch.long) for token_ids in sample]
+        for sample in batch["call_ids"]
+    ]
+
+    noise = torch.randn_like(clean_latents)
+    sigmas = torch.rand(clean_latents.shape[0], device=clean_latents.device, dtype=clean_latents.dtype)
+    noisy_latents = (1.0 - sigmas[:, None, None]) * clean_latents + sigmas[:, None, None] * noise
+    target = noise - clean_latents
+    guidance = None
+    if pipeline.transformer.config.guidance_embeds:
+        guidance = torch.full(
+            (clean_latents.shape[0],),
+            guidance_scale,
+            device=clean_latents.device,
+            dtype=torch.float32,
+        )
+    model_pred = pipeline.transformer(
+        hidden_states=noisy_latents,
+        cond_hidden_states=cond_latents,
+        timestep=sigmas,
+        guidance=guidance,
+        pooled_projections=pooled_prompt_embeds,
+        encoder_hidden_states=prompt_embeds,
+        txt_ids=text_ids,
+        img_ids=image_and_condition_ids,
+        return_dict=False,
+        call_ids=call_ids,
+        cuboids_segmasks=cuboids_segmasks,
+    )[0]
+    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+    return {
+        "loss": loss,
+        "flow_loss": loss.detach(),
+        "condition_latent_norm": batch["condition_latent_norm"].float().mean().to(device).detach(),
+        "pred_center_abs_mean": batch["pred_center_abs_mean"].float().mean().to(device).detach(),
+        "pred_log_size_mean": batch["pred_log_size_mean"].float().mean().to(device).detach(),
+        "binding_token_count": batch["binding_token_count"].float().mean().to(device).detach(),
+        "binding_mask_pct": batch["binding_mask_pct"].float().mean().to(device).detach(),
+    }
+
+
 def _tensor_to_pil(image: torch.Tensor) -> Any:
     from PIL import Image
 
@@ -957,13 +1046,21 @@ def _save_checkpoint(
     output_dir: Path,
     step: int,
     pipeline: Any,
-    graph_encoder: GraphSlotEncoder,
+    graph_encoder: GraphSlotEncoder | None,
     optimizer: torch.optim.Optimizer,
+    init_graph_encoder: Path | None = None,
+    accelerator: Accelerator | None = None,
 ) -> Path:
     checkpoint_dir = output_dir / f"checkpoint-{step:06d}"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    _save_condition_lora_state(pipeline.transformer, checkpoint_dir / "flux_lora.pt")
-    torch.save(graph_encoder.state_dict(), checkpoint_dir / "graph_encoder.pt")
+    _save_condition_lora_state(
+        _unwrap_transformer(pipeline.transformer, accelerator),
+        checkpoint_dir / "flux_lora.pt",
+    )
+    if graph_encoder is not None:
+        torch.save(graph_encoder.state_dict(), checkpoint_dir / "graph_encoder.pt")
+    elif init_graph_encoder is not None:
+        shutil.copy2(init_graph_encoder, checkpoint_dir / "graph_encoder.pt")
     torch.save(optimizer.state_dict(), checkpoint_dir / "optimizer.pt")
     return checkpoint_dir
 
@@ -983,7 +1080,13 @@ def _run_external_eval_samples(
     eval_root = output_dir / "eval_samples" / f"step-{step:06d}" / "external_generation"
     eval_root.mkdir(parents=True, exist_ok=True)
     prompt_file = eval_root / "prompts.txt"
-    prompts = [eval_dataset[index].prompt for index in range(min(args.eval_sample_count, len(eval_dataset)))]
+    prompts = []
+    for index in range(min(args.eval_sample_count, len(eval_dataset))):
+        item = eval_dataset[index]
+        if hasattr(item, "prompt"):
+            prompts.append(item.prompt)
+        else:
+            prompts.append(item.payload["prompt"])
     prompt_file.write_text("\n".join(prompts) + "\n")
 
     python_bin = args.external_eval_python or sys.executable
@@ -1043,37 +1146,76 @@ def _run_external_eval_samples(
 
 
 def main() -> int:
-    args = make_parser().parse_args()
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    args = parse_args_with_config(make_parser(), section="train")
     os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-    device = resolve_torch_device(args.device)
-    dtype = choose_weight_dtype(device, args.mixed_precision)
+    accelerator = Accelerator(
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        mixed_precision=None if args.mixed_precision == "no" else args.mixed_precision,
+        project_dir=str(args.output_dir),
+    )
+    device = str(accelerator.device)
+    dtype = _weight_dtype_from_accelerator(accelerator)
+    if accelerator.is_main_process:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+    accelerator.wait_for_everyone()
     set_seed(args.seed)
+    use_precomputed_cache = args.precomputed_cache_dir is not None
 
-    datasets = build_dataset_splits(
-        args.dataset_dir,
-        image_size=args.image_size,
-        prompt_prefix=args.prompt_prefix,
-        limit_rows=args.limit_rows,
-        seed=args.seed,
-        eval_fraction=args.eval_fraction,
-        test_fraction=args.test_fraction,
-    )
-    write_split_manifest(
-        args.output_dir,
-        train_rows=datasets["train"].rows,
-        eval_rows=datasets["eval"].rows,
-        test_rows=datasets["test"].rows,
-        seed=args.seed,
-        eval_fraction=args.eval_fraction,
-        test_fraction=args.test_fraction,
-    )
+    if use_precomputed_cache:
+        assert args.precomputed_cache_dir is not None
+        expected_manifest = build_expected_manifest(
+            args,
+            graph_sha256=file_sha256(args.init_graph_encoder),
+            dtype_name=str(dtype).replace("torch.", ""),
+        )
+        cache_manifest = validate_manifest(args.precomputed_cache_dir, expected_manifest)
+        datasets = {
+            "train": CachedFluxTrainingDataset(args.precomputed_cache_dir, "train"),
+            "eval": CachedFluxTrainingDataset(args.precomputed_cache_dir, "eval"),
+            "test": CachedFluxTrainingDataset(args.precomputed_cache_dir, "test"),
+        }
+        collate_fn = collate_cached_flux_training_items
+        if accelerator.is_main_process:
+            write_split_manifest(
+                args.output_dir,
+                train_rows=datasets["train"].rows,
+                eval_rows=datasets["eval"].rows,
+                test_rows=datasets["test"].rows,
+                seed=args.seed,
+                eval_fraction=args.eval_fraction,
+                test_fraction=args.test_fraction,
+            )
+            print(
+                "Using precomputed FLUX training cache from "
+                f"{args.precomputed_cache_dir} ({cache_manifest.get('example_count', 'unknown')} examples)."
+            )
+    else:
+        datasets = build_dataset_splits(
+            args.dataset_dir,
+            image_size=args.image_size,
+            prompt_prefix=args.prompt_prefix,
+            limit_rows=args.limit_rows,
+            seed=args.seed,
+            eval_fraction=args.eval_fraction,
+            test_fraction=args.test_fraction,
+        )
+        collate_fn = collate_training_items
+        if accelerator.is_main_process:
+            write_split_manifest(
+                args.output_dir,
+                train_rows=datasets["train"].rows,
+                eval_rows=datasets["eval"].rows,
+                test_rows=datasets["test"].rows,
+                seed=args.seed,
+                eval_fraction=args.eval_fraction,
+                test_fraction=args.test_fraction,
+            )
     train_dataloader = DataLoader(
         datasets["train"],
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        collate_fn=collate_training_items,
+        collate_fn=collate_fn,
     )
 
     (
@@ -1084,7 +1226,6 @@ def main() -> int:
         FluxAttnProcessor2_0,
     ) = _import_seethrough3d_flux()
 
-    pipeline = FluxPipeline.from_pretrained(args.model_id, transformer=None, torch_dtype=dtype)
     quantization_config = _build_flux_quantization_config(args.flux_quantization, dtype)
     transformer_kwargs: dict[str, Any] = {
         "subfolder": "transformer",
@@ -1093,32 +1234,52 @@ def main() -> int:
     if quantization_config is not None:
         transformer_kwargs["quantization_config"] = quantization_config
         transformer_kwargs["device_map"] = {"": device}
-    pipeline.transformer = FluxTransformer2DModel.from_pretrained(
-        args.model_id,
-        **transformer_kwargs,
-    )
-    pipeline._low_vram = args.low_vram
-    pipeline._encoder_device = "cpu" if args.low_vram else device
-    pipeline._graph_device = "cpu" if args.low_vram else device
-    if args.low_vram:
-        pipeline.text_encoder.to("cpu")
-        pipeline.text_encoder_2.to("cpu")
-        pipeline.vae.to("cpu")
+    if use_precomputed_cache:
+        transformer = FluxTransformer2DModel.from_pretrained(args.model_id, **transformer_kwargs)
         if quantization_config is None:
-            pipeline.transformer.to(device=device, dtype=dtype)
+            transformer.to(device=device, dtype=dtype)
+        pipeline = types.SimpleNamespace(transformer=transformer)
+        graph_encoder = None
+        if args.eval_sample_count > 0 and args.external_eval_gpu is None:
+            print(
+                "Warning: in-process eval sample generation is unavailable with --precomputed-cache-dir "
+                "because VAE/text/GNN modules are intentionally not loaded. Use --external-eval-gpu."
+            )
     else:
-        if quantization_config is None:
-            pipeline.to(device)
+        pipeline = FluxPipeline.from_pretrained(args.model_id, transformer=None, torch_dtype=dtype)
+        pipeline.transformer = FluxTransformer2DModel.from_pretrained(
+            args.model_id,
+            **transformer_kwargs,
+        )
+        pipeline._low_vram = args.low_vram
+        pipeline._encoder_device = "cpu" if args.low_vram else device
+        pipeline._graph_device = "cpu" if args.low_vram else device
+        if args.low_vram:
+            pipeline.text_encoder.to("cpu")
+            pipeline.text_encoder_2.to("cpu")
+            pipeline.vae.to("cpu")
+            if quantization_config is None:
+                pipeline.transformer.to(device=device, dtype=dtype)
         else:
-            pipeline.vae.to(device=device, dtype=dtype)
-            pipeline.text_encoder.to(device)
-            pipeline.text_encoder_2.to(device)
-    _set_pipeline_execution_device(pipeline, device)
+            if quantization_config is None:
+                pipeline.to(device)
+            else:
+                pipeline.vae.to(device=device, dtype=dtype)
+                pipeline.text_encoder.to(device)
+                pipeline.text_encoder_2.to(device)
+        _set_pipeline_execution_device(pipeline, device)
+        pipeline.vae.requires_grad_(False)
+        pipeline.text_encoder.requires_grad_(False)
+        pipeline.text_encoder_2.requires_grad_(False)
+        graph_encoder = _load_graph_encoder(
+            path=args.init_graph_encoder,
+            text_hidden_dim=pipeline.text_encoder.config.hidden_size,
+            slot_dim=args.slot_dim,
+            gnn_layers=args.gnn_layers,
+            device=pipeline._graph_device,
+        )
     if args.gradient_checkpointing:
         _enable_gradient_checkpointing_compat(pipeline.transformer)
-    pipeline.vae.requires_grad_(False)
-    pipeline.text_encoder.requires_grad_(False)
-    pipeline.text_encoder_2.requires_grad_(False)
     pipeline.transformer.requires_grad_(False)
 
     lora_layers = _install_condition_lora_processors(
@@ -1132,19 +1293,18 @@ def main() -> int:
         single_processor_cls=MultiSingleStreamBlockLoraProcessor,
         base_processor_cls=FluxAttnProcessor2_0,
     )
-    print(f"Installed SeeThrough3D condition LoRA processors on {len(lora_layers)} FLUX attention blocks.")
+    if accelerator.is_main_process:
+        print(f"Installed SeeThrough3D condition LoRA processors on {len(lora_layers)} FLUX attention blocks.")
 
-    graph_encoder = _load_graph_encoder(
-        path=args.init_graph_encoder,
-        text_hidden_dim=pipeline.text_encoder.config.hidden_size,
-        slot_dim=args.slot_dim,
-        gnn_layers=args.gnn_layers,
-        device=pipeline._graph_device,
-    )
     trainable_params = [p for p in pipeline.transformer.parameters() if p.requires_grad]
-    print(f"Trainable FLUX LoRA parameters: {sum(p.numel() for p in trainable_params) / 1_000_000:.2f}M")
+    if accelerator.is_main_process:
+        print(f"Trainable FLUX LoRA parameters: {sum(p.numel() for p in trainable_params) / 1_000_000:.2f}M")
     optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate)
-    scaler = torch.amp.GradScaler("cuda", enabled=device == "cuda" and args.mixed_precision == "fp16")
+    pipeline.transformer, optimizer, train_dataloader = accelerator.prepare(
+        pipeline.transformer,
+        optimizer,
+        train_dataloader,
+    )
     metrics_logger = MetricsLogger(
         args.output_dir,
         fieldnames=[
@@ -1159,9 +1319,14 @@ def main() -> int:
             "binding_mask_pct",
         ],
     )
-    _save_state(args.output_dir, step=0, args=args, lora_layers=lora_layers)
+    if accelerator.is_main_process:
+        _save_state(args.output_dir, step=0, args=args, lora_layers=lora_layers)
 
-    progress = tqdm(total=args.max_train_steps, disable=is_tqdm_disabled(args), desc="RelationFluxLoRA")
+    progress = tqdm(
+        total=args.max_train_steps,
+        disable=is_tqdm_disabled(args) or not accelerator.is_local_main_process,
+        desc="RelationFluxLoRA",
+    )
     global_step = 0
     micro_step = 0
     running = {
@@ -1177,62 +1342,74 @@ def main() -> int:
     optimizer.zero_grad(set_to_none=True)
     while global_step < args.max_train_steps:
         for batch in train_dataloader:
-            metrics = _compute_loss(
-                batch=batch,
-                pipeline=pipeline,
-                graph_encoder=graph_encoder,
-                device=device,
-                dtype=dtype,
-                image_size=args.image_size,
-                oscr_size=args.oscr_size,
-                guidance_scale=args.guidance_scale,
-                max_sequence_length=args.max_sequence_length,
-                condition_renderer=args.condition_renderer,
-                oscr_face_alpha=args.oscr_face_alpha,
-                oscr_azimuth_degrees=args.oscr_azimuth_degrees,
-                blender_bin=args.blender_bin,
-                blender_cache_dir=args.blender_cache_dir or (args.output_dir / "blender_condition_cache"),
-                prompt_prefix=args.prompt_prefix,
-            )
-            loss = metrics["loss"] / args.gradient_accumulation_steps
-            if scaler.is_enabled():
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
-            micro_step += 1
-            running_steps += 1
-            for key in running:
-                running[key] += float(metrics[key].item())
-            if micro_step % args.gradient_accumulation_steps == 0:
-                if scaler.is_enabled():
-                    scaler.step(optimizer)
-                    scaler.update()
+            with accelerator.accumulate(pipeline.transformer):
+                if use_precomputed_cache:
+                    metrics = _compute_cached_loss(
+                        batch=batch,
+                        pipeline=pipeline,
+                        device=device,
+                        dtype=dtype,
+                        guidance_scale=args.guidance_scale,
+                    )
                 else:
-                    optimizer.step()
+                    assert graph_encoder is not None
+                    metrics = _compute_loss(
+                        batch=batch,
+                        pipeline=pipeline,
+                        graph_encoder=graph_encoder,
+                        device=device,
+                        dtype=dtype,
+                        image_size=args.image_size,
+                        oscr_size=args.oscr_size,
+                        guidance_scale=args.guidance_scale,
+                        max_sequence_length=args.max_sequence_length,
+                        condition_renderer=args.condition_renderer,
+                        oscr_face_alpha=args.oscr_face_alpha,
+                        oscr_azimuth_degrees=args.oscr_azimuth_degrees,
+                        blender_bin=args.blender_bin,
+                        blender_cache_dir=args.blender_cache_dir or (args.output_dir / "blender_condition_cache"),
+                        prompt_prefix=args.prompt_prefix,
+                    )
+                loss = metrics["loss"]
+                accelerator.backward(loss)
+                optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+            micro_step += 1
+            if accelerator.sync_gradients:
                 global_step += 1
                 progress.update(1)
+                running_steps += 1
+                gathered_metrics = {
+                    key: accelerator.gather(metrics[key].detach().float().reshape(1)).mean().item()
+                    for key in running
+                }
+                for key in running:
+                    running[key] += gathered_metrics[key]
                 if global_step % args.log_every == 0:
                     train_log = {
                         "step": global_step,
                         "split": "train",
                         **{key: value / running_steps for key, value in running.items()},
                     }
-                    metrics_logger.log(train_log)
-                    progress.set_postfix(loss=f"{train_log['loss']:.4f}")
+                    if accelerator.is_main_process:
+                        metrics_logger.log(train_log)
+                    if accelerator.is_local_main_process:
+                        progress.set_postfix(loss=f"{train_log['loss']:.4f}")
                     running = {key: 0.0 for key in running}
                     running_steps = 0
-                if global_step % args.save_every == 0:
+                if accelerator.is_main_process and global_step % args.save_every == 0:
                     checkpoint = _save_checkpoint(
                         output_dir=args.output_dir,
                         step=global_step,
                         pipeline=pipeline,
                         graph_encoder=graph_encoder,
                         optimizer=optimizer,
+                        init_graph_encoder=args.init_graph_encoder,
+                        accelerator=accelerator,
                     )
                     _save_state(args.output_dir, step=global_step, args=args, lora_layers=lora_layers)
                     print(f"Saved FLUX LoRA checkpoint to {checkpoint}")
-                if args.eval_sample_count > 0 and global_step % args.eval_every == 0:
+                if accelerator.is_main_process and args.eval_sample_count > 0 and global_step % args.eval_every == 0:
                     if args.external_eval_gpu is not None:
                         checkpoint = _save_checkpoint(
                             output_dir=args.output_dir,
@@ -1240,6 +1417,8 @@ def main() -> int:
                             pipeline=pipeline,
                             graph_encoder=graph_encoder,
                             optimizer=optimizer,
+                            init_graph_encoder=args.init_graph_encoder,
+                            accelerator=accelerator,
                         )
                         _run_external_eval_samples(
                             step=global_step,
@@ -1249,34 +1428,42 @@ def main() -> int:
                             args=args,
                         )
                     else:
-                        _run_eval_samples(
-                            step=global_step,
-                            eval_dataset=datasets["eval"],
-                            pipeline=pipeline,
-                            graph_encoder=graph_encoder,
-                            output_dir=args.output_dir,
-                            device=device,
-                            dtype=dtype,
-                            image_size=args.image_size,
-                            oscr_size=args.oscr_size,
-                            guidance_scale=args.guidance_scale,
-                            max_sequence_length=args.max_sequence_length,
-                            condition_renderer=args.condition_renderer,
-                            oscr_face_alpha=args.oscr_face_alpha,
-                            oscr_azimuth_degrees=args.oscr_azimuth_degrees,
-                            prompt_prefix=args.prompt_prefix,
-                            sample_count=args.eval_sample_count,
-                            inference_steps=args.eval_inference_steps,
-                            seed=args.eval_sample_seed,
-                            eval_blender_oscr=args.eval_blender_oscr,
-                            blender_bin=args.blender_bin,
-                            blender_cache_dir=args.blender_cache_dir or (args.output_dir / "blender_condition_cache"),
-                            eval_blender_face_alpha=args.eval_blender_face_alpha,
+                        if use_precomputed_cache:
+                            print(
+                                "Skipping in-process eval samples for cached training. "
+                                "Use --external-eval-gpu to generate samples from checkpoints."
+                            )
+                        else:
+                            assert graph_encoder is not None
+                            _run_eval_samples(
+                                step=global_step,
+                                eval_dataset=datasets["eval"],
+                                pipeline=pipeline,
+                                graph_encoder=graph_encoder,
+                                output_dir=args.output_dir,
+                                device=device,
+                                dtype=dtype,
+                                image_size=args.image_size,
+                                oscr_size=args.oscr_size,
+                                guidance_scale=args.guidance_scale,
+                                max_sequence_length=args.max_sequence_length,
+                                condition_renderer=args.condition_renderer,
+                                oscr_face_alpha=args.oscr_face_alpha,
+                                oscr_azimuth_degrees=args.oscr_azimuth_degrees,
+                                prompt_prefix=args.prompt_prefix,
+                                sample_count=args.eval_sample_count,
+                                inference_steps=args.eval_inference_steps,
+                                seed=args.eval_sample_seed,
+                                eval_blender_oscr=args.eval_blender_oscr,
+                                blender_bin=args.blender_bin,
+                                blender_cache_dir=args.blender_cache_dir or (args.output_dir / "blender_condition_cache"),
+                                eval_blender_face_alpha=args.eval_blender_face_alpha,
+                            )
+                    if args.external_eval_gpu is not None or not use_precomputed_cache:
+                        print(
+                            "Saved eval samples to "
+                            f"{args.output_dir / 'eval_samples' / f'step-{global_step:06d}'}"
                         )
-                    print(
-                        "Saved eval samples to "
-                        f"{args.output_dir / 'eval_samples' / f'step-{global_step:06d}'}"
-                    )
                 if global_step >= args.max_train_steps:
                     break
         else:
@@ -1284,11 +1471,19 @@ def main() -> int:
         break
 
     final_dir = args.output_dir / "final"
-    final_dir.mkdir(parents=True, exist_ok=True)
-    _save_condition_lora_state(pipeline.transformer, final_dir / "flux_lora.pt")
-    torch.save(graph_encoder.state_dict(), final_dir / "graph_encoder.pt")
-    _save_state(args.output_dir, step=global_step, args=args, lora_layers=lora_layers)
-    print(f"Relation FLUX LoRA training finished at step {global_step}.")
+    if accelerator.is_main_process:
+        final_dir.mkdir(parents=True, exist_ok=True)
+        _save_condition_lora_state(
+            _unwrap_transformer(pipeline.transformer, accelerator),
+            final_dir / "flux_lora.pt",
+        )
+        if graph_encoder is not None:
+            torch.save(graph_encoder.state_dict(), final_dir / "graph_encoder.pt")
+        else:
+            shutil.copy2(args.init_graph_encoder, final_dir / "graph_encoder.pt")
+        _save_state(args.output_dir, step=global_step, args=args, lora_layers=lora_layers)
+        print(f"Relation FLUX LoRA training finished at step {global_step}.")
+    accelerator.wait_for_everyone()
     return 0
 
 

@@ -13,6 +13,7 @@ elif [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
 fi
 
 PYTHON_BIN="${PYTHON_BIN:-$DEFAULT_PYTHON}"
+CONFIG_FILE="${CONFIG_FILE:-}"
 DATASET_DIR="${DATASET_DIR:-$ROOT_DIR/data/scop_depth_crops_depth}"
 OUTPUT_DIR="${OUTPUT_DIR:-$ROOT_DIR/outputs/train/flux1dev_oscr_lora128}"
 INIT_GRAPH_ENCODER="${INIT_GRAPH_ENCODER:-$ROOT_DIR/outputs/train/graph_pretrain_flux_3dbox/final/graph_encoder.pt}"
@@ -40,6 +41,7 @@ EVAL_BLENDER_FACE_ALPHA="${EVAL_BLENDER_FACE_ALPHA:-0.25}"
 BLENDER_CACHE_DIR="${BLENDER_CACHE_DIR:-}"
 EXTERNAL_EVAL_GPU="${EXTERNAL_EVAL_GPU:-}"
 EXTERNAL_EVAL_PYTHON="${EXTERNAL_EVAL_PYTHON:-}"
+PRECOMPUTED_CACHE_DIR="${PRECOMPUTED_CACHE_DIR:-}"
 LOW_VRAM="${LOW_VRAM:-0}"
 GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-0}"
 CONDITION_RENDERER="${CONDITION_RENDERER:-seethrough}"
@@ -47,54 +49,62 @@ OSCR_FACE_ALPHA="${OSCR_FACE_ALPHA:-0.10}"
 OSCR_AZIMUTH_DEGREES="${OSCR_AZIMUTH_DEGREES:-0}"
 PROMPT_PREFIX="${PROMPT_PREFIX:-a photo of}"
 
-CMD=(
-  "$PYTHON_BIN" -m training.train_relation_flux_lora
-  --dataset-dir "$DATASET_DIR" \
-  --output-dir "$OUTPUT_DIR" \
-  --init-graph-encoder "$INIT_GRAPH_ENCODER" \
-  --model-id "$MODEL_ID" \
-  --device "$DEVICE" \
-  --mixed-precision "$MIXED_PRECISION" \
-  --image-size "$IMAGE_SIZE" \
-  --oscr-size "$OSCR_SIZE" \
-  --batch-size "$BATCH_SIZE" \
-  --gradient-accumulation-steps "$GRADIENT_ACCUMULATION_STEPS" \
-  --learning-rate "$LEARNING_RATE" \
-  --max-train-steps "$MAX_TRAIN_STEPS" \
-  --lora-rank "$LORA_RANK" \
-  --lora-alpha "$LORA_ALPHA" \
-  --flux-quantization "$FLUX_QUANTIZATION" \
-  --max-sequence-length "$MAX_SEQUENCE_LENGTH" \
-  --prompt-prefix "$PROMPT_PREFIX" \
-  --condition-renderer "$CONDITION_RENDERER" \
-  --oscr-face-alpha "$OSCR_FACE_ALPHA" \
-  --oscr-azimuth-degrees "$OSCR_AZIMUTH_DEGREES" \
-  --save-every "$SAVE_EVERY" \
-  --eval-every "$EVAL_EVERY" \
-  --eval-sample-count "$EVAL_SAMPLE_COUNT" \
-  --eval-inference-steps "$EVAL_INFERENCE_STEPS" \
-  --eval-sample-seed "$EVAL_SAMPLE_SEED" \
-  --blender-bin "$BLENDER_BIN" \
-  --eval-blender-face-alpha "$EVAL_BLENDER_FACE_ALPHA"
-)
+CMD=("$PYTHON_BIN" -m training.train_relation_flux_lora)
 
-if [[ "$LOW_VRAM" == "1" ]]; then
+if [[ -n "$CONFIG_FILE" ]]; then
+  exec "${CMD[@]}" --config "$CONFIG_FILE"
+else
+  CMD+=(
+    --dataset-dir "$DATASET_DIR" \
+    --output-dir "$OUTPUT_DIR" \
+    --init-graph-encoder "$INIT_GRAPH_ENCODER" \
+    --model-id "$MODEL_ID" \
+    --device "$DEVICE" \
+    --mixed-precision "$MIXED_PRECISION" \
+    --image-size "$IMAGE_SIZE" \
+    --oscr-size "$OSCR_SIZE" \
+    --batch-size "$BATCH_SIZE" \
+    --gradient-accumulation-steps "$GRADIENT_ACCUMULATION_STEPS" \
+    --learning-rate "$LEARNING_RATE" \
+    --max-train-steps "$MAX_TRAIN_STEPS" \
+    --lora-rank "$LORA_RANK" \
+    --lora-alpha "$LORA_ALPHA" \
+    --flux-quantization "$FLUX_QUANTIZATION" \
+    --max-sequence-length "$MAX_SEQUENCE_LENGTH" \
+    --prompt-prefix "$PROMPT_PREFIX" \
+    --condition-renderer "$CONDITION_RENDERER" \
+    --oscr-face-alpha "$OSCR_FACE_ALPHA" \
+    --oscr-azimuth-degrees "$OSCR_AZIMUTH_DEGREES" \
+    --save-every "$SAVE_EVERY" \
+    --eval-every "$EVAL_EVERY" \
+    --eval-sample-count "$EVAL_SAMPLE_COUNT" \
+    --eval-inference-steps "$EVAL_INFERENCE_STEPS" \
+    --eval-sample-seed "$EVAL_SAMPLE_SEED" \
+    --blender-bin "$BLENDER_BIN" \
+    --eval-blender-face-alpha "$EVAL_BLENDER_FACE_ALPHA"
+  )
+fi
+
+if [[ -z "$CONFIG_FILE" && "$LOW_VRAM" == "1" ]]; then
   CMD+=(--low-vram)
 fi
-if [[ "$GRADIENT_CHECKPOINTING" == "1" ]]; then
+if [[ -z "$CONFIG_FILE" && "$GRADIENT_CHECKPOINTING" == "1" ]]; then
   CMD+=(--gradient-checkpointing)
 fi
-if [[ "$EVAL_BLENDER_OSCR" == "1" ]]; then
+if [[ -z "$CONFIG_FILE" && "$EVAL_BLENDER_OSCR" == "1" ]]; then
   CMD+=(--eval-blender-oscr)
 fi
-if [[ -n "$BLENDER_CACHE_DIR" ]]; then
+if [[ -z "$CONFIG_FILE" && -n "$BLENDER_CACHE_DIR" ]]; then
   CMD+=(--blender-cache-dir "$BLENDER_CACHE_DIR")
 fi
-if [[ -n "$EXTERNAL_EVAL_GPU" ]]; then
+if [[ -z "$CONFIG_FILE" && -n "$EXTERNAL_EVAL_GPU" ]]; then
   CMD+=(--external-eval-gpu "$EXTERNAL_EVAL_GPU")
 fi
-if [[ -n "$EXTERNAL_EVAL_PYTHON" ]]; then
+if [[ -z "$CONFIG_FILE" && -n "$EXTERNAL_EVAL_PYTHON" ]]; then
   CMD+=(--external-eval-python "$EXTERNAL_EVAL_PYTHON")
+fi
+if [[ -z "$CONFIG_FILE" && -n "$PRECOMPUTED_CACHE_DIR" ]]; then
+  CMD+=(--precomputed-cache-dir "$PRECOMPUTED_CACHE_DIR")
 fi
 
 "${CMD[@]}" "$@"
