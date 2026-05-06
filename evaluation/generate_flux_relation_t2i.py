@@ -225,7 +225,11 @@ def _load_pipeline(args: argparse.Namespace, device: str, dtype: torch.dtype) ->
     if args.low_vram:
         pipeline.text_encoder.to("cpu")
         pipeline.text_encoder_2.to("cpu")
-        pipeline.vae.to("cpu")
+        # SeeThrough3D encodes spatial_images inside pipeline.__call__ after
+        # moving them to the execution device, so the VAE must stay there too.
+        # Keeping only the text encoders on CPU preserves most of the low-VRAM
+        # benefit without triggering CPU/CUDA conv mismatches.
+        pipeline.vae.to(device=device, dtype=dtype)
         if quantization_config is None:
             pipeline.transformer.to(device=device, dtype=dtype)
     else:
