@@ -45,6 +45,7 @@ def build_expected_manifest(args: Any, *, graph_sha256: str, dtype_name: str) ->
         "init_graph_encoder_sha256": graph_sha256,
         "image_size": args.image_size,
         "oscr_size": args.oscr_size,
+        "oscr_render_size": getattr(args, "oscr_render_size", None),
         "condition_renderer": args.condition_renderer,
         "oscr_face_alpha": args.oscr_face_alpha,
         "oscr_azimuth_degrees": args.oscr_azimuth_degrees,

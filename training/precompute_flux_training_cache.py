@@ -47,6 +47,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--condition-renderer", choices=("seethrough", "legacy", "blender"), default="seethrough")
     parser.add_argument("--oscr-face-alpha", type=float, default=0.10)
     parser.add_argument("--oscr-azimuth-degrees", type=float, default=0.0)
+    parser.add_argument("--oscr-render-size", type=int, default=None)
     parser.add_argument("--blender-bin", type=str, default="blender")
     parser.add_argument("--blender-cache-dir", type=Path, default=None)
     parser.add_argument("--limit-rows", type=int, default=None)
@@ -109,6 +110,7 @@ def _precompute_batch(
         device=device,
         dtype=model_dtype,
         oscr_size=args.oscr_size,
+        oscr_render_size=args.oscr_render_size,
         condition_renderer=args.condition_renderer,
         oscr_face_alpha=args.oscr_face_alpha,
         oscr_azimuth_degrees=args.oscr_azimuth_degrees,

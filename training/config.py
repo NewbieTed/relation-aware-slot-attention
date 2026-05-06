@@ -13,11 +13,11 @@ def _load_raw_config(path: Path) -> dict[str, Any]:
     if suffix in {".yaml", ".yml"}:
         try:
             import yaml
-        except ModuleNotFoundError as exc:
-            raise ModuleNotFoundError(
-                "YAML config files require PyYAML. Use JSON or install pyyaml."
-            ) from exc
-        loaded = yaml.safe_load(path.read_text())
+            loaded = yaml.safe_load(path.read_text())
+        except ModuleNotFoundError:
+            from ruamel.yaml import YAML
+
+            loaded = YAML(typ="safe").load(path.read_text())
         return loaded or {}
     raise ValueError(f"Unsupported config file extension: {path}. Use .json, .yaml, or .yml.")
 

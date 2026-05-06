@@ -22,6 +22,7 @@ DEVICE="${DEVICE:-auto}"
 MIXED_PRECISION="${MIXED_PRECISION:-bf16}"
 IMAGE_SIZE="${IMAGE_SIZE:-512}"
 OSCR_SIZE="${OSCR_SIZE:-512}"
+OSCR_RENDER_SIZE="${OSCR_RENDER_SIZE:-}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
 LEARNING_RATE="${LEARNING_RATE:-1e-5}"
@@ -90,6 +91,9 @@ if [[ -z "$CONFIG_FILE" && "$LOW_VRAM" == "1" ]]; then
 fi
 if [[ -z "$CONFIG_FILE" && "$GRADIENT_CHECKPOINTING" == "1" ]]; then
   CMD+=(--gradient-checkpointing)
+fi
+if [[ -z "$CONFIG_FILE" && -n "$OSCR_RENDER_SIZE" ]]; then
+  CMD+=(--oscr-render-size "$OSCR_RENDER_SIZE")
 fi
 if [[ -z "$CONFIG_FILE" && "$EVAL_BLENDER_OSCR" == "1" ]]; then
   CMD+=(--eval-blender-oscr)

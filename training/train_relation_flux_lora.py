@@ -100,6 +100,12 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--condition-renderer", choices=("seethrough", "legacy", "blender"), default="seethrough")
     parser.add_argument("--oscr-face-alpha", type=float, default=0.10)
     parser.add_argument("--oscr-azimuth-degrees", type=float, default=0.0)
+    parser.add_argument(
+        "--oscr-render-size",
+        type=int,
+        default=None,
+        help="Optional high-resolution OSCR render size before resizing to --oscr-size for VAE encoding.",
+    )
     parser.add_argument("--limit-rows", type=int, default=None)
     parser.add_argument("--eval-fraction", type=float, default=0.1)
     parser.add_argument("--test-fraction", type=float, default=0.1)
@@ -136,6 +142,7 @@ def _save_state(output_dir: Path, *, step: int, args: argparse.Namespace, lora_l
         "flux_quantization": args.flux_quantization,
         "lora_layers": lora_layers,
         "oscr_size": args.oscr_size,
+        "oscr_render_size": args.oscr_render_size,
         "condition_renderer": args.condition_renderer,
         "oscr_face_alpha": args.oscr_face_alpha,
         "oscr_azimuth_degrees": args.oscr_azimuth_degrees,
@@ -500,6 +507,7 @@ def _build_condition_latents(
     device: str,
     dtype: torch.dtype,
     oscr_size: int,
+    oscr_render_size: int | None,
     condition_renderer: str,
     oscr_face_alpha: float,
     oscr_azimuth_degrees: float,
@@ -513,12 +521,13 @@ def _build_condition_latents(
         device=device,
     )
     cond_token_grid = (oscr_size // 16, oscr_size // 16)
+    render_size = oscr_render_size or oscr_size
     if condition_renderer == "seethrough":
         oscr, cuboid_masks = render_seethrough_oscr_and_masks(
             centers=centers,
             log_sizes=log_sizes,
             slot_mask=slot_mask,
-            image_size=oscr_size,
+            image_size=render_size,
             mask_size=cond_token_grid,
             face_alpha=oscr_face_alpha,
             azimuth_degrees=oscr_azimuth_degrees,
@@ -530,7 +539,7 @@ def _build_condition_latents(
             slot_mask=slot_mask,
             scene_graphs=batch["scene_graphs"],
             prompts=batch["prompts"],
-            image_size=oscr_size,
+            image_size=render_size,
             face_alpha=oscr_face_alpha,
             azimuth_degrees=oscr_azimuth_degrees,
             blender_bin=blender_bin,
@@ -561,6 +570,8 @@ def _build_condition_latents(
             face_alpha=oscr_face_alpha,
             azimuth_degrees=oscr_azimuth_degrees,
         )
+    if oscr.shape[-1] != oscr_size or oscr.shape[-2] != oscr_size:
+        oscr = F.interpolate(oscr, size=(oscr_size, oscr_size), mode="bicubic", align_corners=False).clamp(-1.0, 1.0)
     cond_latents, cond_ids, cond_grid = _encode_packed_latents(
         pipeline=pipeline,
         images=oscr,
@@ -580,6 +591,7 @@ def _compute_loss(
     dtype: torch.dtype,
     image_size: int,
     oscr_size: int,
+    oscr_render_size: int | None,
     guidance_scale: float,
     max_sequence_length: int,
     condition_renderer: str,
@@ -606,6 +618,7 @@ def _compute_loss(
             device=device,
             dtype=dtype,
             oscr_size=oscr_size,
+            oscr_render_size=oscr_render_size,
             condition_renderer=condition_renderer,
             oscr_face_alpha=oscr_face_alpha,
             oscr_azimuth_degrees=oscr_azimuth_degrees,
@@ -807,6 +820,7 @@ def _run_eval_samples(
     dtype: torch.dtype,
     image_size: int,
     oscr_size: int,
+    oscr_render_size: int | None,
     guidance_scale: float,
     max_sequence_length: int,
     condition_renderer: str,
@@ -869,12 +883,13 @@ def _run_eval_samples(
         log_sizes = conditioning.slot_log_sizes_3d.to(device)
         slot_mask = conditioning.slot_mask.to(device)
         cond_grid = (oscr_size // 16, oscr_size // 16)
+        render_size = oscr_render_size or oscr_size
         if condition_renderer == "seethrough":
             oscr, cuboids_segmasks = render_seethrough_oscr_and_masks(
                 centers=centers,
                 log_sizes=log_sizes,
                 slot_mask=slot_mask,
-                image_size=oscr_size,
+                image_size=render_size,
                 mask_size=cond_grid,
                 face_alpha=oscr_face_alpha,
                 azimuth_degrees=oscr_azimuth_degrees,
@@ -883,7 +898,7 @@ def _run_eval_samples(
                 centers=centers,
                 log_sizes=log_sizes,
                 slot_mask=slot_mask,
-                image_size=oscr_size,
+                image_size=render_size,
                 mask_size=cond_grid,
                 face_alpha=max(oscr_face_alpha, 0.25),
                 azimuth_degrees=oscr_azimuth_degrees,
@@ -895,7 +910,7 @@ def _run_eval_samples(
                 slot_mask=slot_mask,
                 scene_graphs=[item.scene_graph],
                 prompts=[item.prompt],
-                image_size=oscr_size,
+                image_size=render_size,
                 face_alpha=oscr_face_alpha,
                 azimuth_degrees=oscr_azimuth_degrees,
                 blender_bin=blender_bin,
@@ -907,7 +922,7 @@ def _run_eval_samples(
                 slot_mask=slot_mask,
                 scene_graphs=[item.scene_graph],
                 prompts=[item.prompt],
-                image_size=oscr_size,
+                image_size=render_size,
                 face_alpha=max(oscr_face_alpha, eval_blender_face_alpha),
                 azimuth_degrees=oscr_azimuth_degrees,
                 blender_bin=blender_bin,
@@ -960,6 +975,14 @@ def _run_eval_samples(
                 device=device,
             )
         ]
+        oscr_for_model = oscr
+        if oscr_for_model.shape[-1] != oscr_size or oscr_for_model.shape[-2] != oscr_size:
+            oscr_for_model = F.interpolate(
+                oscr_for_model,
+                size=(oscr_size, oscr_size),
+                mode="bicubic",
+                align_corners=False,
+            ).clamp(-1.0, 1.0)
         generator_device = getattr(pipeline, "_execution_device", torch.device(device))
         generator_device = torch.device(generator_device)
         generator = (
@@ -988,7 +1011,7 @@ def _run_eval_samples(
             guidance_scale=guidance_scale,
             generator=generator,
             max_sequence_length=max_sequence_length,
-            spatial_images=[_tensor_to_pil(oscr[0])],
+            spatial_images=[_tensor_to_pil(oscr_for_model[0])],
             subject_images=[],
             cond_size=oscr_size,
             call_ids=call_ids,
@@ -998,7 +1021,7 @@ def _run_eval_samples(
         oscr_path = sample_dir / f"sample_{sample_index:02d}_oscr.png"
         oscr_viz_path = sample_dir / f"sample_{sample_index:02d}_oscr_viz.png"
         image.save(image_path)
-        _tensor_to_pil(oscr[0]).save(oscr_path)
+        _tensor_to_pil(oscr_for_model[0]).save(oscr_path)
         _tensor_to_pil(oscr_viz[0]).save(oscr_viz_path)
         labels = [str(node["label"]).replace("_", " ") for node in item.scene_graph["nodes"]]
         records.append(
@@ -1112,6 +1135,8 @@ def _run_external_eval_samples(
         str(args.image_size),
         "--oscr-size",
         str(args.oscr_size),
+        "--oscr-render-size",
+        str(args.oscr_render_size or args.oscr_size),
         "--num-inference-steps",
         str(args.eval_inference_steps),
         "--guidance-scale",
@@ -1361,6 +1386,7 @@ def main() -> int:
                         dtype=dtype,
                         image_size=args.image_size,
                         oscr_size=args.oscr_size,
+                        oscr_render_size=args.oscr_render_size,
                         guidance_scale=args.guidance_scale,
                         max_sequence_length=args.max_sequence_length,
                         condition_renderer=args.condition_renderer,
@@ -1445,6 +1471,7 @@ def main() -> int:
                                 dtype=dtype,
                                 image_size=args.image_size,
                                 oscr_size=args.oscr_size,
+                                oscr_render_size=args.oscr_render_size,
                                 guidance_scale=args.guidance_scale,
                                 max_sequence_length=args.max_sequence_length,
                                 condition_renderer=args.condition_renderer,

@@ -23,6 +23,7 @@ MIXED_PRECISION="${MIXED_PRECISION:-bf16}"
 CACHE_DTYPE="${CACHE_DTYPE:-bf16}"
 IMAGE_SIZE="${IMAGE_SIZE:-512}"
 OSCR_SIZE="${OSCR_SIZE:-512}"
+OSCR_RENDER_SIZE="${OSCR_RENDER_SIZE:-}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 MAX_SEQUENCE_LENGTH="${MAX_SEQUENCE_LENGTH:-512}"
 CONDITION_RENDERER="${CONDITION_RENDERER:-seethrough}"
@@ -60,6 +61,9 @@ fi
 
 if [[ -z "$CONFIG_FILE" && -n "$BLENDER_CACHE_DIR" ]]; then
   CMD+=(--blender-cache-dir "$BLENDER_CACHE_DIR")
+fi
+if [[ -z "$CONFIG_FILE" && -n "$OSCR_RENDER_SIZE" ]]; then
+  CMD+=(--oscr-render-size "$OSCR_RENDER_SIZE")
 fi
 if [[ -z "$CONFIG_FILE" && "$OVERWRITE" == "1" ]]; then
   CMD+=(--overwrite)

@@ -1,6 +1,6 @@
 paths:
   dataset_dir: /local1/cse_481_m_l/relation-aware-slot-attention/data/scop_depth_crops_depth
-  cache_dir: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/cache/flux_blender_oscr_384_256_bf16
+  cache_dir: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/cache/flux_blender_oscr_render512_384_256_bf16
   init_graph_encoder: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/train/graph_pretrain_flux_3dbox_gpu7/final/graph_encoder.pt
 
 model:
@@ -30,7 +30,8 @@ cache:
 
 rendering:
   condition_renderer: blender
+  oscr_render_size: 512
   oscr_face_alpha: 0.0025
   oscr_azimuth_degrees: 0.0
   blender_bin: /local1/cse_481_m_l/blender/blender-3.6.19-linux-x64/blender
-  blender_cache_dir: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/cache/blender_oscr_precompute_384_256
+  blender_cache_dir: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/cache/blender_oscr_precompute_render512_384_256

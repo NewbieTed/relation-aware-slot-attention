@@ -24,6 +24,7 @@ FLUX_QUANTIZATION="${FLUX_QUANTIZATION:-4bit}"
 LOW_VRAM="${LOW_VRAM:-1}"
 IMAGE_SIZE="${IMAGE_SIZE:-384}"
 OSCR_SIZE="${OSCR_SIZE:-256}"
+OSCR_RENDER_SIZE="${OSCR_RENDER_SIZE:-}"
 NUM_INFERENCE_STEPS="${NUM_INFERENCE_STEPS:-28}"
 GUIDANCE_SCALE="${GUIDANCE_SCALE:-3.5}"
 MAX_SEQUENCE_LENGTH="${MAX_SEQUENCE_LENGTH:-128}"
@@ -89,6 +90,9 @@ if [[ "$LOW_VRAM" == "1" ]]; then
 fi
 if [[ -n "$LIMIT_PROMPTS" ]]; then
   GEN_CMD+=(--limit-prompts "$LIMIT_PROMPTS")
+fi
+if [[ -n "$OSCR_RENDER_SIZE" ]]; then
+  GEN_CMD+=(--oscr-render-size "$OSCR_RENDER_SIZE")
 fi
 if [[ -n "$BLENDER_CACHE_DIR" ]]; then
   GEN_CMD+=(--blender-cache-dir "$BLENDER_CACHE_DIR")

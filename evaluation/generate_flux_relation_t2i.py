@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 from evaluation.prompt_parser import parse_prompt_to_scene_graph
@@ -60,6 +61,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--condition-renderer", choices=("seethrough", "legacy", "blender"), default="seethrough")
     parser.add_argument("--oscr-face-alpha", type=float, default=0.10)
     parser.add_argument("--oscr-azimuth-degrees", type=float, default=0.0)
+    parser.add_argument("--oscr-render-size", type=int, default=None)
     parser.add_argument("--blender-bin", type=str, default="blender")
     parser.add_argument("--blender-cache-dir", type=Path, default=None)
     parser.add_argument("--prompt-prefix", type=str, default="a photo of")
@@ -213,6 +215,7 @@ def _predict_condition(
     graph_encoder: GraphSlotEncoder,
     device: str,
     oscr_size: int,
+    oscr_render_size: int | None,
     max_sequence_length: int,
     condition_renderer: str,
     oscr_face_alpha: float,
@@ -238,12 +241,13 @@ def _predict_condition(
     log_sizes = conditioning.slot_log_sizes_3d.to(device)
     slot_mask = conditioning.slot_mask.to(device)
     cond_grid = (oscr_size // 16, oscr_size // 16)
+    render_size = oscr_render_size or oscr_size
     if condition_renderer == "seethrough":
         oscr, cuboids_segmasks = render_seethrough_oscr_and_masks(
             centers=centers,
             log_sizes=log_sizes,
             slot_mask=slot_mask,
-            image_size=oscr_size,
+            image_size=render_size,
             mask_size=cond_grid,
             face_alpha=oscr_face_alpha,
             azimuth_degrees=oscr_azimuth_degrees,
@@ -252,7 +256,7 @@ def _predict_condition(
             centers=centers,
             log_sizes=log_sizes,
             slot_mask=slot_mask,
-            image_size=oscr_size,
+            image_size=render_size,
             mask_size=cond_grid,
             face_alpha=max(oscr_face_alpha, 0.25),
             azimuth_degrees=oscr_azimuth_degrees,
@@ -264,7 +268,7 @@ def _predict_condition(
             slot_mask=slot_mask,
             scene_graphs=[scene_graph],
             prompts=[prompt],
-            image_size=oscr_size,
+            image_size=render_size,
             face_alpha=oscr_face_alpha,
             azimuth_degrees=oscr_azimuth_degrees,
             blender_bin=blender_bin,
@@ -276,7 +280,7 @@ def _predict_condition(
             slot_mask=slot_mask,
             scene_graphs=[scene_graph],
             prompts=[prompt],
-            image_size=oscr_size,
+            image_size=render_size,
             face_alpha=max(oscr_face_alpha, 0.25),
             azimuth_degrees=oscr_azimuth_degrees,
             blender_bin=blender_bin,
@@ -330,6 +334,14 @@ def _predict_condition(
         )
     ]
     cuboids_segmasks = cuboids_segmasks.to(device=device, dtype=torch.uint8)
+    oscr_for_model = oscr
+    if oscr_for_model.shape[-1] != oscr_size or oscr_for_model.shape[-2] != oscr_size:
+        oscr_for_model = F.interpolate(
+            oscr_for_model,
+            size=(oscr_size, oscr_size),
+            mode="bicubic",
+            align_corners=False,
+        ).clamp(-1.0, 1.0)
     layout = {
         "prompt": prompt,
         "binding_prompt": binding_prompt.prompt,
@@ -340,7 +352,7 @@ def _predict_condition(
         "binding_token_count": sum(len(ids) for sample in call_ids for ids in sample),
         "binding_mask_pct": float(cuboids_segmasks.float().mean().mul(100.0).item()),
     }
-    return _tensor_to_pil(oscr[0]), _tensor_to_pil(oscr_viz[0]), binding_prompt.prompt, call_ids, cuboids_segmasks, layout
+    return _tensor_to_pil(oscr_for_model[0]), _tensor_to_pil(oscr_viz[0]), binding_prompt.prompt, call_ids, cuboids_segmasks, layout
 
 
 def main() -> int:
@@ -377,6 +389,7 @@ def main() -> int:
             graph_encoder=graph_encoder,
             device=device,
             oscr_size=args.oscr_size,
+            oscr_render_size=args.oscr_render_size,
             max_sequence_length=args.max_sequence_length,
             condition_renderer=args.condition_renderer,
             oscr_face_alpha=args.oscr_face_alpha,
@@ -447,6 +460,7 @@ def main() -> int:
         "samples_per_prompt": args.samples_per_prompt,
         "image_size": args.image_size,
         "oscr_size": args.oscr_size,
+        "oscr_render_size": args.oscr_render_size,
         "num_inference_steps": args.num_inference_steps,
         "guidance_scale": args.guidance_scale,
         "max_sequence_length": args.max_sequence_length,
