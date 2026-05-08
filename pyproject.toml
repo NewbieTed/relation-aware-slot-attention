@@ -25,9 +25,6 @@ eval = [
 ]
 train = [
   "accelerate>=0.34.0",
-  "diffusers>=0.30.0",
-  "einops>=0.7.0",
-  "safetensors>=0.4.5",
 ]
 flux = [
   "accelerate>=0.34.0",
@@ -40,7 +37,6 @@ flux = [
 [project.scripts]
 scop-depth = "scop_depth.__main__:main"
 scop-depth-train-graph = "training.pretrain_graph_encoder:main"
-scop-depth-train-flux-lora = "training.train_relation_flux_lora:main"
 scop-depth-generate-flux-relation = "evaluation.generate_flux_relation:main"
 
 [tool.setuptools]

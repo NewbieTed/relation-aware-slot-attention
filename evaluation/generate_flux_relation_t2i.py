@@ -14,6 +14,14 @@ from tqdm.auto import tqdm
 
 from evaluation.prompt_parser import parse_prompt_to_scene_graph
 from training.config import parse_args_with_config
+from training.flux_inference_runtime import (
+    build_flux_quantization_config,
+    import_seethrough3d_flux,
+    install_condition_lora_processors,
+    pipeline_execution_device,
+    set_pipeline_execution_device,
+    text_encoder_device,
+)
 from training.graph_modules import GraphSlotEncoder, build_slot_conditioning
 from training.oscr_renderer import render_oscr_boxes
 from training.runtime import (
@@ -29,11 +37,6 @@ from training.seethrough_condition import (
     call_ids_from_binding_prompt,
     render_blender_oscr_conditions,
     render_seethrough_oscr_and_masks,
-)
-from training.train_relation_flux_lora import (
-    _build_flux_quantization_config,
-    _import_seethrough3d_flux,
-    _install_condition_lora_processors,
 )
 
 OFFICIAL_SEETHROUGH3D_LORA_REPO = "va1bhavagrawa1/seethrough3d-flux.1-weights"
@@ -213,10 +216,10 @@ def _load_pipeline(args: argparse.Namespace, device: str, dtype: torch.dtype) ->
         MultiDoubleStreamBlockLoraProcessor,
         MultiSingleStreamBlockLoraProcessor,
         FluxAttnProcessor2_0,
-    ) = _import_seethrough3d_flux()
+    ) = import_seethrough3d_flux()
 
     pipeline = FluxPipeline.from_pretrained(args.model_id, transformer=None, torch_dtype=dtype)
-    quantization_config = _build_flux_quantization_config(args.flux_quantization, dtype)
+    quantization_config = build_flux_quantization_config(args.flux_quantization, dtype)
     transformer_kwargs: dict[str, Any] = {"subfolder": "transformer", "torch_dtype": dtype}
     if quantization_config is not None:
         transformer_kwargs["quantization_config"] = quantization_config
@@ -257,7 +260,7 @@ def _load_pipeline(args: argparse.Namespace, device: str, dtype: torch.dtype) ->
     if args.use_official_seethrough3d_lora and inferred_rank is not None:
         lora_alpha = float(inferred_rank)
 
-    _install_condition_lora_processors(
+    install_condition_lora_processors(
         transformer=pipeline.transformer,
         rank=lora_rank,
         alpha=lora_alpha,
@@ -274,48 +277,8 @@ def _load_pipeline(args: argparse.Namespace, device: str, dtype: torch.dtype) ->
         f"(missing={len(incompatible.missing_keys)}, unexpected={len(incompatible.unexpected_keys)})."
     )
     pipeline.transformer.eval()
-    _set_pipeline_execution_device(pipeline, device)
+    set_pipeline_execution_device(pipeline, device)
     return pipeline, quantization_config
-
-
-def _pipeline_execution_device(pipeline: Any, fallback: str) -> torch.device:
-    execution_device = getattr(pipeline, "_execution_device", None)
-    if execution_device is None:
-        return torch.device(fallback)
-    return torch.device(execution_device)
-
-
-def _set_pipeline_execution_device(pipeline: Any, device: str) -> None:
-    """Force SeeThrough3D FLUX to prepare inference latents on the transformer device."""
-
-    forced_device = torch.device(device)
-    object.__setattr__(pipeline, "_forced_execution_device", forced_device)
-    if getattr(pipeline.__class__, "_relation_forced_execution_device", False):
-        return
-
-    base_cls = pipeline.__class__
-
-    class ForcedExecutionDevicePipeline(base_cls):  # type: ignore[misc, valid-type]
-        _relation_forced_execution_device = True
-
-        @property
-        def _execution_device(self) -> torch.device:  # type: ignore[override]
-            forced = getattr(self, "_forced_execution_device", None)
-            if forced is not None:
-                return torch.device(forced)
-            return super()._execution_device
-
-    object.__setattr__(pipeline, "__class__", ForcedExecutionDevicePipeline)
-
-
-def _text_encoder_device(pipeline: Any) -> torch.device:
-    """Return the real text-encoder device for low-VRAM prompt pre-encoding."""
-
-    try:
-        return next(pipeline.text_encoder.parameters()).device
-    except StopIteration:
-        return torch.device("cpu")
-
 
 @torch.no_grad()
 def _predict_condition(
@@ -518,7 +481,7 @@ def main() -> int:
         oscr_viz_name = f"{prompt_name}_oscr_viz.png"
         oscr_viz_image.save(condition_dir / oscr_viz_name)
         layout["oscr_viz_file"] = str(Path("conditions") / oscr_viz_name)
-        encoder_device = _text_encoder_device(pipeline)
+        encoder_device = text_encoder_device(pipeline)
         prompt_embeds, pooled_prompt_embeds, _text_ids = pipeline.encode_prompt(
             prompt=binding_prompt,
             prompt_2=binding_prompt,
@@ -530,7 +493,7 @@ def main() -> int:
         pooled_prompt_embeds = pooled_prompt_embeds.to(device=device, dtype=dtype)
         for repeat_index in range(args.samples_per_prompt):
             seed = args.seed + prompt_index * args.samples_per_prompt + repeat_index
-            generator_device = _pipeline_execution_device(pipeline, device)
+            generator_device = pipeline_execution_device(pipeline, device)
             generator = (
                 torch.Generator(device=generator_device).manual_seed(seed)
                 if generator_device.type != "mps"

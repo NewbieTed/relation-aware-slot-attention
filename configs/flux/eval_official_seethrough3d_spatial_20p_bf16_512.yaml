@@ -5,7 +5,7 @@ generate:
   model_id: black-forest-labs/FLUX.1-dev
   device: cuda
   mixed_precision: bf16
-  flux_quantization: none
+  flux_quantization: 8bit
   low_vram: true
   image_size: 512
   oscr_size: 512
