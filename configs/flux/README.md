@@ -1,0 +1,31 @@
+# FLUX Configs
+
+This directory contains configs for the current FLUX branch. The active path is:
+train/debug the GNN, render GNN-predicted 3D cuboids into OSCR conditions, then
+run inference with the released SeeThrough3D FLUX LoRA.
+
+## Files
+
+- `gnn_pretrain_3dbox.yaml`: trains the GNN on SCOP-Depth 3D layout targets.
+- `eval_official_seethrough3d_spatial_1p_bf16_512.yaml`: one-prompt smoke eval.
+- `eval_official_seethrough3d_spatial_20p_bf16_512.yaml`: short benchmark sanity check.
+- `eval_official_seethrough3d_spatial_full_bf16_8bit_512.yaml`: full spatial benchmark run.
+
+## Examples
+
+Train the GNN:
+
+```bash
+python3 -m training.pretrain_graph_encoder \
+  --config configs/flux/gnn_pretrain_3dbox.yaml
+```
+
+Run the one-prompt SeeThrough3D smoke benchmark:
+
+```bash
+CONFIG_FILE=configs/flux/eval_official_seethrough3d_spatial_1p_bf16_512.yaml \
+bash scripts/benchmark/run_flux_relation_t2icompbench.sh
+```
+
+On the 24GB tomago GPUs, the working FLUX inference setting is currently
+`bf16` plus `8bit` transformer quantization with `512` image and OSCR sizes.
