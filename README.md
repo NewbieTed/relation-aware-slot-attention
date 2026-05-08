@@ -1,63 +1,100 @@
 # relation-aware-slot-attention
 
-This workspace currently contains `SCOP-Depth`, a depth-augmented variant of the SCOP data pipeline used to extract 2D, depth-order, and occlusion-style relations from COCO.
+This branch is the FLUX.1-dev version of the project. It keeps the SCOP-Depth
+data pipeline and relation-aware GNN, then uses the GNN to predict 3D object
+centers and box sizes. Those predictions are rendered into SeeThrough3D-style
+OSCR condition images, VAE-encoded as FLUX condition latents, and consumed by
+the released SeeThrough3D FLUX LoRA during inference.
 
-The implementation lives in [scop_depth](/Users/newbieted/workspace/relation-aware-slot-attention/scop_depth), and the module path is `scop_depth`.
+The current research focus is no longer FLUX fine-tuning. We train and debug the
+GNN/layout side, then evaluate whether GNN-generated OSCR conditions improve a
+strong pretrained FLUX+SeeThrough3D generator. This direction produced the first
+clear benchmark gain: T2I-CompBench spatial improved from the FLUX baseline
+around `0.24` to the GNN-generated OSCR + SeeThrough3D path around `0.37`.
 
-For evaluation, this repo now keeps only our wrapper scripts and a lightweight
-override layer. External benchmark code such as T2I-CompBench should be prepared
-outside the tracked source tree with:
+## Setup
+
+Run the full bootstrap:
 
 ```bash
 ./scripts/setup/bootstrap_all.sh
 ```
 
-This creates a local `.venv`, installs the repo and evaluation dependencies,
-prepares the external T2I-CompBench checkout, and downloads the benchmark
-weights.
+This creates `.venv`, installs the repo with FLUX/evaluation dependencies, clones
+SeeThrough3D into `external/seethrough3d`, and prepares optional benchmark
+checkouts. The FLUX generation code directly imports SeeThrough3D's FLUX
+transformer fork and custom LoRA attention processors.
 
-If you previously used an older bootstrap version that created
-`scripts/.venv`, remove that stale environment first.
-
-## Training Baseline
-
-The repo now also contains a first training scaffold for a vanilla Stable
-Diffusion 1.5 LoRA baseline on SCOP-Depth.
-
-Key pieces:
-
-- [`training/dataset.py`](/Users/newbieted/workspace/relation-aware-slot-attention/training/dataset.py):
-  loads `metadata.jsonl`, images, prompts, and serialized scene-graph metadata
-- [`training/prompts.py`](/Users/newbieted/workspace/relation-aware-slot-attention/training/prompts.py):
-  builds concise baseline prompts from SCOP-Depth relations
-- [`training/train_sd15_lora.py`](/Users/newbieted/workspace/relation-aware-slot-attention/training/train_sd15_lora.py):
-  trains SD1.5 LoRA attention processors on the exported dataset
-- [`scripts/train/run_sd15_lora_baseline.sh`](/Users/newbieted/workspace/relation-aware-slot-attention/scripts/train/run_sd15_lora_baseline.sh):
-  thin shell wrapper for launching the baseline trainer
-
-Example:
+If you only need the SeeThrough3D checkout:
 
 ```bash
-./.venv/bin/python -m pip install -e ".[train]"
-
-DATASET_DIR=/path/to/scop_depth_full \
-OUTPUT_DIR=outputs/train/sd15_scopdepth_lora \
-DEVICE=cuda \
-MAX_TRAIN_STEPS=1000 \
-./scripts/train/run_sd15_lora_baseline.sh
+./scripts/setup/setup_seethrough3d_checkout.sh
 ```
 
-This baseline intentionally keeps the model text-only at conditioning time while
-still carrying scene-graph metadata through the dataloader so the next stage can
-replace or augment text conditioning with graph-aware slots.
+## Current Workflow
 
-If `metadata.jsonl` exists but `data/scop_depth_full/images/` is missing because
-the original COCO tree was moved or deleted, you can rebuild just the referenced
-image subset without rerunning SCOP-Depth:
+1. Build SCOP-Depth cropped/depth data.
+2. Pretrain the GNN with position, relation, and 3D box-size losses.
+3. Use the frozen GNN to predict 3D boxes for new prompts.
+4. Render GNN-predicted 3D boxes into OSCR condition images.
+5. Run FLUX.1-dev inference with the official SeeThrough3D LoRA.
+6. Benchmark/debug generated images and OSCR conditions.
+
+Example GNN training:
 
 ```bash
-./.venv/bin/python -m training.materialize_images \
-  --dataset-dir /path/to/scop_depth_full \
-  --coco-root /path/to/coco2017 \
-  --mode symlink
+python3 -m training.pretrain_graph_encoder \
+  --dataset-dir data/scop_depth_crops_depth \
+  --output-dir outputs/train/graph_pretrain_flux_3dbox \
+  --position-loss-weight 1.0 \
+  --relation-loss-weight 8.0 \
+  --box3d-loss-weight 1.0 \
+  --embedding-loss-weight 0.0 \
+  --inverse-relation-loss-weight 0.0
 ```
+
+Example generation/debug:
+
+```bash
+python3 -m evaluation.generate_flux_relation_t2i \
+  --prompt-file external/T2I-CompBench/examples/dataset/spatial_val.txt \
+  --graph-encoder-path outputs/train/graph_pretrain_flux_3dbox_gpu7/final/graph_encoder.pt \
+  --output-dir outputs/eval/flux_official_seethrough3d_quick \
+  --use-official-seethrough3d-lora \
+  --flux-quantization 8bit \
+  --low-vram \
+  --image-size 512 \
+  --oscr-size 512 \
+  --oscr-render-size 512 \
+  --condition-renderer blender \
+  --oscr-face-alpha 0.0025
+```
+
+The generation utility saves generated images, rendered OSCR visualizations,
+binding prompts, and JSON records containing predicted centers and 3D sizes.
+
+## Official SeeThrough3D LoRA Baseline
+
+The T2I-CompBench FLUX relation generator can also download and use the released
+SeeThrough3D LoRA from Hugging Face. This keeps our GNN-predicted boxes but
+uses the official SeeThrough3D condition adapter:
+
+```bash
+python3 -m evaluation.generate_flux_relation_t2i \
+  --prompt-file external/T2I-CompBench/examples/dataset/spatial_val.txt \
+  --graph-encoder-path outputs/train/graph_pretrain_flux_3dbox_gpu7/final/graph_encoder.pt \
+  --output-dir outputs/eval/flux_official_seethrough3d_quick \
+  --use-official-seethrough3d-lora \
+  --flux-quantization 8bit \
+  --low-vram \
+  --image-size 512 \
+  --oscr-size 512 \
+  --oscr-render-size 512 \
+  --condition-renderer blender \
+  --oscr-face-alpha 0.0025
+```
+
+The official LoRA checkpoint is downloaded from
+`va1bhavagrawa1/seethrough3d-flux.1-weights` using the model-card path
+`checkpoints/seethrough3d_release/lora.safetensors`. Set `HF_HOME` or
+`--official-lora-cache-dir` to keep the download out of home-directory quota.

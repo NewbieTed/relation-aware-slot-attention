@@ -25,15 +25,19 @@ eval = [
 ]
 train = [
   "accelerate>=0.34.0",
-  "diffusers>=0.30.0",
-  "peft>=0.12.0",
+]
+flux = [
+  "accelerate>=0.34.0",
+  "bitsandbytes>=0.43.3",
+  "diffusers>=0.31.0",
+  "einops>=0.7.0",
   "safetensors>=0.4.5",
 ]
 
 [project.scripts]
 scop-depth = "scop_depth.__main__:main"
-scop-depth-train-lora = "training.train_sd15_lora:main"
-scop-depth-train-relation-aware = "training.train_relation_aware_sd15:main"
+scop-depth-train-graph = "training.pretrain_graph_encoder:main"
+scop-depth-generate-flux-relation = "evaluation.generate_flux_relation:main"
 
 [tool.setuptools]
 

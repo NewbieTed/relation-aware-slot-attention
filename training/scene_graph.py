@@ -29,6 +29,21 @@ INVERSE_RELATION = {
     "hidden_by": "in_front_of",
 }
 
+if set(INVERSE_RELATION) != set(RELATION_VOCAB):
+    missing = sorted(set(RELATION_VOCAB) - set(INVERSE_RELATION))
+    extra = sorted(set(INVERSE_RELATION) - set(RELATION_VOCAB))
+    raise ValueError(
+        "INVERSE_RELATION must cover exactly RELATION_VOCAB. "
+        f"Missing: {missing}. Extra: {extra}."
+    )
+
+_unknown_inverse_values = sorted(set(INVERSE_RELATION.values()) - set(RELATION_VOCAB))
+if _unknown_inverse_values:
+    raise ValueError(
+        "INVERSE_RELATION contains values missing from RELATION_VOCAB: "
+        f"{_unknown_inverse_values}"
+    )
+
 
 @dataclass(frozen=True)
 class BatchedSceneGraphs:

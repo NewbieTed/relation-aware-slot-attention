@@ -1,0 +1,37 @@
+generate:
+  prompt_file: /local1/cse_481_m_l/relation-aware-slot-attention/external/T2I-CompBench/examples/dataset/spatial_val.txt
+  graph_encoder_path: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/train/graph_pretrain_flux_3dbox_gpu7/final/graph_encoder.pt
+  output_dir: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/eval/flux_official_seethrough3d_spatial_1p_bf16_512_oscr512
+  model_id: black-forest-labs/FLUX.1-dev
+  device: cuda
+  mixed_precision: bf16
+  flux_quantization: 8bit
+  low_vram: true
+  image_size: 512
+  oscr_size: 512
+  oscr_render_size: 512
+  num_inference_steps: 28
+  guidance_scale: 3.5
+  max_sequence_length: 128
+  samples_per_prompt: 1
+  limit_prompts: 1
+  seed: 42
+  slot_dim: 512
+  gnn_layers: 2
+  lora_rank: 128
+  lora_alpha: 128
+  use_official_seethrough3d_lora: true
+  official_lora_cache_dir: /local1/cse_481_m_l/relation-aware-slot-attention/.cache/huggingface
+  condition_renderer: blender
+  oscr_face_alpha: 0.0025
+  oscr_azimuth_degrees: 0.0
+  blender_bin: /local1/cse_481_m_l/blender/blender-3.6.19-linux-x64/blender
+  blender_cache_dir: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/cache/blender_official_seethrough3d_spatial_1p_bf16_512_oscr512
+  prompt_prefix: a photo of
+
+benchmark:
+  benchmark: spatial
+  t2i_root: /local1/cse_481_m_l/relation-aware-slot-attention/external/T2I-CompBench
+  t2i_python: /local1/cse_481_m_l/relation-aware-slot-attention/.venv-t2i/bin/python
+  output_dir: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/eval/flux_official_seethrough3d_spatial_1p_bf16_512_oscr512
+  prompt_file: /local1/cse_481_m_l/relation-aware-slot-attention/external/T2I-CompBench/examples/dataset/spatial_val.txt

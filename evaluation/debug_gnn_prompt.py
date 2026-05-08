@@ -9,9 +9,9 @@ from typing import Any
 import torch
 from transformers import CLIPTextModel, CLIPTokenizer
 
-from evaluation.generate import MODEL_REGISTRY, load_graph_encoder, resolve_torch_device
 from evaluation.prompt_parser import parse_prompt_to_scene_graph
 from training.graph_modules import GraphSlotEncoder, mean_pool_hidden
+from training.runtime import DEFAULT_FLUX_MODEL_ID, load_graph_encoder, resolve_torch_device
 from training.scene_graph import RELATION_VOCAB, build_batched_scene_graphs
 
 
@@ -21,8 +21,7 @@ def make_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--prompt", type=str, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--model", choices=sorted(MODEL_REGISTRY.keys()), default="sd15")
-    parser.add_argument("--model-id", type=str, default=None)
+    parser.add_argument("--model-id", type=str, default=DEFAULT_FLUX_MODEL_ID)
     parser.add_argument("--graph-encoder-path", type=Path, required=True)
     parser.add_argument("--device", choices=("auto", "cpu", "mps", "cuda"), default="auto")
     parser.add_argument("--max-vector-elements-print", type=int, default=16)
@@ -232,6 +231,7 @@ def _build_debug_payload(
 
     slot_embeddings = graph_encoder.slot_out(sample_states)
     slot_positions = graph_encoder.position_head(sample_states)
+    slot_log_sigmas = graph_encoder.log_sigma_head(sample_states).clamp(min=-4.0, max=1.0)
 
     predicted_relations: list[dict[str, Any]] = []
     for source_idx, target_idx, relation_name in batched_graph.relation_triplets[0]:
@@ -276,6 +276,14 @@ def _build_debug_payload(
         },
         "predicted_slot_positions": {
             node_labels[node_index]: _tensor_to_list(slot_positions[node_index])
+            for node_index in range(len(node_labels))
+        },
+        "predicted_slot_log_sigmas": {
+            node_labels[node_index]: _tensor_to_list(slot_log_sigmas[node_index])
+            for node_index in range(len(node_labels))
+        },
+        "predicted_slot_sigmas": {
+            node_labels[node_index]: _tensor_to_list(slot_log_sigmas[node_index].exp())
             for node_index in range(len(node_labels))
         },
         "predicted_relation_deltas": predicted_relations,
@@ -401,6 +409,16 @@ def _render_text_report(payload: dict[str, Any], *, max_vector_elements: int) ->
         )
     lines.append("")
 
+    lines.append("Predicted log-sigma and sigma spreads:")
+    for label, values in payload["predicted_slot_log_sigmas"].items():
+        log_values = torch.tensor(values)
+        sigma_values = torch.tensor(payload["predicted_slot_sigmas"][label])
+        lines.append(
+            f"  {label}: log_sigma=({log_values[0]:+.4f}, {log_values[1]:+.4f}), "
+            f"sigma=({sigma_values[0]:+.4f}, {sigma_values[1]:+.4f})"
+        )
+    lines.append("")
+
     lines.append("Predicted relation deltas (target - source):")
     for item in payload["predicted_relation_deltas"]:
         delta = torch.tensor(item["delta_target_minus_source"])
@@ -418,9 +436,8 @@ def main() -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     device = resolve_torch_device(args.device)
-    model_id = args.model_id or MODEL_REGISTRY[args.model]
-    tokenizer = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer")
-    text_encoder = CLIPTextModel.from_pretrained(model_id, subfolder="text_encoder").to(device)
+    tokenizer = CLIPTokenizer.from_pretrained(args.model_id, subfolder="tokenizer")
+    text_encoder = CLIPTextModel.from_pretrained(args.model_id, subfolder="text_encoder").to(device)
     text_encoder.eval()
 
     graph_encoder = load_graph_encoder(

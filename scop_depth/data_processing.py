@@ -28,6 +28,99 @@ from .geometry import segmentation_to_mask
 from .models import CocoInstanceAnnotation, serialize_jsonl
 
 
+def _fit_square_crop_to_image(
+    x0: float,
+    y0: float,
+    x1: float,
+    y1: float,
+    *,
+    image_width: int,
+    image_height: int,
+    padding_ratio: float,
+) -> tuple[int, int, int, int]:
+    """Return a padded square crop around a pair bbox union, clamped to the image."""
+    union_w = max(1.0, x1 - x0)
+    union_h = max(1.0, y1 - y0)
+    pad = max(union_w, union_h) * padding_ratio
+    cx = (x0 + x1) / 2.0
+    cy = (y0 + y1) / 2.0
+    side = min(float(min(image_width, image_height)), max(union_w, union_h) + 2.0 * pad)
+    left = cx - side / 2.0
+    top = cy - side / 2.0
+    left = max(0.0, min(left, image_width - side))
+    top = max(0.0, min(top, image_height - side))
+    right = left + side
+    bottom = top + side
+    return (
+        int(round(left)),
+        int(round(top)),
+        int(round(right)),
+        int(round(bottom)),
+    )
+
+
+def _pair_crop_box(
+    annotations: list[CocoInstanceAnnotation],
+    *,
+    image_width: int,
+    image_height: int,
+    padding_ratio: float,
+) -> tuple[int, int, int, int]:
+    x0 = min(annot.bbox[0] for annot in annotations)
+    y0 = min(annot.bbox[1] for annot in annotations)
+    x1 = max(annot.bbox[0] + annot.bbox[2] for annot in annotations)
+    y1 = max(annot.bbox[1] + annot.bbox[3] for annot in annotations)
+    return _fit_square_crop_to_image(
+        x0,
+        y0,
+        x1,
+        y1,
+        image_width=image_width,
+        image_height=image_height,
+        padding_ratio=padding_ratio,
+    )
+
+
+def _shift_polygon_segmentation(segmentation: Any, *, left: int, top: int) -> Any:
+    if not isinstance(segmentation, list):
+        return segmentation
+    shifted: list[list[float]] = []
+    for polygon in segmentation:
+        shifted_polygon = []
+        for index, value in enumerate(polygon):
+            offset = left if index % 2 == 0 else top
+            shifted_polygon.append(float(value) - offset)
+        shifted.append(shifted_polygon)
+    return shifted
+
+
+def _annotation_dict_for_crop(
+    annotation: CocoInstanceAnnotation,
+    *,
+    crop_box: tuple[int, int, int, int],
+) -> dict[str, Any]:
+    left, top, right, bottom = crop_box
+    x, y, w, h = annotation.bbox
+    crop_x0 = max(0.0, x - left)
+    crop_y0 = max(0.0, y - top)
+    crop_x1 = min(float(right - left), x + w - left)
+    crop_y1 = min(float(bottom - top), y + h - top)
+    annot_dict = annotation.asdict()
+    annot_dict["source_bbox"] = list(annotation.bbox)
+    annot_dict["bbox"] = [
+        crop_x0,
+        crop_y0,
+        max(0.0, crop_x1 - crop_x0),
+        max(0.0, crop_y1 - crop_y0),
+    ]
+    annot_dict["segmentation"] = _shift_polygon_segmentation(
+        annot_dict.get("segmentation"),
+        left=left,
+        top=top,
+    )
+    return annot_dict
+
+
 def _append_depth_relations(
     relative_positions: list[list[str]],
     object_name1: str,
@@ -397,12 +490,16 @@ def export_dataset(
     image_id_to_relationships: dict[int, list[dict[str, Any]]],
     output_dir: Path,
     shared_images_dir: Path | None = None,
+    *,
+    crop_pairs: bool = True,
+    crop_padding_ratio: float = 0.15,
 ) -> None:
     """
     Export the SCOP-Depth dataset to the specified directory.
     Creates:
         - A metadata.jsonl file with relationship information
-        - Either:
+        - Pair crops by default, matching CoMPaSS/SCOP relationship decoding
+        - Or, when crop_pairs is disabled:
           - Symbolic links to shared_images_dir if provided
           - Symbolic link to original dataset if using directory input
           - Copy needed images if using zip input without shared_images_dir
@@ -412,15 +509,25 @@ def export_dataset(
         image_id_to_relationships: Dictionary mapping image IDs to relationships
         output_dir: Directory to save the dataset
         shared_images_dir: Optional directory to store actual images
+        crop_pairs: Create one cropped image per object pair instead of linking full images
+        crop_padding_ratio: Padding around the pair bbox union as a fraction of pair size
     """
     output_dir = Path(output_dir)
     images_outdir = output_dir / "images"
     metadata_jsonl_path = output_dir / "metadata.jsonl"
+    output_dir.mkdir(exist_ok=True, parents=True)
+    if crop_pairs:
+        images_outdir.mkdir(exist_ok=True, parents=True)
 
     # Function to process each image
     def process_image(image_data):
         image_id, relationships = image_data
         metadata_entries = []
+        image = None
+        image_width = image_height = None
+        if crop_pairs:
+            image = reader.get_image(image_id).convert("RGB")
+            image_width, image_height = image.size
 
         # Prepare filename
         image_name = f"{image_id:012d}.jpg"
@@ -430,13 +537,43 @@ def export_dataset(
             annotations = rel_data["annotations"]
             rel_positions = rel_data["relative_positions"]
             depth_data = rel_data.get("depth")
+            crop_box = None
+            source_file_name = f"train2017/{image_id:012d}.jpg"
+            if crop_pairs:
+                assert image is not None
+                assert image_width is not None and image_height is not None
+                crop_box = _pair_crop_box(
+                    annotations,
+                    image_width=image_width,
+                    image_height=image_height,
+                    padding_ratio=crop_padding_ratio,
+                )
+                image_name = f"{image_id:012d}_{i:04d}.jpg"
+                crop_path = images_outdir / image_name
+                if not crop_path.exists():
+                    image.crop(crop_box).save(crop_path, quality=95)
+                annots = [
+                    _annotation_dict_for_crop(annot, crop_box=crop_box)
+                    for annot in annotations
+                ]
+                crop_left, crop_top, crop_right, crop_bottom = crop_box
+                image_size = [crop_right - crop_left, crop_bottom - crop_top]
+            else:
+                annots = [ann.asdict() for ann in annotations]
+                image_size = None
 
             entry = {
                 "seq": i,
                 "file_name": f"images/{image_name}",  # Relative path
                 "oros": rel_positions,
-                "annots": [ann.asdict() for ann in annotations],
+                "annots": annots,
             }
+            if crop_pairs and crop_box is not None:
+                entry["source_image_id"] = image_id
+                entry["source_file_name"] = source_file_name
+                entry["source_image_size"] = [image_width, image_height]
+                entry["crop_box"] = list(crop_box)
+                entry["image_size"] = image_size
             if depth_data is not None:
                 entry["depth"] = depth_data
 
@@ -456,12 +593,16 @@ def export_dataset(
             )
         )
 
-    output_dir.mkdir(exist_ok=True, parents=True)
     # Write metadata file
     metadata_jsonl_path.write_text(serialize_jsonl(all_metadata))
 
     # Handle images based on configuration
     needed_image_ids = set(image_id_to_relationships.keys())
+
+    if crop_pairs:
+        print(f"Exported {len(all_metadata)} relationship entries to {metadata_jsonl_path}")
+        print(f"Exported pair crops to {images_outdir}")
+        return
 
     if shared_images_dir:
         # Using shared images directory

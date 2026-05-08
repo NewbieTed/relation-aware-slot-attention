@@ -63,6 +63,8 @@ class GraphMessagePassingLayer(nn.Module):
 class GraphConditioningOutput:
     slot_embeddings: torch.Tensor
     slot_positions: torch.Tensor
+    slot_log_sigmas: torch.Tensor
+    slot_log_sizes_3d: torch.Tensor
     slot_mask: torch.Tensor
     relation_logits: list[torch.Tensor]
 
@@ -91,6 +93,18 @@ class GraphSlotEncoder(nn.Module):
             nn.SiLU(),
             nn.Linear(slot_dim, 3),
             nn.Tanh(),
+        )
+        self.log_sigma_head = nn.Sequential(
+            nn.LayerNorm(slot_dim),
+            nn.Linear(slot_dim, slot_dim),
+            nn.SiLU(),
+            nn.Linear(slot_dim, 2),
+        )
+        self.log_size_3d_head = nn.Sequential(
+            nn.LayerNorm(slot_dim),
+            nn.Linear(slot_dim, slot_dim),
+            nn.SiLU(),
+            nn.Linear(slot_dim, 3),
         )
         self.relation_head = nn.Sequential(
             nn.Linear(slot_dim * 2, slot_dim),
@@ -155,9 +169,13 @@ class GraphSlotEncoder(nn.Module):
 
         slot_embeddings = self.slot_out(node_states)
         slot_positions = self.position_head(node_states)
+        slot_log_sigmas = self.log_sigma_head(node_states).clamp(min=-4.0, max=1.0)
+        slot_log_sizes_3d = self.log_size_3d_head(node_states).clamp(min=-4.0, max=1.0)
         return GraphConditioningOutput(
             slot_embeddings=slot_embeddings,
             slot_positions=slot_positions,
+            slot_log_sigmas=slot_log_sigmas,
+            slot_log_sizes_3d=slot_log_sizes_3d,
             slot_mask=scene_graph_batch.position_mask.to(node_states.device),
             relation_logits=relation_logits,
         )
@@ -235,6 +253,32 @@ def embedding_alignment_loss(
     ).mean()
 
 
+def log_sigma_loss(
+    slot_log_sigmas: torch.Tensor,
+    log_sigma_targets: torch.Tensor,
+    slot_mask: torch.Tensor,
+) -> torch.Tensor:
+    if not slot_mask.any():
+        return slot_log_sigmas.new_tensor(0.0)
+    return F.smooth_l1_loss(
+        slot_log_sigmas[slot_mask],
+        log_sigma_targets[slot_mask].to(slot_log_sigmas.dtype),
+    )
+
+
+def log_size_3d_loss(
+    slot_log_sizes_3d: torch.Tensor,
+    log_size_targets: torch.Tensor,
+    slot_mask: torch.Tensor,
+) -> torch.Tensor:
+    if not slot_mask.any():
+        return slot_log_sizes_3d.new_tensor(0.0)
+    return F.smooth_l1_loss(
+        slot_log_sizes_3d[slot_mask],
+        log_size_targets[slot_mask].to(slot_log_sizes_3d.dtype),
+    )
+
+
 def relation_loss(
     relation_logits: list[torch.Tensor],
     slot_positions: torch.Tensor,
@@ -263,12 +307,14 @@ def relation_loss(
                 sample_losses.append(F.relu(0.1 - delta[1]))
             elif relation == "below":
                 sample_losses.append(F.relu(0.1 + delta[1]))
-            elif relation in {"in_front_of", "hidden_by"}:
+            elif relation == "in_front_of":
+                sample_losses.append(F.relu(0.05 + delta[2]))
+            elif relation == "hidden_by":
                 sample_losses.append(F.relu(0.05 - delta[2]))
             elif relation == "behind":
-                sample_losses.append(F.relu(0.05 + delta[2]))
+                sample_losses.append(F.relu(0.05 - delta[2]))
             elif relation == "on":
-                sample_losses.append(F.relu(delta[1].abs() - 0.2))
+                sample_losses.append(F.relu(0.1 - delta[1]))
         if sample_losses:
             losses.append(torch.stack(sample_losses).mean())
     if not losses:

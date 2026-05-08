@@ -1,26 +1,21 @@
-# Training Workflows
+# Training Workflow
 
-This repo now supports a two-stage relation-aware training workflow:
+This FLUX branch now trains only the relation-aware GNN/layout module. FLUX
+fine-tuning experiments were removed from the active workflow after the official
+SeeThrough3D LoRA plus our GNN-generated OSCR conditions gave the first clear
+spatial benchmark gain.
 
-1. `scripts/train/run_graph_pretrain.sh`
-   Pretrains only the graph encoder on SCOP-Depth structure supervision. This stage
-   learns slot geometry and relation-aware message passing without paying the cost of
-   full diffusion training.
-2. `scripts/train/run_relation_aware_sd15.sh`
-   Runs the full relation-aware Stable Diffusion training loop with LoRA, graph
-   conditioning, and modified cross-attention. Pass `INIT_GRAPH_ENCODER=/path/to/graph_encoder.pt`
-   to warm-start from stage 1.
+`training.pretrain_graph_encoder` pretrains the graph encoder on SCOP-Depth
+relation, position, and 3D box-size targets. The resulting checkpoint is used at
+inference time to predict object cuboids, which are rendered into OSCR
+conditions for the released SeeThrough3D FLUX LoRA.
 
-The intended schedule is:
+The graph trainer creates deterministic train/eval/test splits, saves
+`data_split.json`, writes losses to `metrics.jsonl` and `metrics.csv`, and saves
+reusable checkpoints under the run output directory.
 
-- run graph pretraining for many epochs / many steps
-- select the best `graph_encoder.pt`
-- warm-start the full trainer
-- train LoRA + graph encoder + relation-attention for a shorter schedule
+Example graph pretraining:
 
-This split is useful because the graph encoder typically benefits from much longer
-optimization than the LoRA stage.
-
-Both training entrypoints now create deterministic train/eval/test splits, save the
-split manifest to `data_split.json`, write loss curves to `metrics.jsonl` and
-`metrics.csv`, and report a held-out test loss at the end of training.
+```bash
+./scripts/train/run_graph_pretrain.sh
+```

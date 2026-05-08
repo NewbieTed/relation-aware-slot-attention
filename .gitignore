@@ -22,6 +22,10 @@ dist/
 data/
 outputs/
 external/
+cache/
+.cache/
+hf_cache/
+huggingface_cache/
 
 # Local benchmark checkouts
 T2I-CompBench/
@@ -32,3 +36,6 @@ evaluation/vendor/
 
 # Visualizations
 docs/
+
+# Logs
+logs/

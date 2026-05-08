@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from typing import Any, Literal
 
 BoundingBox = tuple[float, float, float, float]
@@ -31,7 +31,8 @@ class CocoInstanceAnnotation:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> CocoInstanceAnnotation:
         """Create a CocoInstanceAnnotation from a dictionary."""
-        d_copy = d.copy()
+        valid_fields = {field.name for field in fields(cls)}
+        d_copy = {key: value for key, value in d.items() if key in valid_fields}
         d_copy["bbox"] = tuple(d_copy["bbox"])
 
         # Handle segmentation - could be list of lists or dict

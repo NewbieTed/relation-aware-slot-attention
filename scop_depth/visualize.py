@@ -1,4 +1,5 @@
 import random
+import json
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +49,163 @@ def _draw_text_block(
     for line, line_height in zip(lines, line_heights):
         draw.text((x + padding, cursor_y), line, font=font, fill=line_fill)
         cursor_y += line_height + line_gap
+
+
+def _mask_from_annotation_dict(
+    annot_dict: dict[str, Any],
+    image_size: tuple[int, int],
+) -> np.ndarray | None:
+    try:
+        annot = CocoInstanceAnnotation.from_dict(annot_dict)
+    except TypeError:
+        return None
+    mask = segmentation_to_mask(annot, image_size[0], image_size[1])
+    if mask is None or mask.shape != (image_size[1], image_size[0]):
+        return None
+    return mask
+
+
+def _annotated_crop_panel(
+    image: Image.Image,
+    annots: list[dict[str, Any]],
+    *,
+    title_lines: list[str],
+    labels: list[str] | None = None,
+    font: ImageFont.ImageFont,
+) -> Image.Image:
+    colors = ["cyan", "magenta"]
+    overlay = np.asarray(image.convert("RGB").copy()).copy()
+    image_size = image.size
+
+    for i, annot in enumerate(annots):
+        rgb = (0, 255, 255) if i == 0 else (255, 0, 255)
+        mask = _mask_from_annotation_dict(annot, image_size)
+        if mask is not None and np.any(mask):
+            tint = np.zeros_like(overlay)
+            tint[..., 0] = rgb[0]
+            tint[..., 1] = rgb[1]
+            tint[..., 2] = rgb[2]
+            overlay[mask] = (0.45 * overlay[mask] + 0.55 * tint[mask]).astype(
+                np.uint8
+            )
+
+    panel = Image.fromarray(overlay)
+    draw = ImageDraw.Draw(panel)
+    for i, annot in enumerate(annots):
+        x, y, w, h = annot["bbox"]
+        label = (
+            labels[i]
+            if labels is not None and i < len(labels)
+            else str(annot.get("category_id", f"obj{i}"))
+        )
+        color = colors[i % len(colors)]
+        draw.rectangle([x, y, x + w, y + h], outline=color, width=3)
+        text_bbox = draw.textbbox((x, y), label, font=font)
+        draw.rectangle(text_bbox, fill="black")
+        draw.text((x, y), label, font=font, fill=color)
+    _draw_text_block(draw, title_lines, (10, 10), font)
+    return panel
+
+
+def _relationship_lines(row: dict[str, Any]) -> tuple[list[str], list[str]]:
+    depth_phrases = {"in front of", "behind", "hidden by"}
+    planar_lines = []
+    depth_lines = []
+    for subj, rel, obj in row.get("oros", []):
+        line = f"{subj} {rel} {obj}"
+        if rel in depth_phrases:
+            depth_lines.append(line)
+        else:
+            planar_lines.append(line)
+    return planar_lines, depth_lines
+
+
+def _labels_from_relationships(row: dict[str, Any], annot_count: int) -> list[str]:
+    if row.get("oros"):
+        subj, _, obj = row["oros"][0]
+        labels = [str(subj), str(obj)]
+    else:
+        labels = []
+    while len(labels) < annot_count:
+        labels.append(f"obj{len(labels)}")
+    return labels[:annot_count]
+
+
+def create_exported_sample_visualization(
+    dataset_dir: Path,
+    output_dir: Path,
+    num_samples: int = 5,
+) -> None:
+    """Create sample panels from exported crop images and rewritten metadata."""
+    dataset_dir = Path(dataset_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for old_sample in output_dir.glob("*.jpg"):
+        old_sample.unlink()
+
+    metadata_path = dataset_dir / "metadata.jsonl"
+    rows = [
+        json.loads(line)
+        for line in metadata_path.read_text().splitlines()
+        if line.strip()
+    ]
+    if not rows:
+        print(f"No exported rows available for sample visualization in {metadata_path}")
+        return
+
+    sample_rows = random.sample(rows, min(num_samples, len(rows)))
+    font = _load_font(size=22)
+
+    for index, row in enumerate(sample_rows):
+        image = Image.open(dataset_dir / row["file_name"]).convert("RGB")
+        annots = row.get("annots", [])
+        labels = _labels_from_relationships(row, len(annots))
+        planar_lines, depth_lines = _relationship_lines(row)
+
+        left_lines = ["2D crop"]
+        left_lines.extend(planar_lines if planar_lines else ["no 2D relation label"])
+
+        right_lines = ["3D / depth crop"]
+        if depth_lines:
+            right_lines.extend(depth_lines)
+        else:
+            right_lines.append("no 3D relation label")
+        depth = row.get("depth")
+        if depth is not None:
+            ordering = depth.get("ordering", "unknown")
+            delta = depth.get("delta_median")
+            if isinstance(delta, (int, float)):
+                right_lines.append(f"depth ordering: {ordering} ({delta:+.3f})")
+            else:
+                right_lines.append(f"depth ordering: {ordering}")
+
+        left_panel = _annotated_crop_panel(
+            image,
+            annots,
+            title_lines=left_lines,
+            labels=labels,
+            font=font,
+        )
+        right_panel = _annotated_crop_panel(
+            image,
+            annots,
+            title_lines=right_lines,
+            labels=labels,
+            font=font,
+        )
+
+        combined = Image.new(
+            "RGB",
+            (left_panel.width + right_panel.width, max(left_panel.height, right_panel.height)),
+            "black",
+        )
+        combined.paste(left_panel, (0, 0))
+        combined.paste(right_panel, (left_panel.width, 0))
+        source_id = row.get("source_image_id", "unknown")
+        output_path = output_dir / f"crop_sample_{index:03d}_source_{source_id}.jpg"
+        combined.save(output_path, quality=95)
+
+    print(f"Created {len(sample_rows)} crop sample visualizations in {output_dir}")
 
 
 def visualize_object_pair(

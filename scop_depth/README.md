@@ -18,7 +18,12 @@ python3 -m scop_depth --coco-root /path/to/coco2017 --output-dir ./scop-coco2017
 The `--coco-root` directory should contain `annotations/` and `train2017/`.
 
 On successful processing of COCO2017, the output directory (`scop-coco2017` in this example) should
-have a `metadata.jsonl` file (28,028 lines) and an `images/` folder (15,426 images).
+have a `metadata.jsonl` file and an `images/` folder with one image crop per metadata row.
+
+By default, exported images are CoMPaSS-style pair crops: each metadata row points
+to a square crop around the selected object pair, and the row's bounding boxes are
+rewritten into that crop's coordinate system. Use `--no-crop-pairs` only when you
+intentionally want the older full-image symlink/copy export.
 
 ### Optional: Depth Anything V2 Enrichment
 
