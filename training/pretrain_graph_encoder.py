@@ -18,7 +18,6 @@ from .graph_modules import (
     build_slot_conditioning,
     cvae_kl_loss,
     embedding_alignment_loss,
-    gaussian_nll_loss,
     inverse_relation_regularizer,
     log_size_3d_loss,
     log_sigma_loss,
@@ -92,6 +91,18 @@ def _graph_layout_mode(graph_encoder: GraphSlotEncoder) -> str:
     base = getattr(graph_encoder, "module", graph_encoder)
     base = getattr(base, "_orig_mod", base)
     return getattr(base, "layout_mode", "deterministic")
+
+
+def _metric_keys(layout_mode: str) -> list[str]:
+    keys = [
+        "loss",
+        "position_loss",
+        "relation_loss",
+        "box3d_loss",
+    ]
+    if layout_mode == "cvae":
+        keys.extend(["cvae_kl_loss", "cvae_kl_weighted"])
+    return keys
 
 
 def make_parser() -> argparse.ArgumentParser:
@@ -189,11 +200,9 @@ def _compute_graph_batch_losses(
         dtype=conditioning.slot_embeddings.dtype,
     )
 
-    position_loss = gaussian_nll_loss(
-        conditioning.slot_position_mu,
-        conditioning.slot_position_logvar,
-        slot_targets,
-        conditioning.slot_mask,
+    position_loss = F.smooth_l1_loss(
+        conditioning.slot_positions[conditioning.slot_mask],
+        slot_targets[conditioning.slot_mask],
     )
     edge_loss = relation_loss(
         conditioning.relation_logits,
@@ -210,19 +219,10 @@ def _compute_graph_batch_losses(
         log_sigma_targets,
         conditioning.slot_mask,
     )
-    box3d_loss = (
-        gaussian_nll_loss(
-            conditioning.slot_log_size_3d_mu,
-            conditioning.slot_log_size_3d_logvar,
-            log_size_3d_targets,
-            conditioning.slot_mask,
-        )
-        if _graph_layout_mode(graph_encoder) == "cvae"
-        else log_size_3d_loss(
-            conditioning.slot_log_sizes_3d,
-            log_size_3d_targets,
-            conditioning.slot_mask,
-        )
+    box3d_loss = log_size_3d_loss(
+        conditioning.slot_log_sizes_3d,
+        log_size_3d_targets,
+        conditioning.slot_mask,
     )
     inverse_loss = inverse_relation_regularizer(graph_encoder)
     kl_loss = cvae_kl_loss(conditioning)
@@ -271,17 +271,8 @@ def _evaluate_graph_encoder(
     cvae_kl_warmup_steps: int,
 ) -> dict[str, float]:
     graph_encoder.eval()
-    totals = {
-        "loss": 0.0,
-        "position_loss": 0.0,
-        "relation_loss": 0.0,
-        "embedding_loss": 0.0,
-        "inverse_relation_loss": 0.0,
-        "box_loss": 0.0,
-        "box3d_loss": 0.0,
-        "cvae_kl_loss": 0.0,
-        "cvae_kl_weighted": 0.0,
-    }
+    metric_keys = _metric_keys(_graph_layout_mode(graph_encoder))
+    totals = {key: 0.0 for key in metric_keys}
     batch_count = 0
     for batch in dataloader:
         metrics = _compute_graph_batch_losses(
@@ -300,12 +291,12 @@ def _evaluate_graph_encoder(
             cvae_kl_warmup_steps=cvae_kl_warmup_steps,
             step=cvae_kl_warmup_steps,
         )
-        for key in totals:
+        for key in metric_keys:
             totals[key] += float(metrics[key].item())
         batch_count += 1
     graph_encoder.train()
     if batch_count == 0:
-        return {key: 0.0 for key in totals}
+        return {key: 0.0 for key in metric_keys}
     return {key: value / batch_count for key, value in totals.items()}
 
 
@@ -391,24 +382,13 @@ def main() -> int:
         optimizer,
         train_dataloader,
     )
+    metric_keys = _metric_keys(args.layout_mode)
 
     if accelerator.is_main_process:
         _save_state(args.output_dir, step=0, args=args)
     metrics_logger = MetricsLogger(
         args.output_dir,
-        fieldnames=[
-            "step",
-            "split",
-            "loss",
-            "position_loss",
-            "relation_loss",
-            "embedding_loss",
-            "inverse_relation_loss",
-            "box_loss",
-            "box3d_loss",
-            "cvae_kl_loss",
-            "cvae_kl_weighted",
-        ],
+        fieldnames=["step", "split", *metric_keys],
     )
     progress_bar = tqdm(
         total=args.max_train_steps,
@@ -417,17 +397,7 @@ def main() -> int:
     )
 
     global_step = 0
-    running = {
-        "loss": 0.0,
-        "position_loss": 0.0,
-        "relation_loss": 0.0,
-        "embedding_loss": 0.0,
-        "inverse_relation_loss": 0.0,
-        "box_loss": 0.0,
-        "box3d_loss": 0.0,
-        "cvae_kl_loss": 0.0,
-        "cvae_kl_weighted": 0.0,
-    }
+    running = {key: 0.0 for key in metric_keys}
     running_steps = 0
     while global_step < args.max_train_steps:
         for batch in train_dataloader:
@@ -463,38 +433,29 @@ def main() -> int:
             running_steps += 1
             gathered_metrics = {
                 key: accelerator.gather(metrics[key].detach().float().reshape(1)).mean().item()
-                for key in running
+                for key in metric_keys
             }
-            for key in running:
+            for key in metric_keys:
                 running[key] += gathered_metrics[key]
 
             if global_step % args.log_every == 0:
                 train_log = {
                     "step": global_step,
                     "split": "train",
-                    "loss": running["loss"] / running_steps,
-                    "position_loss": running["position_loss"] / running_steps,
-                    "relation_loss": running["relation_loss"] / running_steps,
-                    "embedding_loss": running["embedding_loss"] / running_steps,
-                    "inverse_relation_loss": running["inverse_relation_loss"] / running_steps,
-                    "box_loss": running["box_loss"] / running_steps,
-                    "box3d_loss": running["box3d_loss"] / running_steps,
-                    "cvae_kl_loss": running["cvae_kl_loss"] / running_steps,
-                    "cvae_kl_weighted": running["cvae_kl_weighted"] / running_steps,
                 }
+                train_log.update({key: running[key] / running_steps for key in metric_keys})
                 if accelerator.is_main_process:
                     metrics_logger.log(train_log)
                 if accelerator.is_local_main_process:
-                    progress_bar.set_postfix(
-                        pos=f"{train_log['position_loss']:.4f}",
-                        rel=f"{train_log['relation_loss']:.4f}",
-                        sem=f"{train_log['embedding_loss']:.4f}",
-                        inv=f"{train_log['inverse_relation_loss']:.4f}",
-                        box=f"{train_log['box_loss']:.4f}",
-                        box3d=f"{train_log['box3d_loss']:.4f}",
-                        kl=f"{train_log['cvae_kl_loss']:.4f}",
-                    )
-                running = {key: 0.0 for key in running}
+                    postfix = {
+                        "pos": f"{train_log['position_loss']:.4f}",
+                        "rel": f"{train_log['relation_loss']:.4f}",
+                        "box3d": f"{train_log['box3d_loss']:.4f}",
+                    }
+                    if args.layout_mode == "cvae":
+                        postfix["kl"] = f"{train_log['cvae_kl_loss']:.4f}"
+                    progress_bar.set_postfix(**postfix)
+                running = {key: 0.0 for key in metric_keys}
                 running_steps = 0
 
             if (
@@ -523,17 +484,15 @@ def main() -> int:
                     ),
                 }
                 metrics_logger.log(eval_log)
-                print(
-                    "Eval at step "
-                    f"{global_step}: loss={eval_log['loss']:.4f}, "
+                summary = (
+                    f"Eval at step {global_step}: loss={eval_log['loss']:.4f}, "
                     f"pos={eval_log['position_loss']:.4f}, "
                     f"rel={eval_log['relation_loss']:.4f}, "
-                    f"sem={eval_log['embedding_loss']:.4f}, "
-                    f"inv={eval_log['inverse_relation_loss']:.4f}, "
-                    f"box={eval_log['box_loss']:.4f}, "
-                    f"box3d={eval_log['box3d_loss']:.4f}, "
-                    f"kl={eval_log['cvae_kl_loss']:.4f}"
+                    f"box3d={eval_log['box3d_loss']:.4f}"
                 )
+                if args.layout_mode == "cvae":
+                    summary += f", kl={eval_log['cvae_kl_loss']:.4f}"
+                print(summary)
 
             if accelerator.is_main_process and global_step % args.save_every == 0:
                 checkpoint_dir = _save_graph_encoder(
@@ -576,17 +535,17 @@ def main() -> int:
             ),
         }
         metrics_logger.log(test_log)
-        print(
+        summary = (
             "Final test loss: "
             f"{test_log['loss']:.4f} "
             f"(pos={test_log['position_loss']:.4f}, "
             f"rel={test_log['relation_loss']:.4f}, "
-            f"sem={test_log['embedding_loss']:.4f}, "
-            f"inv={test_log['inverse_relation_loss']:.4f}, "
-            f"box={test_log['box_loss']:.4f}, "
-            f"box3d={test_log['box3d_loss']:.4f}, "
-            f"kl={test_log['cvae_kl_loss']:.4f})"
+            f"box3d={test_log['box3d_loss']:.4f}"
         )
+        if args.layout_mode == "cvae":
+            summary += f", kl={test_log['cvae_kl_loss']:.4f}"
+        summary += ")"
+        print(summary)
     if accelerator.is_main_process:
         _save_state(args.output_dir, step=global_step, args=args)
         print(f"Graph pretraining finished at step {global_step}.")
