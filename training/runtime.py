@@ -92,8 +92,8 @@ def normalize_graph_encoder_state_dict(checkpoint: object) -> dict[str, torch.Te
     return state_dict
 
 
-def infer_graph_encoder_config(state_dict: dict[str, torch.Tensor]) -> tuple[int, int]:
-    """Infer slot dimension and GNN depth from a saved graph encoder state."""
+def infer_graph_encoder_config(state_dict: dict[str, torch.Tensor]) -> tuple[int, int, str, int]:
+    """Infer graph encoder dimensions and layout mode from a saved state."""
 
     node_weight = state_dict.get("node_proj.weight")
     if node_weight is None:
@@ -110,7 +110,13 @@ def infer_graph_encoder_config(state_dict: dict[str, torch.Tensor]) -> tuple[int
         for key in state_dict
         if key.startswith("layers.") and key.split(".")[1].isdigit()
     }
-    return slot_dim, len(layer_indices)
+    if "prior_head.3.weight" in state_dict:
+        layout_mode = "cvae"
+        latent_dim = int(state_dict["prior_head.3.weight"].shape[0] // 2)
+    else:
+        layout_mode = "deterministic"
+        latent_dim = 64
+    return slot_dim, len(layer_indices), layout_mode, latent_dim
 
 
 def load_graph_encoder(
@@ -123,11 +129,13 @@ def load_graph_encoder(
     """Load a saved graph encoder with its inferred architecture."""
 
     state_dict = normalize_graph_encoder_state_dict(torch.load(path, map_location="cpu"))
-    slot_dim, gnn_layers = infer_graph_encoder_config(state_dict)
+    slot_dim, gnn_layers, layout_mode, latent_dim = infer_graph_encoder_config(state_dict)
     encoder = GraphSlotEncoder(
         text_hidden_dim=text_hidden_dim,
         slot_dim=slot_dim,
         num_layers=gnn_layers,
+        layout_mode=layout_mode,
+        latent_dim=latent_dim,
     ).to(device=device, dtype=dtype)
     encoder.load_state_dict(state_dict, strict=False)
     encoder.eval()

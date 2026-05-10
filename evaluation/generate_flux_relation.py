@@ -23,6 +23,7 @@ from training.scene_graph import build_batched_scene_graphs
 from training.runtime import (
     DEFAULT_FLUX_MODEL_ID,
     choose_weight_dtype,
+    load_graph_encoder,
     normalize_graph_encoder_state_dict,
     resolve_torch_device,
     set_seed,
@@ -49,6 +50,12 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lora-rank", type=int, default=128)
     parser.add_argument("--lora-alpha", type=float, default=128.0)
     parser.add_argument("--max-sequence-length", type=int, default=512)
+    parser.add_argument(
+        "--gnn-layout-sample-mode",
+        choices=("auto", "prior_mean", "prior_sample"),
+        default="auto",
+        help="For CVAE graph checkpoints, use prior_mean for deterministic boxes or prior_sample for stochastic boxes.",
+    )
     return parser
 
 
@@ -66,17 +73,13 @@ def _load_graph_encoder(
     gnn_layers: int,
     device: str,
 ) -> GraphSlotEncoder:
-    graph_encoder = GraphSlotEncoder(
+    graph_encoder = load_graph_encoder(
+        path=path,
         text_hidden_dim=text_hidden_dim,
-        slot_dim=slot_dim,
-        num_layers=gnn_layers,
-    ).to(device)
-    graph_encoder.load_state_dict(
-        normalize_graph_encoder_state_dict(torch.load(path, map_location=device)),
-        strict=False,
+        device=device,
+        dtype=torch.float32,
     )
     graph_encoder.requires_grad_(False)
-    graph_encoder.eval()
     return graph_encoder
 
 
@@ -88,6 +91,7 @@ def _predict_layout(
     graph_encoder: GraphSlotEncoder,
     device: str,
     oscr_size: int,
+    gnn_layout_sample_mode: str,
 ) -> tuple[Image.Image, dict[str, Any]]:
     scene_graph = parse_prompt_to_scene_graph(prompt)
     node_count = len(scene_graph["nodes"])
@@ -100,6 +104,7 @@ def _predict_layout(
         scene_graph_batch=scene_graph_batch,
         graph_encoder=graph_encoder,
         device=device,
+        layout_sample_mode=gnn_layout_sample_mode,
     )
     oscr = render_oscr_boxes(
         centers=conditioning.slot_positions,
@@ -109,6 +114,8 @@ def _predict_layout(
     )
     layout = {
         "prompt": prompt,
+        "graph_layout_mode": getattr(graph_encoder, "layout_mode", "deterministic"),
+        "gnn_layout_sample_mode": gnn_layout_sample_mode,
         "nodes": scene_graph["nodes"],
         "edges": scene_graph["edges"],
         "predicted_centers": conditioning.slot_positions[0].detach().cpu().tolist(),
@@ -179,6 +186,7 @@ def main() -> int:
         graph_encoder=graph_encoder,
         device=device,
         oscr_size=args.oscr_size,
+        gnn_layout_sample_mode=args.gnn_layout_sample_mode,
     )
     oscr_image.save(args.output_dir / "oscr_condition.png")
     (args.output_dir / "predicted_layout.json").write_text(json.dumps(layout, indent=2))

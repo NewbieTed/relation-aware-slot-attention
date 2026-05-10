@@ -63,10 +63,19 @@ class GraphMessagePassingLayer(nn.Module):
 class GraphConditioningOutput:
     slot_embeddings: torch.Tensor
     slot_positions: torch.Tensor
+    slot_position_mu: torch.Tensor
+    slot_position_logvar: torch.Tensor | None
     slot_log_sigmas: torch.Tensor
     slot_log_sizes_3d: torch.Tensor
+    slot_log_size_3d_mu: torch.Tensor
+    slot_log_size_3d_logvar: torch.Tensor | None
     slot_mask: torch.Tensor
     relation_logits: list[torch.Tensor]
+    prior_mu: torch.Tensor | None = None
+    prior_logvar: torch.Tensor | None = None
+    posterior_mu: torch.Tensor | None = None
+    posterior_logvar: torch.Tensor | None = None
+    sampled_z: torch.Tensor | None = None
 
 
 class GraphSlotEncoder(nn.Module):
@@ -76,8 +85,14 @@ class GraphSlotEncoder(nn.Module):
         slot_dim: int,
         relation_dim: int = 128,
         num_layers: int = 2,
+        layout_mode: str = "deterministic",
+        latent_dim: int = 64,
     ) -> None:
         super().__init__()
+        if layout_mode not in {"deterministic", "cvae"}:
+            raise ValueError(f"Unsupported layout_mode: {layout_mode}")
+        self.layout_mode = layout_mode
+        self.latent_dim = latent_dim
         self.node_proj = nn.Linear(text_hidden_dim, slot_dim)
         self.relation_embedding = nn.Embedding(len(RELATION_VOCAB), relation_dim)
         self.layers = nn.ModuleList(
@@ -106,6 +121,49 @@ class GraphSlotEncoder(nn.Module):
             nn.SiLU(),
             nn.Linear(slot_dim, 3),
         )
+        if self.layout_mode == "cvae":
+            self.position_mu_head = nn.Sequential(
+                nn.LayerNorm(slot_dim + latent_dim),
+                nn.Linear(slot_dim + latent_dim, slot_dim),
+                nn.SiLU(),
+                nn.Linear(slot_dim, 3),
+                nn.Tanh(),
+            )
+            self.position_logvar_head = nn.Sequential(
+                nn.LayerNorm(slot_dim + latent_dim),
+                nn.Linear(slot_dim + latent_dim, slot_dim),
+                nn.SiLU(),
+                nn.Linear(slot_dim, 3),
+            )
+            self.log_size_3d_mu_head = nn.Sequential(
+                nn.LayerNorm(slot_dim + latent_dim),
+                nn.Linear(slot_dim + latent_dim, slot_dim),
+                nn.SiLU(),
+                nn.Linear(slot_dim, 3),
+            )
+            self.log_size_3d_logvar_head = nn.Sequential(
+                nn.LayerNorm(slot_dim + latent_dim),
+                nn.Linear(slot_dim + latent_dim, slot_dim),
+                nn.SiLU(),
+                nn.Linear(slot_dim, 3),
+            )
+            self.gt_layout_encoder = nn.Sequential(
+                nn.Linear(6, slot_dim),
+                nn.SiLU(),
+                nn.Linear(slot_dim, slot_dim),
+            )
+            self.prior_head = nn.Sequential(
+                nn.LayerNorm(slot_dim),
+                nn.Linear(slot_dim, slot_dim),
+                nn.SiLU(),
+                nn.Linear(slot_dim, latent_dim * 2),
+            )
+            self.posterior_head = nn.Sequential(
+                nn.LayerNorm(slot_dim * 2),
+                nn.Linear(slot_dim * 2, slot_dim),
+                nn.SiLU(),
+                nn.Linear(slot_dim, latent_dim * 2),
+            )
         self.relation_head = nn.Sequential(
             nn.Linear(slot_dim * 2, slot_dim),
             nn.SiLU(),
@@ -132,7 +190,11 @@ class GraphSlotEncoder(nn.Module):
         self,
         pooled_label_embeddings: torch.Tensor,
         scene_graph_batch: BatchedSceneGraphs,
+        *,
+        layout_sample_mode: str = "auto",
     ) -> GraphConditioningOutput:
+        if layout_sample_mode not in {"auto", "posterior", "prior_sample", "prior_mean"}:
+            raise ValueError(f"Unsupported layout_sample_mode: {layout_sample_mode}")
         batch_size, max_nodes, _ = pooled_label_embeddings.shape
         node_states = self.node_proj(pooled_label_embeddings)
         relation_logits: list[torch.Tensor] = []
@@ -168,16 +230,138 @@ class GraphSlotEncoder(nn.Module):
                 relation_logits.append(torch.zeros((0, 3), device=node_states.device))
 
         slot_embeddings = self.slot_out(node_states)
-        slot_positions = self.position_head(node_states)
         slot_log_sigmas = self.log_sigma_head(node_states).clamp(min=-4.0, max=1.0)
-        slot_log_sizes_3d = self.log_size_3d_head(node_states).clamp(min=-4.0, max=1.0)
+        if self.layout_mode == "cvae":
+            (
+                slot_positions,
+                position_mu,
+                position_logvar,
+                slot_log_sizes_3d,
+                log_size_3d_mu,
+                log_size_3d_logvar,
+                prior_mu,
+                prior_logvar,
+                posterior_mu,
+                posterior_logvar,
+                sampled_z,
+            ) = self._cvae_layout_outputs(
+                node_states,
+                scene_graph_batch,
+                layout_sample_mode=layout_sample_mode,
+            )
+        else:
+            slot_positions = self.position_head(node_states)
+            slot_log_sizes_3d = self.log_size_3d_head(node_states).clamp(min=-4.0, max=1.0)
+            position_mu = slot_positions
+            position_logvar = None
+            log_size_3d_mu = slot_log_sizes_3d
+            log_size_3d_logvar = None
+            prior_mu = None
+            prior_logvar = None
+            posterior_mu = None
+            posterior_logvar = None
+            sampled_z = None
         return GraphConditioningOutput(
             slot_embeddings=slot_embeddings,
             slot_positions=slot_positions,
+            slot_position_mu=position_mu,
+            slot_position_logvar=position_logvar,
             slot_log_sigmas=slot_log_sigmas,
             slot_log_sizes_3d=slot_log_sizes_3d,
+            slot_log_size_3d_mu=log_size_3d_mu,
+            slot_log_size_3d_logvar=log_size_3d_logvar,
             slot_mask=scene_graph_batch.position_mask.to(node_states.device),
             relation_logits=relation_logits,
+            prior_mu=prior_mu,
+            prior_logvar=prior_logvar,
+            posterior_mu=posterior_mu,
+            posterior_logvar=posterior_logvar,
+            sampled_z=sampled_z,
+        )
+
+    def _masked_mean(self, values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        mask_f = mask.to(values.dtype).unsqueeze(-1)
+        denom = mask_f.sum(dim=1).clamp_min(1.0)
+        return (values * mask_f).sum(dim=1) / denom
+
+    def _reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + std * eps
+
+    def _cvae_layout_outputs(
+        self,
+        node_states: torch.Tensor,
+        scene_graph_batch: BatchedSceneGraphs,
+        *,
+        layout_sample_mode: str,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        slot_mask = scene_graph_batch.position_mask.to(node_states.device)
+        graph_state = self._masked_mean(node_states, slot_mask)
+        prior_stats = self.prior_head(graph_state)
+        prior_mu, prior_logvar = prior_stats.chunk(2, dim=-1)
+        prior_logvar = prior_logvar.clamp(min=-8.0, max=4.0)
+
+        gt_layout = torch.cat(
+            [
+                scene_graph_batch.position_targets.to(node_states.device, dtype=node_states.dtype),
+                scene_graph_batch.log_size_targets.to(node_states.device, dtype=node_states.dtype),
+            ],
+            dim=-1,
+        )
+        gt_layout_state = self._masked_mean(self.gt_layout_encoder(gt_layout), slot_mask)
+        posterior_stats = self.posterior_head(torch.cat([graph_state, gt_layout_state], dim=-1))
+        posterior_mu, posterior_logvar = posterior_stats.chunk(2, dim=-1)
+        posterior_logvar = posterior_logvar.clamp(min=-8.0, max=4.0)
+
+        if layout_sample_mode == "posterior" or (layout_sample_mode == "auto" and self.training):
+            z = self._reparameterize(posterior_mu, posterior_logvar)
+        elif layout_sample_mode == "prior_sample":
+            z = self._reparameterize(prior_mu, prior_logvar)
+        else:
+            z = prior_mu
+
+        z_per_node = z.unsqueeze(1).expand(-1, node_states.shape[1], -1)
+        decoder_input = torch.cat([node_states, z_per_node], dim=-1)
+        position_mu = self.position_mu_head(decoder_input)
+        position_logvar = self.position_logvar_head(decoder_input).clamp(min=-8.0, max=4.0)
+        log_size_3d_mu = self.log_size_3d_mu_head(decoder_input).clamp(min=-4.0, max=1.0)
+        log_size_3d_logvar = self.log_size_3d_logvar_head(decoder_input).clamp(min=-8.0, max=4.0)
+
+        if self.training and layout_sample_mode in {"auto", "posterior"}:
+            slot_positions = position_mu + torch.exp(0.5 * position_logvar) * torch.randn_like(position_mu)
+            slot_positions = slot_positions.clamp(min=-1.0, max=1.0)
+            slot_log_sizes_3d = (
+                log_size_3d_mu + torch.exp(0.5 * log_size_3d_logvar) * torch.randn_like(log_size_3d_mu)
+            ).clamp(min=-4.0, max=1.0)
+        else:
+            slot_positions = position_mu
+            slot_log_sizes_3d = log_size_3d_mu
+
+        return (
+            slot_positions,
+            position_mu,
+            position_logvar,
+            slot_log_sizes_3d,
+            log_size_3d_mu,
+            log_size_3d_logvar,
+            prior_mu,
+            prior_logvar,
+            posterior_mu,
+            posterior_logvar,
+            z,
         )
 
 
@@ -227,6 +411,7 @@ def build_slot_conditioning(
     scene_graph_batch: BatchedSceneGraphs,
     graph_encoder: GraphSlotEncoder,
     device: str,
+    layout_sample_mode: str = "auto",
 ) -> GraphConditioningOutput:
     graph_dtype = graph_encoder.node_proj.weight.dtype
     pooled = pooled_label_embeddings(
@@ -236,7 +421,7 @@ def build_slot_conditioning(
         device=device,
         dtype=graph_dtype,
     )
-    return graph_encoder(pooled, scene_graph_batch)
+    return graph_encoder(pooled, scene_graph_batch, layout_sample_mode=layout_sample_mode)
 
 
 def embedding_alignment_loss(
@@ -277,6 +462,48 @@ def log_size_3d_loss(
         slot_log_sizes_3d[slot_mask],
         log_size_targets[slot_mask].to(slot_log_sizes_3d.dtype),
     )
+
+
+def gaussian_nll_loss(
+    mean: torch.Tensor,
+    logvar: torch.Tensor | None,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """Gaussian negative log likelihood for masked layout regression."""
+
+    if logvar is None:
+        if not mask.any():
+            return mean.new_tensor(0.0)
+        return F.smooth_l1_loss(mean[mask], target[mask].to(mean.dtype))
+    if not mask.any():
+        return mean.new_tensor(0.0)
+    target = target.to(mean.dtype)
+    error = target[mask] - mean[mask]
+    selected_logvar = logvar[mask]
+    return 0.5 * (selected_logvar + error.pow(2) * torch.exp(-selected_logvar)).mean()
+
+
+def cvae_kl_loss(output: GraphConditioningOutput) -> torch.Tensor:
+    """KL(q(z | graph, layout) || p(z | graph)) for the scene-level latent."""
+
+    if (
+        output.prior_mu is None
+        or output.prior_logvar is None
+        or output.posterior_mu is None
+        or output.posterior_logvar is None
+    ):
+        return output.slot_positions.new_tensor(0.0)
+    prior_var = torch.exp(output.prior_logvar)
+    posterior_var = torch.exp(output.posterior_logvar)
+    delta = output.posterior_mu - output.prior_mu
+    kl = 0.5 * (
+        output.prior_logvar
+        - output.posterior_logvar
+        + (posterior_var + delta.pow(2)) / prior_var.clamp_min(1e-8)
+        - 1.0
+    )
+    return kl.sum(dim=-1).mean()
 
 
 def relation_loss(

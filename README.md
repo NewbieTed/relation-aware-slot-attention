@@ -53,6 +53,17 @@ python3 -m training.pretrain_graph_encoder \
   --inverse-relation-loss-weight 0.0
 ```
 
+Optional probabilistic GNN training:
+
+```bash
+python3 -m training.pretrain_graph_encoder \
+  --config configs/flux/gnn_pretrain_3dbox_cvae.yaml
+```
+
+The CVAE mode keeps the same GNN message passing but replaces the deterministic
+layout head with a scene-level latent variable, so one prompt can sample multiple
+plausible OSCR layouts.
+
 Example generation/debug:
 
 ```bash

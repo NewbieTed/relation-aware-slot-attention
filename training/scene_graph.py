@@ -52,6 +52,7 @@ class BatchedSceneGraphs:
     edge_index: list[torch.Tensor]
     edge_types: list[torch.Tensor]
     position_targets: torch.Tensor
+    log_size_targets: torch.Tensor
     position_mask: torch.Tensor
     relation_triplets: list[list[tuple[int, int, str]]]
 
@@ -90,6 +91,7 @@ def build_batched_scene_graphs(
     scene_graphs: list[dict[str, Any]],
     slot_targets: torch.Tensor,
     slot_mask: torch.Tensor,
+    log_size_targets: torch.Tensor | None = None,
 ) -> BatchedSceneGraphs:
     edge_index: list[torch.Tensor] = []
     edge_types: list[torch.Tensor] = []
@@ -129,6 +131,15 @@ def build_batched_scene_graphs(
         edge_index=edge_index,
         edge_types=edge_types,
         position_targets=slot_targets,
+        log_size_targets=(
+            log_size_targets
+            if log_size_targets is not None
+            else torch.zeros(
+                (*slot_targets.shape[:2], 3),
+                dtype=slot_targets.dtype,
+                device=slot_targets.device,
+            )
+        ),
         position_mask=slot_mask,
         relation_triplets=relation_triplets,
     )

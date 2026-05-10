@@ -7,6 +7,8 @@ run inference with the released SeeThrough3D FLUX LoRA.
 ## Files
 
 - `gnn_pretrain_3dbox.yaml`: trains the GNN on SCOP-Depth 3D layout targets.
+- `gnn_pretrain_3dbox_cvae.yaml`: trains the probabilistic CVAE layout-head
+  variant of the GNN.
 - `eval_official_seethrough3d_spatial_1p_bf16_512.yaml`: one-prompt smoke eval.
 - `eval_official_seethrough3d_spatial_20p_bf16_512.yaml`: short benchmark sanity check.
 - `eval_official_seethrough3d_spatial_full_bf16_8bit_512.yaml`: full spatial benchmark run.
@@ -18,6 +20,13 @@ Train the GNN:
 ```bash
 python3 -m training.pretrain_graph_encoder \
   --config configs/flux/gnn_pretrain_3dbox.yaml
+```
+
+Train the CVAE GNN variant:
+
+```bash
+python3 -m training.pretrain_graph_encoder \
+  --config configs/flux/gnn_pretrain_3dbox_cvae.yaml
 ```
 
 Run the one-prompt SeeThrough3D smoke benchmark:

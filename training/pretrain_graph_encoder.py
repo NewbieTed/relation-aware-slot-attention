@@ -16,7 +16,9 @@ from .dataset import build_dataset_splits, collate_training_items
 from .graph_modules import (
     GraphSlotEncoder,
     build_slot_conditioning,
+    cvae_kl_loss,
     embedding_alignment_loss,
+    gaussian_nll_loss,
     inverse_relation_regularizer,
     log_size_3d_loss,
     log_sigma_loss,
@@ -51,6 +53,10 @@ def _save_state(output_dir: Path, *, step: int, args: argparse.Namespace) -> Non
         "inverse_relation_loss_weight": args.inverse_relation_loss_weight,
         "box_loss_weight": args.box_loss_weight,
         "box3d_loss_weight": args.box3d_loss_weight,
+        "layout_mode": args.layout_mode,
+        "latent_dim": args.latent_dim,
+        "cvae_kl_weight": args.cvae_kl_weight,
+        "cvae_kl_warmup_steps": args.cvae_kl_warmup_steps,
     }
     (output_dir / "training_state.json").write_text(json.dumps(payload, indent=2))
 
@@ -82,6 +88,12 @@ def _unwrap_graph_encoder(graph_encoder: GraphSlotEncoder, accelerator: Accelera
     return getattr(unwrapped, "_orig_mod", unwrapped)
 
 
+def _graph_layout_mode(graph_encoder: GraphSlotEncoder) -> str:
+    base = getattr(graph_encoder, "module", graph_encoder)
+    base = getattr(base, "_orig_mod", base)
+    return getattr(base, "layout_mode", "deterministic")
+
+
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Pretrain the SCOP-Depth graph encoder before full relation-aware diffusion training."
@@ -98,6 +110,8 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--slot-dim", type=int, default=512)
     parser.add_argument("--gnn-layers", type=int, default=2)
+    parser.add_argument("--layout-mode", choices=("deterministic", "cvae"), default="deterministic")
+    parser.add_argument("--latent-dim", type=int, default=64)
     parser.add_argument("--save-every", type=int, default=500)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--eval-every", type=int, default=250)
@@ -111,6 +125,8 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--inverse-relation-loss-weight", type=float, default=0.0)
     parser.add_argument("--box-loss-weight", type=float, default=0.0)
     parser.add_argument("--box3d-loss-weight", type=float, default=0.0)
+    parser.add_argument("--cvae-kl-weight", type=float, default=0.0)
+    parser.add_argument("--cvae-kl-warmup-steps", type=int, default=1000)
     parser.add_argument("--disable-tqdm", action="store_true")
     return parser
 
@@ -128,6 +144,9 @@ def _compute_graph_batch_losses(
     inverse_relation_loss_weight: float,
     box_loss_weight: float,
     box3d_loss_weight: float = 0.0,
+    cvae_kl_weight: float = 0.0,
+    cvae_kl_warmup_steps: int = 1000,
+    step: int | None = None,
 ) -> dict[str, torch.Tensor]:
     max_nodes = max(len(graph["nodes"]) for graph in batch["scene_graphs"])  # type: ignore[index]
     slot_targets, slot_mask = bbox_centers_after_crop(
@@ -152,6 +171,7 @@ def _compute_graph_batch_losses(
         batch["scene_graphs"],  # type: ignore[arg-type]
         slot_targets=slot_targets,
         slot_mask=slot_mask,
+        log_size_targets=log_size_3d_targets,
     )
     conditioning = build_slot_conditioning(
         tokenizer=tokenizer,
@@ -159,6 +179,7 @@ def _compute_graph_batch_losses(
         scene_graph_batch=scene_graph_batch,
         graph_encoder=graph_encoder,
         device=device,
+        layout_sample_mode="posterior" if _graph_layout_mode(graph_encoder) == "cvae" else "auto",
     )
     pooled_embeddings = pooled_label_embeddings(
         tokenizer=tokenizer,
@@ -168,9 +189,11 @@ def _compute_graph_batch_losses(
         dtype=conditioning.slot_embeddings.dtype,
     )
 
-    position_loss = F.smooth_l1_loss(
-        conditioning.slot_positions[conditioning.slot_mask],
-        slot_targets[conditioning.slot_mask],
+    position_loss = gaussian_nll_loss(
+        conditioning.slot_position_mu,
+        conditioning.slot_position_logvar,
+        slot_targets,
+        conditioning.slot_mask,
     )
     edge_loss = relation_loss(
         conditioning.relation_logits,
@@ -187,12 +210,27 @@ def _compute_graph_batch_losses(
         log_sigma_targets,
         conditioning.slot_mask,
     )
-    box3d_loss = log_size_3d_loss(
-        conditioning.slot_log_sizes_3d,
-        log_size_3d_targets,
-        conditioning.slot_mask,
+    box3d_loss = (
+        gaussian_nll_loss(
+            conditioning.slot_log_size_3d_mu,
+            conditioning.slot_log_size_3d_logvar,
+            log_size_3d_targets,
+            conditioning.slot_mask,
+        )
+        if _graph_layout_mode(graph_encoder) == "cvae"
+        else log_size_3d_loss(
+            conditioning.slot_log_sizes_3d,
+            log_size_3d_targets,
+            conditioning.slot_mask,
+        )
     )
     inverse_loss = inverse_relation_regularizer(graph_encoder)
+    kl_loss = cvae_kl_loss(conditioning)
+    if cvae_kl_warmup_steps > 0 and step is not None:
+        kl_scale = min(1.0, max(0.0, float(step) / float(cvae_kl_warmup_steps)))
+    else:
+        kl_scale = 1.0
+    weighted_kl = cvae_kl_weight * kl_scale * kl_loss
     total_loss = (
         position_loss_weight * position_loss
         + relation_loss_weight * edge_loss
@@ -200,6 +238,7 @@ def _compute_graph_batch_losses(
         + inverse_relation_loss_weight * inverse_loss
         + box_loss_weight * box_loss
         + box3d_loss_weight * box3d_loss
+        + weighted_kl
     )
     return {
         "loss": total_loss,
@@ -209,6 +248,8 @@ def _compute_graph_batch_losses(
         "inverse_relation_loss": inverse_loss,
         "box_loss": box_loss,
         "box3d_loss": box3d_loss,
+        "cvae_kl_loss": kl_loss,
+        "cvae_kl_weighted": weighted_kl,
     }
 
 
@@ -226,6 +267,8 @@ def _evaluate_graph_encoder(
     inverse_relation_loss_weight: float,
     box_loss_weight: float,
     box3d_loss_weight: float,
+    cvae_kl_weight: float,
+    cvae_kl_warmup_steps: int,
 ) -> dict[str, float]:
     graph_encoder.eval()
     totals = {
@@ -236,6 +279,8 @@ def _evaluate_graph_encoder(
         "inverse_relation_loss": 0.0,
         "box_loss": 0.0,
         "box3d_loss": 0.0,
+        "cvae_kl_loss": 0.0,
+        "cvae_kl_weighted": 0.0,
     }
     batch_count = 0
     for batch in dataloader:
@@ -251,6 +296,9 @@ def _evaluate_graph_encoder(
             inverse_relation_loss_weight=inverse_relation_loss_weight,
             box_loss_weight=box_loss_weight,
             box3d_loss_weight=box3d_loss_weight,
+            cvae_kl_weight=cvae_kl_weight,
+            cvae_kl_warmup_steps=cvae_kl_warmup_steps,
+            step=cvae_kl_warmup_steps,
         )
         for key in totals:
             totals[key] += float(metrics[key].item())
@@ -331,6 +379,8 @@ def main() -> int:
         text_hidden_dim=text_encoder.config.hidden_size,
         slot_dim=args.slot_dim,
         num_layers=args.gnn_layers,
+        layout_mode=args.layout_mode,
+        latent_dim=args.latent_dim,
     ).to(device)
     optimizer = torch.optim.AdamW(
         graph_encoder.parameters(),
@@ -356,6 +406,8 @@ def main() -> int:
             "inverse_relation_loss",
             "box_loss",
             "box3d_loss",
+            "cvae_kl_loss",
+            "cvae_kl_weighted",
         ],
     )
     progress_bar = tqdm(
@@ -373,6 +425,8 @@ def main() -> int:
         "inverse_relation_loss": 0.0,
         "box_loss": 0.0,
         "box3d_loss": 0.0,
+        "cvae_kl_loss": 0.0,
+        "cvae_kl_weighted": 0.0,
     }
     running_steps = 0
     while global_step < args.max_train_steps:
@@ -389,6 +443,9 @@ def main() -> int:
                 inverse_relation_loss_weight=args.inverse_relation_loss_weight,
                 box_loss_weight=args.box_loss_weight,
                 box3d_loss_weight=args.box3d_loss_weight,
+                cvae_kl_weight=args.cvae_kl_weight,
+                cvae_kl_warmup_steps=args.cvae_kl_warmup_steps,
+                step=global_step,
             )
             loss = metrics["loss"]
 
@@ -422,6 +479,8 @@ def main() -> int:
                     "inverse_relation_loss": running["inverse_relation_loss"] / running_steps,
                     "box_loss": running["box_loss"] / running_steps,
                     "box3d_loss": running["box3d_loss"] / running_steps,
+                    "cvae_kl_loss": running["cvae_kl_loss"] / running_steps,
+                    "cvae_kl_weighted": running["cvae_kl_weighted"] / running_steps,
                 }
                 if accelerator.is_main_process:
                     metrics_logger.log(train_log)
@@ -433,6 +492,7 @@ def main() -> int:
                         inv=f"{train_log['inverse_relation_loss']:.4f}",
                         box=f"{train_log['box_loss']:.4f}",
                         box3d=f"{train_log['box3d_loss']:.4f}",
+                        kl=f"{train_log['cvae_kl_loss']:.4f}",
                     )
                 running = {key: 0.0 for key in running}
                 running_steps = 0
@@ -458,6 +518,8 @@ def main() -> int:
                         inverse_relation_loss_weight=args.inverse_relation_loss_weight,
                         box_loss_weight=args.box_loss_weight,
                         box3d_loss_weight=args.box3d_loss_weight,
+                        cvae_kl_weight=args.cvae_kl_weight,
+                        cvae_kl_warmup_steps=args.cvae_kl_warmup_steps,
                     ),
                 }
                 metrics_logger.log(eval_log)
@@ -469,7 +531,8 @@ def main() -> int:
                     f"sem={eval_log['embedding_loss']:.4f}, "
                     f"inv={eval_log['inverse_relation_loss']:.4f}, "
                     f"box={eval_log['box_loss']:.4f}, "
-                    f"box3d={eval_log['box3d_loss']:.4f}"
+                    f"box3d={eval_log['box3d_loss']:.4f}, "
+                    f"kl={eval_log['cvae_kl_loss']:.4f}"
                 )
 
             if accelerator.is_main_process and global_step % args.save_every == 0:
@@ -508,6 +571,8 @@ def main() -> int:
                 inverse_relation_loss_weight=args.inverse_relation_loss_weight,
                 box_loss_weight=args.box_loss_weight,
                 box3d_loss_weight=args.box3d_loss_weight,
+                cvae_kl_weight=args.cvae_kl_weight,
+                cvae_kl_warmup_steps=args.cvae_kl_warmup_steps,
             ),
         }
         metrics_logger.log(test_log)
@@ -519,7 +584,8 @@ def main() -> int:
             f"sem={test_log['embedding_loss']:.4f}, "
             f"inv={test_log['inverse_relation_loss']:.4f}, "
             f"box={test_log['box_loss']:.4f}, "
-            f"box3d={test_log['box3d_loss']:.4f})"
+            f"box3d={test_log['box3d_loss']:.4f}, "
+            f"kl={test_log['cvae_kl_loss']:.4f})"
         )
     if accelerator.is_main_process:
         _save_state(args.output_dir, step=global_step, args=args)

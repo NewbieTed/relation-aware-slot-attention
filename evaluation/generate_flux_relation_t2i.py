@@ -27,6 +27,7 @@ from training.oscr_renderer import render_oscr_boxes
 from training.runtime import (
     DEFAULT_FLUX_MODEL_ID,
     choose_weight_dtype,
+    load_graph_encoder,
     normalize_graph_encoder_state_dict,
     resolve_torch_device,
     set_seed,
@@ -74,6 +75,12 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--slot-dim", type=int, default=512)
     parser.add_argument("--gnn-layers", type=int, default=2)
+    parser.add_argument(
+        "--gnn-layout-sample-mode",
+        choices=("auto", "prior_mean", "prior_sample"),
+        default="auto",
+        help="For CVAE graph checkpoints, use prior_mean for deterministic boxes or prior_sample for stochastic boxes.",
+    )
     parser.add_argument("--lora-rank", type=int, default=32)
     parser.add_argument("--lora-alpha", type=float, default=32.0)
     parser.add_argument(
@@ -135,17 +142,13 @@ def _load_graph_encoder(
     gnn_layers: int,
     device: str,
 ) -> GraphSlotEncoder:
-    encoder = GraphSlotEncoder(
+    encoder = load_graph_encoder(
+        path=path,
         text_hidden_dim=text_hidden_dim,
-        slot_dim=slot_dim,
-        num_layers=gnn_layers,
-    ).to(device)
-    encoder.load_state_dict(
-        normalize_graph_encoder_state_dict(torch.load(path, map_location=device)),
-        strict=False,
+        device=device,
+        dtype=torch.float32,
     )
     encoder.requires_grad_(False)
-    encoder.eval()
     return encoder
 
 
@@ -296,6 +299,7 @@ def _predict_condition(
     blender_bin: str,
     blender_cache_dir: Path,
     prompt_prefix: str,
+    gnn_layout_sample_mode: str,
 ) -> tuple[Any, Any, str, list[list[torch.Tensor]], torch.Tensor, dict[str, Any]]:
     scene_graph = parse_prompt_to_scene_graph(prompt)
     node_count = len(scene_graph["nodes"])
@@ -309,6 +313,7 @@ def _predict_condition(
         scene_graph_batch=batched_graph,
         graph_encoder=graph_encoder,
         device=graph_device,
+        layout_sample_mode=gnn_layout_sample_mode,
     )
     centers = conditioning.slot_positions.to(device)
     log_sizes = conditioning.slot_log_sizes_3d.to(device)
@@ -418,6 +423,8 @@ def _predict_condition(
     layout = {
         "prompt": prompt,
         "binding_prompt": binding_prompt.prompt,
+        "graph_layout_mode": getattr(graph_encoder, "layout_mode", "deterministic"),
+        "gnn_layout_sample_mode": gnn_layout_sample_mode,
         "nodes": scene_graph["nodes"],
         "edges": scene_graph["edges"],
         "predicted_centers": centers[0].detach().cpu().tolist(),
@@ -475,6 +482,7 @@ def main() -> int:
             blender_bin=args.blender_bin,
             blender_cache_dir=args.blender_cache_dir or (args.output_dir / "blender_condition_cache"),
             prompt_prefix=args.prompt_prefix,
+            gnn_layout_sample_mode=args.gnn_layout_sample_mode,
         )
         condition_dir = args.output_dir / "conditions"
         condition_dir.mkdir(parents=True, exist_ok=True)
@@ -556,6 +564,7 @@ def main() -> int:
         "blender_bin": args.blender_bin,
         "blender_cache_dir": str(args.blender_cache_dir or (args.output_dir / "blender_condition_cache")),
         "prompt_prefix": args.prompt_prefix,
+        "gnn_layout_sample_mode": args.gnn_layout_sample_mode,
         "seed": args.seed,
     }
     (args.output_dir / "run_config.json").write_text(json.dumps(run_config, indent=2))

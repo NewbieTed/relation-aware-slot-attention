@@ -18,6 +18,7 @@ generate:
   seed: 42
   slot_dim: 512
   gnn_layers: 2
+  gnn_layout_sample_mode: auto
   lora_rank: 128
   lora_alpha: 128
   use_official_seethrough3d_lora: true
