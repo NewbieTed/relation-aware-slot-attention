@@ -246,7 +246,24 @@ def _build_debug_payload(
         sample_states = new_states
 
     batched_node_states = sample_states.unsqueeze(0)
-    if graph_encoder.layout_mode == "cvae":
+    if graph_encoder.layout_mode == "triple_cvae":
+        conditioning = graph_encoder(
+            pooled_embeddings.unsqueeze(0),
+            batched_graph,
+            layout_sample_mode=layout_sample_mode,
+        )
+        slot_positions = conditioning.slot_positions[0]
+        position_mu = slot_positions
+        position_logvar = None
+        log_sizes_3d = conditioning.slot_log_sizes_3d[0]
+        log_size_mu = log_sizes_3d
+        log_size_logvar = None
+        prior_mu = conditioning.prior_mu
+        prior_logvar = conditioning.prior_logvar
+        posterior_mu = conditioning.posterior_mu
+        posterior_logvar = conditioning.posterior_logvar
+        sampled_z = conditioning.sampled_z
+    elif graph_encoder.layout_mode == "cvae":
         (
             batched_slot_positions,
             batched_position_mu,

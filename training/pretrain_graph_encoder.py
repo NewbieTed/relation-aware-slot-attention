@@ -15,6 +15,7 @@ from .config import parse_args_with_config
 from .dataset import build_dataset_splits, collate_training_items
 from .graph_modules import (
     GraphSlotEncoder,
+    box_3d_l1_loss,
     build_slot_conditioning,
     cvae_kl_loss,
     embedding_alignment_loss,
@@ -26,6 +27,7 @@ from .graph_modules import (
 )
 from .graph_targets import (
     bbox_centers_after_crop,
+    bbox_minmax_3d_after_crop,
     bbox_log_sigmas_after_crop,
     bbox_log_sizes_3d_after_crop,
 )
@@ -178,11 +180,18 @@ def _compute_graph_batch_losses(
         max_nodes=max_nodes,
         device=torch.device(device),
     )
+    box_3d_targets, _ = bbox_minmax_3d_after_crop(
+        batch["metadata"],  # type: ignore[arg-type]
+        batch["image_sizes"],  # type: ignore[arg-type]
+        max_nodes=max_nodes,
+        device=torch.device(device),
+    )
     scene_graph_batch = build_batched_scene_graphs(
         batch["scene_graphs"],  # type: ignore[arg-type]
         slot_targets=slot_targets,
         slot_mask=slot_mask,
         log_size_targets=log_size_3d_targets,
+        box_targets=box_3d_targets,
     )
     conditioning = build_slot_conditioning(
         tokenizer=tokenizer,
@@ -219,11 +228,18 @@ def _compute_graph_batch_losses(
         log_sigma_targets,
         conditioning.slot_mask,
     )
-    box3d_loss = log_size_3d_loss(
-        conditioning.slot_log_sizes_3d,
-        log_size_3d_targets,
-        conditioning.slot_mask,
-    )
+    if _graph_layout_mode(graph_encoder) == "triple_cvae":
+        box3d_loss = box_3d_l1_loss(
+            conditioning.slot_boxes_3d,
+            box_3d_targets,
+            conditioning.slot_mask,
+        )
+    else:
+        box3d_loss = log_size_3d_loss(
+            conditioning.slot_log_sizes_3d,
+            log_size_3d_targets,
+            conditioning.slot_mask,
+        )
     inverse_loss = inverse_relation_regularizer(graph_encoder)
     kl_loss = cvae_kl_loss(conditioning)
     if cvae_kl_warmup_steps > 0 and step is not None:

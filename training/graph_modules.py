@@ -119,6 +119,7 @@ class GraphConditioningOutput:
     slot_log_sizes_3d: torch.Tensor
     slot_log_size_3d_mu: torch.Tensor
     slot_log_size_3d_logvar: torch.Tensor | None
+    slot_boxes_3d: torch.Tensor | None
     slot_mask: torch.Tensor
     relation_logits: list[torch.Tensor]
     prior_mu: torch.Tensor | None = None
@@ -308,6 +309,12 @@ class GraphSlotEncoder(nn.Module):
                 nn.SiLU(),
                 nn.Linear(slot_dim, 3),
             )
+            self.triple_box_3d_head = nn.Sequential(
+                nn.LayerNorm(slot_dim),
+                nn.Linear(slot_dim, slot_dim),
+                nn.SiLU(),
+                nn.Linear(slot_dim, 6),
+            )
             self.posterior_head = nn.Sequential(
                 nn.LayerNorm(slot_dim * 2),
                 nn.Linear(slot_dim * 2, slot_dim),
@@ -426,6 +433,7 @@ class GraphSlotEncoder(nn.Module):
             slot_log_sizes_3d=slot_log_sizes_3d,
             slot_log_size_3d_mu=log_size_3d_mu,
             slot_log_size_3d_logvar=log_size_3d_logvar,
+            slot_boxes_3d=None,
             slot_mask=scene_graph_batch.position_mask.to(node_states.device),
             relation_logits=relation_logits,
             prior_mu=prior_mu,
@@ -489,6 +497,7 @@ class GraphSlotEncoder(nn.Module):
 
         slot_positions = torch.zeros(batch_size, max_nodes, 3, device=device, dtype=dtype)
         slot_log_sizes_3d = torch.zeros(batch_size, max_nodes, 3, device=device, dtype=dtype)
+        slot_boxes_3d = torch.zeros(batch_size, max_nodes, 6, device=device, dtype=dtype)
         decoded_nodes = torch.zeros_like(node_states)
         prior_mu = torch.zeros(batch_size, self.latent_dim, device=device, dtype=dtype)
         prior_logvar = torch.zeros_like(prior_mu)
@@ -528,15 +537,19 @@ class GraphSlotEncoder(nn.Module):
                 sample_edges,
                 self.triple_prior_layers,
             )
-            graph_state = self._triple_graph_readout(prior_nodes, prior_edges)
-            scene_prior_mu, scene_prior_logvar = self._split_stats(
-                self.triple_prior_scene_head(graph_state)
-            )
-            obj_prior_mu, obj_prior_logvar = self._split_stats(
-                self.triple_prior_object_head(prior_nodes)
-            )
+            scene_prior_mu = torch.zeros(self.latent_dim, device=device, dtype=dtype)
+            scene_prior_logvar = torch.zeros_like(scene_prior_mu)
+            obj_prior_mu = torch.zeros(valid_node_count, self.latent_dim, device=device, dtype=dtype)
+            obj_prior_logvar = torch.zeros_like(obj_prior_mu)
 
-            layout_features = self.gt_layout_encoder(gt_layout[batch_index, :valid_node_count])
+            if scene_graph_batch.box_targets is not None:
+                posterior_layout = scene_graph_batch.box_targets[batch_index, :valid_node_count].to(
+                    device=device,
+                    dtype=dtype,
+                )
+            else:
+                posterior_layout = gt_layout[batch_index, :valid_node_count]
+            layout_features = self.gt_layout_encoder(posterior_layout)
             posterior_input_nodes = self.posterior_node_init(
                 torch.cat([sample_nodes, layout_features], dim=-1)
             )
@@ -574,8 +587,14 @@ class GraphSlotEncoder(nn.Module):
                 sample_edges,
                 self.triple_decoder_layers,
             )
-            positions = self.triple_position_head(decoder_nodes)
-            log_sizes = self.triple_log_size_3d_head(decoder_nodes).clamp(min=-4.0, max=1.0)
+            raw_boxes = self.triple_box_3d_head(decoder_nodes).sigmoid()
+            box_mins = torch.minimum(raw_boxes[:, :3], raw_boxes[:, 3:])
+            box_maxs = torch.maximum(raw_boxes[:, :3], raw_boxes[:, 3:])
+            boxes = torch.cat([box_mins, box_maxs], dim=-1)
+            centers_01 = (box_mins + box_maxs) * 0.5
+            sizes = (box_maxs - box_mins).clamp(min=0.03)
+            positions = centers_01.mul(2.0).sub(1.0)
+            log_sizes = sizes.log()
 
             slot_positions[batch_index, :valid_node_count] = positions
             slot_log_sizes_3d[batch_index, :valid_node_count] = log_sizes
@@ -590,6 +609,7 @@ class GraphSlotEncoder(nn.Module):
             object_posterior_logvar[batch_index, :valid_node_count] = obj_posterior_logvar
             sampled_scene_z[batch_index] = scene_z
             sampled_object_z[batch_index, :valid_node_count] = object_z
+            slot_boxes_3d[batch_index, :valid_node_count] = boxes
 
             logits_per_edge: list[torch.Tensor] = []
             for src, dst, _relation in scene_graph_batch.relation_triplets[batch_index]:
@@ -612,6 +632,7 @@ class GraphSlotEncoder(nn.Module):
             slot_log_sizes_3d=slot_log_sizes_3d,
             slot_log_size_3d_mu=slot_log_sizes_3d,
             slot_log_size_3d_logvar=None,
+            slot_boxes_3d=slot_boxes_3d,
             slot_mask=slot_mask,
             relation_logits=relation_logits,
             prior_mu=prior_mu,
@@ -831,6 +852,24 @@ def log_size_3d_loss(
     )
 
 
+def box_3d_l1_loss(
+    slot_boxes_3d: torch.Tensor | None,
+    box_targets: torch.Tensor | None,
+    slot_mask: torch.Tensor,
+) -> torch.Tensor:
+    """3D_SLN-style L1 loss on normalized ``[x0,y0,z0,x1,y1,z1]`` boxes."""
+
+    if slot_boxes_3d is None or box_targets is None or not slot_mask.any():
+        fallback = slot_mask.new_tensor(0.0, dtype=torch.float32)
+        if slot_boxes_3d is not None:
+            fallback = slot_boxes_3d.new_tensor(0.0)
+        return fallback
+    return F.l1_loss(
+        slot_boxes_3d[slot_mask],
+        box_targets[slot_mask].to(slot_boxes_3d.dtype),
+    )
+
+
 def gaussian_nll_loss(
     mean: torch.Tensor,
     logvar: torch.Tensor | None,
@@ -869,20 +908,17 @@ def _diagonal_gaussian_kl(
 
 
 def cvae_kl_loss(output: GraphConditioningOutput) -> torch.Tensor:
-    """KL(q || p) for scene-level and optional object-level CVAE latents."""
+    """KL to ``N(0, I)`` for scene-level and optional object-level CVAE latents."""
 
-    if (
-        output.prior_mu is None
-        or output.prior_logvar is None
-        or output.posterior_mu is None
-        or output.posterior_logvar is None
-    ):
+    if output.posterior_mu is None or output.posterior_logvar is None:
         return output.slot_positions.new_tensor(0.0)
+    prior_mu = torch.zeros_like(output.posterior_mu)
+    prior_logvar = torch.zeros_like(output.posterior_logvar)
     scene_kl = _diagonal_gaussian_kl(
         output.posterior_mu,
         output.posterior_logvar,
-        output.prior_mu,
-        output.prior_logvar,
+        prior_mu,
+        prior_logvar,
     ).sum(dim=-1).mean()
     if (
         output.object_prior_mu is None
@@ -891,11 +927,13 @@ def cvae_kl_loss(output: GraphConditioningOutput) -> torch.Tensor:
         or output.object_posterior_logvar is None
     ):
         return scene_kl
+    object_prior_mu = torch.zeros_like(output.object_posterior_mu)
+    object_prior_logvar = torch.zeros_like(output.object_posterior_logvar)
     object_kl = _diagonal_gaussian_kl(
         output.object_posterior_mu,
         output.object_posterior_logvar,
-        output.object_prior_mu,
-        output.object_prior_logvar,
+        object_prior_mu,
+        object_prior_logvar,
     ).sum(dim=-1)
     if not output.slot_mask.any():
         return scene_kl
