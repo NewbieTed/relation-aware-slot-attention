@@ -110,7 +110,10 @@ def infer_graph_encoder_config(state_dict: dict[str, torch.Tensor]) -> tuple[int
         for key in state_dict
         if key.startswith("layers.") and key.split(".")[1].isdigit()
     }
-    if "prior_head.3.weight" in state_dict:
+    if "triple_prior_scene_head.3.weight" in state_dict:
+        layout_mode = "triple_cvae"
+        latent_dim = int(state_dict["triple_prior_scene_head.3.weight"].shape[0] // 2)
+    elif "prior_head.3.weight" in state_dict:
         layout_mode = "cvae"
         latent_dim = int(state_dict["prior_head.3.weight"].shape[0] // 2)
     else:

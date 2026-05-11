@@ -18,6 +18,10 @@ The graph encoder supports two layout heads:
   over plausible 3D layouts. During training it uses
   `q(z | graph, ground_truth_boxes)` and at inference it uses
   `p(z | graph)`.
+- `layout_mode: triple_cvae`: a 3D_SLN-style variant that updates contextual
+  subject-relation-object edge states, uses separate prior/posterior triple-GNNs,
+  samples both scene-level and object-level latents, and runs a decoder
+  triple-GNN before predicting centers and 3D sizes.
 
 The graph trainer creates deterministic train/eval/test splits, saves
 `data_split.json`, writes losses to `metrics.jsonl` and `metrics.csv`, and saves
@@ -34,4 +38,11 @@ Example CVAE graph pretraining:
 ```bash
 python3 -m training.pretrain_graph_encoder \
   --config configs/flux/gnn_pretrain_3dbox_cvae.yaml
+```
+
+Example triple-GNN CVAE pretraining:
+
+```bash
+python3 -m training.pretrain_graph_encoder \
+  --config configs/flux/gnn_pretrain_3dbox_triple_cvae.yaml
 ```

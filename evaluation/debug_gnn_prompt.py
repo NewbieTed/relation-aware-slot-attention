@@ -498,7 +498,7 @@ def _render_text_report(payload: dict[str, Any], *, max_vector_elements: int) ->
     if payload["cvae"] is not None:
         cvae = payload["cvae"]
         lines.append("CVAE layout head:")
-        lines.append("  graph_state = masked_mean(final_node_states)")
+        lines.append("  graph_state = attention_readout(final_node_states, slot_mask)")
         lines.append("  prior_stats = prior_head(graph_state)")
         lines.append(
             f"    prior_mu = {_preview_vector(torch.tensor(cvae['prior_mu']), max_elements=max_vector_elements)}"
@@ -506,7 +506,7 @@ def _render_text_report(payload: dict[str, Any], *, max_vector_elements: int) ->
         lines.append(
             f"    prior_logvar = {_preview_vector(torch.tensor(cvae['prior_logvar']), max_elements=max_vector_elements)}"
         )
-        lines.append("  gt_layout_state = masked_mean(gt_layout_encoder(concat(gt_center, gt_log_size)))")
+        lines.append("  gt_layout_state = attention_readout(gt_layout_encoder(concat(gt_center, gt_log_size)), slot_mask)")
         lines.append("  posterior_stats = posterior_head(concat(graph_state, gt_layout_state))")
         lines.append(
             f"    posterior_mu = {_preview_vector(torch.tensor(cvae['posterior_mu']), max_elements=max_vector_elements)}"

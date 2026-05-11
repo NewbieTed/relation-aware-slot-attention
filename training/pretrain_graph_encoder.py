@@ -100,7 +100,7 @@ def _metric_keys(layout_mode: str) -> list[str]:
         "relation_loss",
         "box3d_loss",
     ]
-    if layout_mode == "cvae":
+    if layout_mode in {"cvae", "triple_cvae"}:
         keys.extend(["cvae_kl_loss", "cvae_kl_weighted"])
     return keys
 
@@ -121,7 +121,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--slot-dim", type=int, default=512)
     parser.add_argument("--gnn-layers", type=int, default=2)
-    parser.add_argument("--layout-mode", choices=("deterministic", "cvae"), default="deterministic")
+    parser.add_argument("--layout-mode", choices=("deterministic", "cvae", "triple_cvae"), default="deterministic")
     parser.add_argument("--latent-dim", type=int, default=64)
     parser.add_argument("--save-every", type=int, default=500)
     parser.add_argument("--log-every", type=int, default=10)
@@ -190,7 +190,7 @@ def _compute_graph_batch_losses(
         scene_graph_batch=scene_graph_batch,
         graph_encoder=graph_encoder,
         device=device,
-        layout_sample_mode="posterior" if _graph_layout_mode(graph_encoder) == "cvae" else "auto",
+        layout_sample_mode="posterior" if _graph_layout_mode(graph_encoder) in {"cvae", "triple_cvae"} else "auto",
     )
     pooled_embeddings = pooled_label_embeddings(
         tokenizer=tokenizer,
@@ -452,7 +452,7 @@ def main() -> int:
                         "rel": f"{train_log['relation_loss']:.4f}",
                         "box3d": f"{train_log['box3d_loss']:.4f}",
                     }
-                    if args.layout_mode == "cvae":
+                    if args.layout_mode in {"cvae", "triple_cvae"}:
                         postfix["kl"] = f"{train_log['cvae_kl_loss']:.4f}"
                     progress_bar.set_postfix(**postfix)
                 running = {key: 0.0 for key in metric_keys}
@@ -490,7 +490,7 @@ def main() -> int:
                     f"rel={eval_log['relation_loss']:.4f}, "
                     f"box3d={eval_log['box3d_loss']:.4f}"
                 )
-                if args.layout_mode == "cvae":
+                if args.layout_mode in {"cvae", "triple_cvae"}:
                     summary += f", kl={eval_log['cvae_kl_loss']:.4f}"
                 print(summary)
 
@@ -542,7 +542,7 @@ def main() -> int:
             f"rel={test_log['relation_loss']:.4f}, "
             f"box3d={test_log['box3d_loss']:.4f}"
         )
-        if args.layout_mode == "cvae":
+        if args.layout_mode in {"cvae", "triple_cvae"}:
             summary += f", kl={test_log['cvae_kl_loss']:.4f}"
         summary += ")"
         print(summary)

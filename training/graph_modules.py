@@ -59,6 +59,56 @@ class GraphMessagePassingLayer(nn.Module):
         return node_states + self.update(torch.cat([node_states, aggregated], dim=-1))
 
 
+class TripleGraphConvLayer(nn.Module):
+    """3D_SLN-style triple update over subject, relation, and object states."""
+
+    def __init__(self, node_dim: int, edge_dim: int, hidden_dim: int | None = None) -> None:
+        super().__init__()
+        hidden_dim = hidden_dim or node_dim * 2
+        self.node_dim = node_dim
+        self.edge_dim = edge_dim
+        self.triple_mlp = nn.Sequential(
+            nn.Linear(node_dim * 2 + edge_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, node_dim * 2 + edge_dim),
+        )
+        self.node_update = nn.Sequential(
+            nn.Linear(node_dim * 2, node_dim),
+            nn.SiLU(),
+            nn.Linear(node_dim, node_dim),
+        )
+
+    def forward(
+        self,
+        node_states: torch.Tensor,
+        edge_states: torch.Tensor,
+        edge_index: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if edge_index.numel() == 0:
+            return node_states, edge_states
+
+        src = edge_index[:, 0]
+        dst = edge_index[:, 1]
+        triple_input = torch.cat([node_states[src], edge_states, node_states[dst]], dim=-1)
+        triple_output = self.triple_mlp(triple_input)
+        src_messages = triple_output[:, : self.node_dim]
+        edge_updates = triple_output[:, self.node_dim : self.node_dim + self.edge_dim]
+        dst_messages = triple_output[:, self.node_dim + self.edge_dim :]
+
+        aggregated = torch.zeros_like(node_states)
+        counts = torch.zeros(node_states.shape[0], 1, device=node_states.device, dtype=node_states.dtype)
+        aggregated.index_add_(0, src, src_messages)
+        aggregated.index_add_(0, dst, dst_messages)
+        ones = torch.ones(edge_index.shape[0], 1, device=node_states.device, dtype=node_states.dtype)
+        counts.index_add_(0, src, ones)
+        counts.index_add_(0, dst, ones)
+        aggregated = aggregated / counts.clamp_min(1.0)
+
+        new_node_states = node_states + self.node_update(torch.cat([node_states, aggregated], dim=-1))
+        new_edge_states = edge_states + edge_updates
+        return new_node_states, new_edge_states
+
+
 @dataclass
 class GraphConditioningOutput:
     slot_embeddings: torch.Tensor
@@ -76,6 +126,11 @@ class GraphConditioningOutput:
     posterior_mu: torch.Tensor | None = None
     posterior_logvar: torch.Tensor | None = None
     sampled_z: torch.Tensor | None = None
+    object_prior_mu: torch.Tensor | None = None
+    object_prior_logvar: torch.Tensor | None = None
+    object_posterior_mu: torch.Tensor | None = None
+    object_posterior_logvar: torch.Tensor | None = None
+    sampled_object_z: torch.Tensor | None = None
 
 
 class GraphSlotEncoder(nn.Module):
@@ -89,7 +144,7 @@ class GraphSlotEncoder(nn.Module):
         latent_dim: int = 64,
     ) -> None:
         super().__init__()
-        if layout_mode not in {"deterministic", "cvae"}:
+        if layout_mode not in {"deterministic", "cvae", "triple_cvae"}:
             raise ValueError(f"Unsupported layout_mode: {layout_mode}")
         self.layout_mode = layout_mode
         self.latent_dim = latent_dim
@@ -152,11 +207,106 @@ class GraphSlotEncoder(nn.Module):
                 nn.SiLU(),
                 nn.Linear(slot_dim, slot_dim),
             )
+            self.graph_readout_score = nn.Sequential(
+                nn.LayerNorm(slot_dim),
+                nn.Linear(slot_dim, slot_dim // 2),
+                nn.SiLU(),
+                nn.Linear(slot_dim // 2, 1),
+            )
+            self.layout_readout_score = nn.Sequential(
+                nn.LayerNorm(slot_dim),
+                nn.Linear(slot_dim, slot_dim // 2),
+                nn.SiLU(),
+                nn.Linear(slot_dim // 2, 1),
+            )
             self.prior_head = nn.Sequential(
                 nn.LayerNorm(slot_dim),
                 nn.Linear(slot_dim, slot_dim),
                 nn.SiLU(),
                 nn.Linear(slot_dim, latent_dim * 2),
+            )
+        if self.layout_mode == "triple_cvae":
+            self.edge_proj = nn.Linear(relation_dim, slot_dim)
+            self.posterior_node_init = nn.Sequential(
+                nn.LayerNorm(slot_dim * 2),
+                nn.Linear(slot_dim * 2, slot_dim),
+                nn.SiLU(),
+                nn.Linear(slot_dim, slot_dim),
+            )
+            self.gt_layout_encoder = nn.Sequential(
+                nn.Linear(6, slot_dim),
+                nn.SiLU(),
+                nn.Linear(slot_dim, slot_dim),
+            )
+            self.triple_prior_layers = nn.ModuleList(
+                TripleGraphConvLayer(slot_dim, slot_dim) for _ in range(num_layers)
+            )
+            self.triple_posterior_layers = nn.ModuleList(
+                TripleGraphConvLayer(slot_dim, slot_dim) for _ in range(num_layers)
+            )
+            self.triple_decoder_layers = nn.ModuleList(
+                TripleGraphConvLayer(slot_dim, slot_dim) for _ in range(num_layers)
+            )
+            self.triple_node_readout_score = nn.Sequential(
+                nn.LayerNorm(slot_dim),
+                nn.Linear(slot_dim, slot_dim // 2),
+                nn.SiLU(),
+                nn.Linear(slot_dim // 2, 1),
+            )
+            self.triple_edge_readout_score = nn.Sequential(
+                nn.LayerNorm(slot_dim),
+                nn.Linear(slot_dim, slot_dim // 2),
+                nn.SiLU(),
+                nn.Linear(slot_dim // 2, 1),
+            )
+            self.triple_graph_fuse = nn.Sequential(
+                nn.LayerNorm(slot_dim * 2),
+                nn.Linear(slot_dim * 2, slot_dim),
+                nn.SiLU(),
+                nn.Linear(slot_dim, slot_dim),
+            )
+            self.triple_prior_scene_head = nn.Sequential(
+                nn.LayerNorm(slot_dim),
+                nn.Linear(slot_dim, slot_dim),
+                nn.SiLU(),
+                nn.Linear(slot_dim, latent_dim * 2),
+            )
+            self.triple_posterior_scene_head = nn.Sequential(
+                nn.LayerNorm(slot_dim),
+                nn.Linear(slot_dim, slot_dim),
+                nn.SiLU(),
+                nn.Linear(slot_dim, latent_dim * 2),
+            )
+            self.triple_prior_object_head = nn.Sequential(
+                nn.LayerNorm(slot_dim),
+                nn.Linear(slot_dim, slot_dim),
+                nn.SiLU(),
+                nn.Linear(slot_dim, latent_dim * 2),
+            )
+            self.triple_posterior_object_head = nn.Sequential(
+                nn.LayerNorm(slot_dim),
+                nn.Linear(slot_dim, slot_dim),
+                nn.SiLU(),
+                nn.Linear(slot_dim, latent_dim * 2),
+            )
+            self.triple_decoder_node_in = nn.Sequential(
+                nn.LayerNorm(slot_dim + latent_dim * 2),
+                nn.Linear(slot_dim + latent_dim * 2, slot_dim),
+                nn.SiLU(),
+                nn.Linear(slot_dim, slot_dim),
+            )
+            self.triple_position_head = nn.Sequential(
+                nn.LayerNorm(slot_dim),
+                nn.Linear(slot_dim, slot_dim),
+                nn.SiLU(),
+                nn.Linear(slot_dim, 3),
+                nn.Tanh(),
+            )
+            self.triple_log_size_3d_head = nn.Sequential(
+                nn.LayerNorm(slot_dim),
+                nn.Linear(slot_dim, slot_dim),
+                nn.SiLU(),
+                nn.Linear(slot_dim, 3),
             )
             self.posterior_head = nn.Sequential(
                 nn.LayerNorm(slot_dim * 2),
@@ -197,6 +347,12 @@ class GraphSlotEncoder(nn.Module):
             raise ValueError(f"Unsupported layout_sample_mode: {layout_sample_mode}")
         batch_size, max_nodes, _ = pooled_label_embeddings.shape
         node_states = self.node_proj(pooled_label_embeddings)
+        if self.layout_mode == "triple_cvae":
+            return self._triple_cvae_forward(
+                node_states,
+                scene_graph_batch,
+                layout_sample_mode=layout_sample_mode,
+            )
         relation_logits: list[torch.Tensor] = []
 
         for batch_index in range(batch_size):
@@ -279,10 +435,213 @@ class GraphSlotEncoder(nn.Module):
             sampled_z=sampled_z,
         )
 
-    def _masked_mean(self, values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        mask_f = mask.to(values.dtype).unsqueeze(-1)
-        denom = mask_f.sum(dim=1).clamp_min(1.0)
-        return (values * mask_f).sum(dim=1) / denom
+    def _edge_readout(self, edge_states: torch.Tensor) -> torch.Tensor:
+        if edge_states.numel() == 0:
+            return edge_states.new_zeros(edge_states.shape[-1])
+        edge_mask = torch.ones(1, edge_states.shape[0], device=edge_states.device, dtype=torch.bool)
+        readout, _weights = self._attention_readout(
+            edge_states.unsqueeze(0),
+            edge_mask,
+            self.triple_edge_readout_score,
+        )
+        return readout.squeeze(0)
+
+    def _triple_graph_readout(
+        self,
+        node_states: torch.Tensor,
+        edge_states: torch.Tensor,
+    ) -> torch.Tensor:
+        node_mask = torch.ones(1, node_states.shape[0], device=node_states.device, dtype=torch.bool)
+        node_readout, _weights = self._attention_readout(
+            node_states.unsqueeze(0),
+            node_mask,
+            self.triple_node_readout_score,
+        )
+        edge_readout = self._edge_readout(edge_states).unsqueeze(0)
+        return self.triple_graph_fuse(torch.cat([node_readout, edge_readout], dim=-1)).squeeze(0)
+
+    def _run_triple_layers(
+        self,
+        node_states: torch.Tensor,
+        edge_states: torch.Tensor,
+        edge_index: torch.Tensor,
+        layers: nn.ModuleList,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        for layer in layers:
+            node_states, edge_states = layer(node_states, edge_states, edge_index)
+        return node_states, edge_states
+
+    def _split_stats(self, stats: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        mu, logvar = stats.chunk(2, dim=-1)
+        return mu, logvar.clamp(min=-8.0, max=4.0)
+
+    def _triple_cvae_forward(
+        self,
+        node_states: torch.Tensor,
+        scene_graph_batch: BatchedSceneGraphs,
+        *,
+        layout_sample_mode: str,
+    ) -> GraphConditioningOutput:
+        batch_size, max_nodes, _ = node_states.shape
+        device = node_states.device
+        dtype = node_states.dtype
+        slot_mask = scene_graph_batch.position_mask.to(device)
+
+        slot_positions = torch.zeros(batch_size, max_nodes, 3, device=device, dtype=dtype)
+        slot_log_sizes_3d = torch.zeros(batch_size, max_nodes, 3, device=device, dtype=dtype)
+        decoded_nodes = torch.zeros_like(node_states)
+        prior_mu = torch.zeros(batch_size, self.latent_dim, device=device, dtype=dtype)
+        prior_logvar = torch.zeros_like(prior_mu)
+        posterior_mu = torch.zeros_like(prior_mu)
+        posterior_logvar = torch.zeros_like(prior_mu)
+        object_prior_mu = torch.zeros(batch_size, max_nodes, self.latent_dim, device=device, dtype=dtype)
+        object_prior_logvar = torch.zeros_like(object_prior_mu)
+        object_posterior_mu = torch.zeros_like(object_prior_mu)
+        object_posterior_logvar = torch.zeros_like(object_prior_mu)
+        sampled_scene_z = torch.zeros_like(prior_mu)
+        sampled_object_z = torch.zeros_like(object_prior_mu)
+        relation_logits: list[torch.Tensor] = []
+
+        gt_layout = torch.cat(
+            [
+                scene_graph_batch.position_targets.to(device=device, dtype=dtype),
+                scene_graph_batch.log_size_targets.to(device=device, dtype=dtype),
+            ],
+            dim=-1,
+        )
+
+        for batch_index in range(batch_size):
+            valid_node_count = int(slot_mask[batch_index].sum().item())
+            if valid_node_count == 0:
+                relation_logits.append(torch.zeros((0, 3), device=device, dtype=dtype))
+                continue
+
+            sample_nodes = node_states[batch_index, :valid_node_count]
+            sample_edges = scene_graph_batch.edge_index[batch_index].to(device)
+            sample_edge_types = scene_graph_batch.edge_types[batch_index].to(device)
+            relation_vectors = self.relation_embedding(sample_edge_types).to(dtype=dtype)
+            edge_states = self.edge_proj(relation_vectors)
+
+            prior_nodes, prior_edges = self._run_triple_layers(
+                sample_nodes,
+                edge_states,
+                sample_edges,
+                self.triple_prior_layers,
+            )
+            graph_state = self._triple_graph_readout(prior_nodes, prior_edges)
+            scene_prior_mu, scene_prior_logvar = self._split_stats(
+                self.triple_prior_scene_head(graph_state)
+            )
+            obj_prior_mu, obj_prior_logvar = self._split_stats(
+                self.triple_prior_object_head(prior_nodes)
+            )
+
+            layout_features = self.gt_layout_encoder(gt_layout[batch_index, :valid_node_count])
+            posterior_input_nodes = self.posterior_node_init(
+                torch.cat([sample_nodes, layout_features], dim=-1)
+            )
+            posterior_nodes, posterior_edges = self._run_triple_layers(
+                posterior_input_nodes,
+                edge_states,
+                sample_edges,
+                self.triple_posterior_layers,
+            )
+            posterior_graph_state = self._triple_graph_readout(posterior_nodes, posterior_edges)
+            scene_posterior_mu, scene_posterior_logvar = self._split_stats(
+                self.triple_posterior_scene_head(posterior_graph_state)
+            )
+            obj_posterior_mu, obj_posterior_logvar = self._split_stats(
+                self.triple_posterior_object_head(posterior_nodes)
+            )
+
+            if layout_sample_mode == "posterior" or (layout_sample_mode == "auto" and self.training):
+                scene_z = self._reparameterize(scene_posterior_mu, scene_posterior_logvar)
+                object_z = self._reparameterize(obj_posterior_mu, obj_posterior_logvar)
+            elif layout_sample_mode == "prior_sample":
+                scene_z = self._reparameterize(scene_prior_mu, scene_prior_logvar)
+                object_z = self._reparameterize(obj_prior_mu, obj_prior_logvar)
+            else:
+                scene_z = scene_prior_mu
+                object_z = obj_prior_mu
+
+            scene_z_nodes = scene_z.unsqueeze(0).expand(valid_node_count, -1)
+            decoder_nodes = self.triple_decoder_node_in(
+                torch.cat([prior_nodes, scene_z_nodes, object_z], dim=-1)
+            )
+            decoder_nodes, decoder_edges = self._run_triple_layers(
+                decoder_nodes,
+                prior_edges,
+                sample_edges,
+                self.triple_decoder_layers,
+            )
+            positions = self.triple_position_head(decoder_nodes)
+            log_sizes = self.triple_log_size_3d_head(decoder_nodes).clamp(min=-4.0, max=1.0)
+
+            slot_positions[batch_index, :valid_node_count] = positions
+            slot_log_sizes_3d[batch_index, :valid_node_count] = log_sizes
+            decoded_nodes[batch_index, :valid_node_count] = decoder_nodes
+            prior_mu[batch_index] = scene_prior_mu
+            prior_logvar[batch_index] = scene_prior_logvar
+            posterior_mu[batch_index] = scene_posterior_mu
+            posterior_logvar[batch_index] = scene_posterior_logvar
+            object_prior_mu[batch_index, :valid_node_count] = obj_prior_mu
+            object_prior_logvar[batch_index, :valid_node_count] = obj_prior_logvar
+            object_posterior_mu[batch_index, :valid_node_count] = obj_posterior_mu
+            object_posterior_logvar[batch_index, :valid_node_count] = obj_posterior_logvar
+            sampled_scene_z[batch_index] = scene_z
+            sampled_object_z[batch_index, :valid_node_count] = object_z
+
+            logits_per_edge: list[torch.Tensor] = []
+            for src, dst, _relation in scene_graph_batch.relation_triplets[batch_index]:
+                logits_per_edge.append(
+                    self.relation_head(torch.cat([decoder_nodes[src], decoder_nodes[dst]], dim=-1))
+                )
+            if logits_per_edge:
+                relation_logits.append(torch.stack(logits_per_edge, dim=0))
+            else:
+                relation_logits.append(torch.zeros((0, 3), device=device, dtype=dtype))
+
+        slot_embeddings = self.slot_out(decoded_nodes)
+        slot_log_sigmas = self.log_sigma_head(decoded_nodes).clamp(min=-4.0, max=1.0)
+        return GraphConditioningOutput(
+            slot_embeddings=slot_embeddings,
+            slot_positions=slot_positions,
+            slot_position_mu=slot_positions,
+            slot_position_logvar=None,
+            slot_log_sigmas=slot_log_sigmas,
+            slot_log_sizes_3d=slot_log_sizes_3d,
+            slot_log_size_3d_mu=slot_log_sizes_3d,
+            slot_log_size_3d_logvar=None,
+            slot_mask=slot_mask,
+            relation_logits=relation_logits,
+            prior_mu=prior_mu,
+            prior_logvar=prior_logvar,
+            posterior_mu=posterior_mu,
+            posterior_logvar=posterior_logvar,
+            sampled_z=sampled_scene_z,
+            object_prior_mu=object_prior_mu,
+            object_prior_logvar=object_prior_logvar,
+            object_posterior_mu=object_posterior_mu,
+            object_posterior_logvar=object_posterior_logvar,
+            sampled_object_z=sampled_object_z,
+        )
+
+    def _attention_readout(
+        self,
+        values: torch.Tensor,
+        mask: torch.Tensor,
+        score_head: nn.Module,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        scores = score_head(values).squeeze(-1)
+        scores = scores.masked_fill(~mask.to(torch.bool), torch.finfo(scores.dtype).min)
+        empty = ~mask.any(dim=1)
+        if empty.any():
+            scores = scores.clone()
+            scores[empty] = 0.0
+        weights = torch.softmax(scores, dim=1)
+        weights = weights * mask.to(weights.dtype)
+        weights = weights / weights.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        return (values * weights.unsqueeze(-1)).sum(dim=1), weights
 
     def _reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
         std = torch.exp(0.5 * logvar)
@@ -309,7 +668,11 @@ class GraphSlotEncoder(nn.Module):
         torch.Tensor,
     ]:
         slot_mask = scene_graph_batch.position_mask.to(node_states.device)
-        graph_state = self._masked_mean(node_states, slot_mask)
+        graph_state, _graph_readout_weights = self._attention_readout(
+            node_states,
+            slot_mask,
+            self.graph_readout_score,
+        )
         prior_stats = self.prior_head(graph_state)
         prior_mu, prior_logvar = prior_stats.chunk(2, dim=-1)
         prior_logvar = prior_logvar.clamp(min=-8.0, max=4.0)
@@ -321,7 +684,11 @@ class GraphSlotEncoder(nn.Module):
             ],
             dim=-1,
         )
-        gt_layout_state = self._masked_mean(self.gt_layout_encoder(gt_layout), slot_mask)
+        gt_layout_state, _layout_readout_weights = self._attention_readout(
+            self.gt_layout_encoder(gt_layout),
+            slot_mask,
+            self.layout_readout_score,
+        )
         posterior_stats = self.posterior_head(torch.cat([graph_state, gt_layout_state], dim=-1))
         posterior_mu, posterior_logvar = posterior_stats.chunk(2, dim=-1)
         posterior_logvar = posterior_logvar.clamp(min=-8.0, max=4.0)
@@ -484,8 +851,25 @@ def gaussian_nll_loss(
     return 0.5 * (selected_logvar + error.pow(2) * torch.exp(-selected_logvar)).mean()
 
 
+def _diagonal_gaussian_kl(
+    posterior_mu: torch.Tensor,
+    posterior_logvar: torch.Tensor,
+    prior_mu: torch.Tensor,
+    prior_logvar: torch.Tensor,
+) -> torch.Tensor:
+    prior_var = torch.exp(prior_logvar)
+    posterior_var = torch.exp(posterior_logvar)
+    delta = posterior_mu - prior_mu
+    return 0.5 * (
+        prior_logvar
+        - posterior_logvar
+        + (posterior_var + delta.pow(2)) / prior_var.clamp_min(1e-8)
+        - 1.0
+    )
+
+
 def cvae_kl_loss(output: GraphConditioningOutput) -> torch.Tensor:
-    """KL(q(z | graph, layout) || p(z | graph)) for the scene-level latent."""
+    """KL(q || p) for scene-level and optional object-level CVAE latents."""
 
     if (
         output.prior_mu is None
@@ -494,16 +878,29 @@ def cvae_kl_loss(output: GraphConditioningOutput) -> torch.Tensor:
         or output.posterior_logvar is None
     ):
         return output.slot_positions.new_tensor(0.0)
-    prior_var = torch.exp(output.prior_logvar)
-    posterior_var = torch.exp(output.posterior_logvar)
-    delta = output.posterior_mu - output.prior_mu
-    kl = 0.5 * (
-        output.prior_logvar
-        - output.posterior_logvar
-        + (posterior_var + delta.pow(2)) / prior_var.clamp_min(1e-8)
-        - 1.0
-    )
-    return kl.sum(dim=-1).mean()
+    scene_kl = _diagonal_gaussian_kl(
+        output.posterior_mu,
+        output.posterior_logvar,
+        output.prior_mu,
+        output.prior_logvar,
+    ).sum(dim=-1).mean()
+    if (
+        output.object_prior_mu is None
+        or output.object_prior_logvar is None
+        or output.object_posterior_mu is None
+        or output.object_posterior_logvar is None
+    ):
+        return scene_kl
+    object_kl = _diagonal_gaussian_kl(
+        output.object_posterior_mu,
+        output.object_posterior_logvar,
+        output.object_prior_mu,
+        output.object_prior_logvar,
+    ).sum(dim=-1)
+    if not output.slot_mask.any():
+        return scene_kl
+    object_kl = object_kl[output.slot_mask].mean()
+    return scene_kl + object_kl
 
 
 def relation_loss(
