@@ -15,16 +15,22 @@ from typing import Any
 
 import torch
 from PIL import Image, ImageDraw, ImageFont
-from transformers import CLIPTextModel, CLIPTokenizer
 
 from evaluation.prompt_parser import parse_prompt_to_scene_graph
 from training.graph_modules import build_slot_conditioning
 from training.oscr_renderer import render_oscr_boxes
-from training.runtime import load_graph_encoder, resolve_torch_device
+from training.runtime import (
+    DEFAULT_FLUX_MODEL_ID,
+    infer_graph_encoder_config,
+    infer_text_encoder_type,
+    load_graph_encoder,
+    load_graph_label_encoder,
+    normalize_graph_encoder_state_dict,
+    resolve_torch_device,
+)
 from training.scene_graph import build_batched_scene_graphs
 
 
-DEFAULT_CLIP_MODEL_ID = "runwayml/stable-diffusion-v1-5"
 CANVAS_SIZE = 512
 COLORS = ["#00d5ff", "#ff3366", "#2a9d8f", "#f77f00", "#ffd166", "#9b5de5"]
 
@@ -40,7 +46,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt-file", type=Path, default=None, help="Optional newline prompt file.")
     parser.add_argument("--graph-encoder-path", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--model-id", type=str, default=DEFAULT_CLIP_MODEL_ID)
+    parser.add_argument("--model-id", type=str, default=DEFAULT_FLUX_MODEL_ID)
     parser.add_argument("--device", choices=("auto", "cpu", "mps", "cuda"), default="auto")
     parser.add_argument("--image-size", type=int, default=CANVAS_SIZE)
     parser.add_argument(
@@ -270,8 +276,8 @@ def _make_contact_sheet(
 def _predict_prompt(
     *,
     prompt: str,
-    tokenizer: CLIPTokenizer,
-    text_encoder: CLIPTextModel,
+    tokenizer: object,
+    text_encoder: object,
     graph_encoder: torch.nn.Module,
     device: str,
 ) -> tuple[dict[str, Any], list[str], torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -307,12 +313,18 @@ def main() -> int:
     prompts = _read_prompts(args)
     device = resolve_torch_device(args.device)
 
-    tokenizer = CLIPTokenizer.from_pretrained(args.model_id, subfolder="tokenizer")
-    text_encoder = CLIPTextModel.from_pretrained(args.model_id, subfolder="text_encoder").to(device)
-    text_encoder.eval()
+    state_dict = normalize_graph_encoder_state_dict(torch.load(args.graph_encoder_path, map_location="cpu"))
+    _slot_dim, text_hidden_dim, _gnn_layers, _layout_mode, _latent_dim = infer_graph_encoder_config(state_dict)
+    text_encoder_type = infer_text_encoder_type(text_hidden_dim)
+    tokenizer, text_encoder, encoder_hidden_dim = load_graph_label_encoder(
+        model_id=args.model_id,
+        text_encoder_type=text_encoder_type,
+        torch_dtype=torch.float32,
+        device=device,
+    )
     graph_encoder = load_graph_encoder(
         path=args.graph_encoder_path,
-        text_hidden_dim=text_encoder.config.hidden_size,
+        text_hidden_dim=encoder_hidden_dim,
         device=device,
         dtype=text_encoder.dtype,
     )

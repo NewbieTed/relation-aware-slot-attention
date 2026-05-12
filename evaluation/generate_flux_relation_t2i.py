@@ -27,7 +27,10 @@ from training.oscr_renderer import render_oscr_boxes
 from training.runtime import (
     DEFAULT_FLUX_MODEL_ID,
     choose_weight_dtype,
+    infer_graph_encoder_config,
+    infer_text_encoder_type,
     load_graph_encoder,
+    load_graph_label_encoder,
     normalize_graph_encoder_state_dict,
     resolve_torch_device,
     set_seed,
@@ -137,11 +140,11 @@ def _tensor_to_pil(image: torch.Tensor) -> Any:
 def _load_graph_encoder(
     *,
     path: Path,
-    text_hidden_dim: int,
-    slot_dim: int,
-    gnn_layers: int,
     device: str,
-) -> GraphSlotEncoder:
+) -> tuple[GraphSlotEncoder, str, int]:
+    state_dict = normalize_graph_encoder_state_dict(torch.load(path, map_location="cpu"))
+    _slot_dim, text_hidden_dim, _gnn_layers, _layout_mode, _latent_dim = infer_graph_encoder_config(state_dict)
+    text_encoder_type = infer_text_encoder_type(text_hidden_dim)
     encoder = load_graph_encoder(
         path=path,
         text_hidden_dim=text_hidden_dim,
@@ -149,7 +152,7 @@ def _load_graph_encoder(
         dtype=torch.float32,
     )
     encoder.requires_grad_(False)
-    return encoder
+    return encoder, text_encoder_type, text_hidden_dim
 
 
 def _download_official_lora(args: argparse.Namespace) -> Path:
@@ -289,6 +292,8 @@ def _predict_condition(
     prompt: str,
     pipeline: Any,
     graph_encoder: GraphSlotEncoder,
+    graph_tokenizer: object,
+    graph_text_encoder: object,
     device: str,
     oscr_size: int,
     oscr_render_size: int | None,
@@ -308,8 +313,8 @@ def _predict_condition(
     batched_graph = build_batched_scene_graphs([scene_graph], slot_targets=targets, slot_mask=slot_mask)
     graph_device = "cpu" if next(graph_encoder.parameters()).device.type == "cpu" else device
     conditioning = build_slot_conditioning(
-        tokenizer=pipeline.tokenizer,
-        text_encoder=pipeline.text_encoder,
+        tokenizer=graph_tokenizer,
+        text_encoder=graph_text_encoder,
         scene_graph_batch=batched_graph,
         graph_encoder=graph_encoder,
         device=graph_device,
@@ -456,11 +461,14 @@ def main() -> int:
         raise ValueError("Pass --graph-encoder-path when using an external/official SeeThrough3D LoRA.")
     if not graph_path.exists():
         raise FileNotFoundError(f"Missing graph encoder checkpoint: {graph_path}")
-    graph_encoder = _load_graph_encoder(
+    graph_encoder, graph_text_encoder_type, _graph_text_hidden_dim = _load_graph_encoder(
         path=graph_path,
-        text_hidden_dim=pipeline.text_encoder.config.hidden_size,
-        slot_dim=args.slot_dim,
-        gnn_layers=args.gnn_layers,
+        device=graph_device,
+    )
+    graph_tokenizer, graph_text_encoder, _encoder_hidden_dim = load_graph_label_encoder(
+        model_id=args.model_id,
+        text_encoder_type=graph_text_encoder_type,
+        torch_dtype=dtype,
         device=graph_device,
     )
 
@@ -472,6 +480,8 @@ def main() -> int:
             prompt=prompt,
             pipeline=pipeline,
             graph_encoder=graph_encoder,
+            graph_tokenizer=graph_tokenizer,
+            graph_text_encoder=graph_text_encoder,
             device=device,
             oscr_size=args.oscr_size,
             oscr_render_size=args.oscr_render_size,

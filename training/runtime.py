@@ -92,7 +92,7 @@ def normalize_graph_encoder_state_dict(checkpoint: object) -> dict[str, torch.Te
     return state_dict
 
 
-def infer_graph_encoder_config(state_dict: dict[str, torch.Tensor]) -> tuple[int, int, str, int]:
+def infer_graph_encoder_config(state_dict: dict[str, torch.Tensor]) -> tuple[int, int, int, str, int]:
     """Infer graph encoder dimensions and layout mode from a saved state."""
 
     node_weight = state_dict.get("node_proj.weight")
@@ -105,6 +105,7 @@ def infer_graph_encoder_config(state_dict: dict[str, torch.Tensor]) -> tuple[int
             f"'node_proj.weight' nor 'node_in.weight' exists. Keys: {available}"
         )
     slot_dim = int(node_weight.shape[0])
+    text_hidden_dim = int(node_weight.shape[1])
     layer_indices = {
         int(key.split(".")[1])
         for key in state_dict
@@ -119,7 +120,55 @@ def infer_graph_encoder_config(state_dict: dict[str, torch.Tensor]) -> tuple[int
     else:
         layout_mode = "deterministic"
         latent_dim = 64
-    return slot_dim, len(layer_indices), layout_mode, latent_dim
+    return slot_dim, text_hidden_dim, len(layer_indices), layout_mode, latent_dim
+
+
+def infer_text_encoder_type(text_hidden_dim: int) -> str:
+    """Infer which FLUX text encoder produced graph node embeddings."""
+
+    # FLUX.1-dev uses CLIP-L/14 hidden size 768 and T5-XXL hidden size 4096.
+    if text_hidden_dim == 4096:
+        return "t5"
+    if text_hidden_dim == 768:
+        return "clip"
+    return "custom"
+
+
+def load_graph_label_encoder(
+    *,
+    model_id: str,
+    text_encoder_type: str,
+    torch_dtype: torch.dtype,
+    device: str,
+) -> tuple[object, object, int]:
+    """Load the frozen text encoder used to create GNN object-label embeddings."""
+
+    normalized = text_encoder_type.lower()
+    if normalized == "clip":
+        from transformers import CLIPTextModel, CLIPTokenizer
+
+        tokenizer = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer")
+        text_encoder = CLIPTextModel.from_pretrained(
+            model_id,
+            subfolder="text_encoder",
+            torch_dtype=torch_dtype,
+        )
+    elif normalized == "t5":
+        from transformers import T5EncoderModel, T5TokenizerFast
+
+        tokenizer = T5TokenizerFast.from_pretrained(model_id, subfolder="tokenizer_2")
+        text_encoder = T5EncoderModel.from_pretrained(
+            model_id,
+            subfolder="text_encoder_2",
+            torch_dtype=torch_dtype,
+        )
+    else:
+        raise ValueError(f"Unsupported graph text encoder type: {text_encoder_type}")
+
+    text_encoder.requires_grad_(False)
+    text_encoder.to(device)
+    text_encoder.eval()
+    return tokenizer, text_encoder, int(text_encoder.config.hidden_size)
 
 
 def load_graph_encoder(
@@ -132,7 +181,12 @@ def load_graph_encoder(
     """Load a saved graph encoder with its inferred architecture."""
 
     state_dict = normalize_graph_encoder_state_dict(torch.load(path, map_location="cpu"))
-    slot_dim, gnn_layers, layout_mode, latent_dim = infer_graph_encoder_config(state_dict)
+    slot_dim, inferred_text_hidden_dim, gnn_layers, layout_mode, latent_dim = infer_graph_encoder_config(state_dict)
+    if text_hidden_dim != inferred_text_hidden_dim:
+        raise ValueError(
+            "Graph encoder text embedding dimension mismatch: "
+            f"checkpoint expects {inferred_text_hidden_dim}, caller provided {text_hidden_dim}."
+        )
     encoder = GraphSlotEncoder(
         text_hidden_dim=text_hidden_dim,
         slot_dim=slot_dim,

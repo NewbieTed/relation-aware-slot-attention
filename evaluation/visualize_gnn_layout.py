@@ -8,7 +8,6 @@ from typing import Any
 
 import torch
 from PIL import Image, ImageDraw, ImageFont
-from transformers import CLIPTextModel, CLIPTokenizer
 
 from evaluation.prompt_parser import parse_prompt_to_scene_graph
 from training.dataset import load_metadata_rows
@@ -16,7 +15,15 @@ from training.graph_modules import build_slot_conditioning
 from training.graph_targets import bbox_centers_after_crop, bbox_log_sizes_3d_after_crop
 from training.oscr_renderer import render_oscr_boxes
 from training.prompts import prompt_from_scop_depth_row, scene_graph_payload_from_row
-from training.runtime import DEFAULT_FLUX_MODEL_ID, load_graph_encoder, resolve_torch_device
+from training.runtime import (
+    DEFAULT_FLUX_MODEL_ID,
+    infer_graph_encoder_config,
+    infer_text_encoder_type,
+    load_graph_encoder,
+    load_graph_label_encoder,
+    normalize_graph_encoder_state_dict,
+    resolve_torch_device,
+)
 from training.scene_graph import INVERSE_RELATION, build_batched_scene_graphs
 
 
@@ -725,12 +732,18 @@ def main() -> int:
         )
 
     device = resolve_torch_device(args.device)
-    tokenizer = CLIPTokenizer.from_pretrained(args.model_id, subfolder="tokenizer")
-    text_encoder = CLIPTextModel.from_pretrained(args.model_id, subfolder="text_encoder").to(device)
-    text_encoder.eval()
+    state_dict = normalize_graph_encoder_state_dict(torch.load(args.graph_encoder_path, map_location="cpu"))
+    _slot_dim, text_hidden_dim, _gnn_layers, _layout_mode, _latent_dim = infer_graph_encoder_config(state_dict)
+    text_encoder_type = infer_text_encoder_type(text_hidden_dim)
+    tokenizer, text_encoder, encoder_hidden_dim = load_graph_label_encoder(
+        model_id=args.model_id,
+        text_encoder_type=text_encoder_type,
+        torch_dtype=torch.float32,
+        device=device,
+    )
     graph_encoder = load_graph_encoder(
         path=args.graph_encoder_path,
-        text_hidden_dim=text_encoder.config.hidden_size,
+        text_hidden_dim=encoder_hidden_dim,
         device=device,
         dtype=text_encoder.dtype,
     )

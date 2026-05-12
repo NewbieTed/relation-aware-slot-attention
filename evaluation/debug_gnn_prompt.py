@@ -7,11 +7,18 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from transformers import CLIPTextModel, CLIPTokenizer
 
 from evaluation.prompt_parser import parse_prompt_to_scene_graph
 from training.graph_modules import GraphSlotEncoder, mean_pool_hidden
-from training.runtime import DEFAULT_FLUX_MODEL_ID, load_graph_encoder, resolve_torch_device
+from training.runtime import (
+    DEFAULT_FLUX_MODEL_ID,
+    infer_graph_encoder_config,
+    infer_text_encoder_type,
+    load_graph_encoder,
+    load_graph_label_encoder,
+    normalize_graph_encoder_state_dict,
+    resolve_torch_device,
+)
 from training.scene_graph import RELATION_VOCAB, build_batched_scene_graphs
 
 
@@ -80,8 +87,8 @@ def _relation_name_from_index(index: int) -> str:
 def _label_embeddings(
     *,
     labels: list[str],
-    tokenizer: CLIPTokenizer,
-    text_encoder: CLIPTextModel,
+    tokenizer: object,
+    text_encoder: object,
     device: str,
 ) -> tuple[torch.Tensor, list[dict[str, Any]]]:
     text_inputs = tokenizer(labels, padding=True, truncation=True, return_tensors="pt")
@@ -97,8 +104,8 @@ def _label_embeddings(
         details.append(
             {
                 "label": label,
-                "clip_embedding": _tensor_to_list(pooled_embedding),
-                "clip_embedding_norm": _norm(pooled_embedding),
+                "label_embedding": _tensor_to_list(pooled_embedding),
+                "label_embedding_norm": _norm(pooled_embedding),
             }
         )
     return pooled, details
@@ -109,8 +116,8 @@ def _build_debug_payload(
     prompt: str,
     scene_graph: dict[str, Any],
     graph_encoder: GraphSlotEncoder,
-    tokenizer: CLIPTokenizer,
-    text_encoder: CLIPTextModel,
+    tokenizer: object,
+    text_encoder: object,
     device: str,
     layout_sample_mode: str,
     seed: int,
@@ -360,7 +367,7 @@ def _build_debug_payload(
                 batched_graph.edge_types[0].tolist(),
             )
         ],
-        "clip_label_embeddings": label_details,
+        "label_embeddings": label_details,
         "projected_node_states": {
             node_labels[node_index]: _tensor_to_list(node_states[node_index])
             for node_index in range(len(node_labels))
@@ -418,11 +425,11 @@ def _render_text_report(payload: dict[str, Any], *, max_vector_elements: int) ->
         )
     lines.append("")
 
-    lines.append("CLIP pooled label embeddings:")
-    for item in payload["clip_label_embeddings"]:
-        vector = torch.tensor(item["clip_embedding"])
+    lines.append("Object label embeddings:")
+    for item in payload["label_embeddings"]:
+        vector = torch.tensor(item["label_embedding"])
         lines.append(
-            f"  {item['label']}: norm={item['clip_embedding_norm']:.4f} "
+            f"  {item['label']}: norm={item['label_embedding_norm']:.4f} "
             f"{_preview_vector(vector, max_elements=max_vector_elements)}"
         )
     lines.append("")
@@ -591,13 +598,19 @@ def main() -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     device = resolve_torch_device(args.device)
-    tokenizer = CLIPTokenizer.from_pretrained(args.model_id, subfolder="tokenizer")
-    text_encoder = CLIPTextModel.from_pretrained(args.model_id, subfolder="text_encoder").to(device)
-    text_encoder.eval()
+    state_dict = normalize_graph_encoder_state_dict(torch.load(args.graph_encoder_path, map_location="cpu"))
+    _slot_dim, text_hidden_dim, _gnn_layers, _layout_mode, _latent_dim = infer_graph_encoder_config(state_dict)
+    text_encoder_type = infer_text_encoder_type(text_hidden_dim)
+    tokenizer, text_encoder, encoder_hidden_dim = load_graph_label_encoder(
+        model_id=args.model_id,
+        text_encoder_type=text_encoder_type,
+        torch_dtype=torch.float32,
+        device=device,
+    )
 
     graph_encoder = load_graph_encoder(
         path=args.graph_encoder_path,
-        text_hidden_dim=text_encoder.config.hidden_size,
+        text_hidden_dim=encoder_hidden_dim,
         device=device,
         dtype=text_encoder.dtype,
     )

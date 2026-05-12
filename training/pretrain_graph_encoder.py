@@ -35,6 +35,7 @@ from .metrics import MetricsLogger, write_split_manifest
 from .runtime import (
     DEFAULT_FLUX_MODEL_ID,
     is_tqdm_disabled,
+    load_graph_label_encoder,
     set_seed,
 )
 from .scene_graph import build_batched_scene_graphs
@@ -48,6 +49,8 @@ def _save_state(output_dir: Path, *, step: int, args: argparse.Namespace) -> Non
         "graph_learning_rate": args.graph_learning_rate,
         "slot_dim": args.slot_dim,
         "gnn_layers": args.gnn_layers,
+        "text_encoder_type": args.text_encoder_type,
+        "text_hidden_dim": args.text_hidden_dim,
         "position_loss_weight": args.position_loss_weight,
         "relation_loss_weight": args.relation_loss_weight,
         "embedding_loss_weight": args.embedding_loss_weight,
@@ -123,6 +126,8 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--slot-dim", type=int, default=512)
     parser.add_argument("--gnn-layers", type=int, default=2)
+    parser.add_argument("--text-encoder-type", choices=("clip", "t5"), default="clip")
+    parser.add_argument("--text-hidden-dim", type=int, default=None)
     parser.add_argument("--layout-mode", choices=("deterministic", "cvae", "triple_cvae"), default="deterministic")
     parser.add_argument("--latent-dim", type=int, default=64)
     parser.add_argument("--save-every", type=int, default=500)
@@ -371,19 +376,21 @@ def main() -> int:
         collate_fn=collate_training_items,
     )
 
-    from transformers import CLIPTextModel, CLIPTokenizer
-
-    tokenizer = CLIPTokenizer.from_pretrained(args.model_id, subfolder="tokenizer")
-    text_encoder = CLIPTextModel.from_pretrained(
-        args.model_id,
-        subfolder="text_encoder",
+    tokenizer, text_encoder, encoder_hidden_dim = load_graph_label_encoder(
+        model_id=args.model_id,
+        text_encoder_type=args.text_encoder_type,
         torch_dtype=weight_dtype,
+        device=device,
     )
-    text_encoder.requires_grad_(False)
-    text_encoder.to(device)
+    if args.text_hidden_dim is not None and args.text_hidden_dim != encoder_hidden_dim:
+        raise ValueError(
+            f"Config text_hidden_dim={args.text_hidden_dim} does not match "
+            f"{args.text_encoder_type} encoder hidden size {encoder_hidden_dim}."
+        )
+    args.text_hidden_dim = encoder_hidden_dim
 
     graph_encoder = GraphSlotEncoder(
-        text_hidden_dim=text_encoder.config.hidden_size,
+        text_hidden_dim=encoder_hidden_dim,
         slot_dim=args.slot_dim,
         num_layers=args.gnn_layers,
         layout_mode=args.layout_mode,

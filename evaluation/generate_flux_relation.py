@@ -23,7 +23,10 @@ from training.scene_graph import build_batched_scene_graphs
 from training.runtime import (
     DEFAULT_FLUX_MODEL_ID,
     choose_weight_dtype,
+    infer_graph_encoder_config,
+    infer_text_encoder_type,
     load_graph_encoder,
+    load_graph_label_encoder,
     normalize_graph_encoder_state_dict,
     resolve_torch_device,
     set_seed,
@@ -68,11 +71,11 @@ def _tensor_to_pil(image: torch.Tensor) -> Image.Image:
 def _load_graph_encoder(
     *,
     path: Path,
-    text_hidden_dim: int,
-    slot_dim: int,
-    gnn_layers: int,
     device: str,
-) -> GraphSlotEncoder:
+) -> tuple[GraphSlotEncoder, str]:
+    state_dict = normalize_graph_encoder_state_dict(torch.load(path, map_location="cpu"))
+    _slot_dim, text_hidden_dim, _gnn_layers, _layout_mode, _latent_dim = infer_graph_encoder_config(state_dict)
+    text_encoder_type = infer_text_encoder_type(text_hidden_dim)
     graph_encoder = load_graph_encoder(
         path=path,
         text_hidden_dim=text_hidden_dim,
@@ -80,7 +83,7 @@ def _load_graph_encoder(
         dtype=torch.float32,
     )
     graph_encoder.requires_grad_(False)
-    return graph_encoder
+    return graph_encoder, text_encoder_type
 
 
 @torch.no_grad()
@@ -89,6 +92,8 @@ def _predict_layout(
     prompt: str,
     pipeline: Any,
     graph_encoder: GraphSlotEncoder,
+    graph_tokenizer: object,
+    graph_text_encoder: object,
     device: str,
     oscr_size: int,
     gnn_layout_sample_mode: str,
@@ -99,8 +104,8 @@ def _predict_layout(
     slot_mask = torch.ones(1, node_count, dtype=torch.bool, device=device)
     scene_graph_batch = build_batched_scene_graphs([scene_graph], slot_targets=targets, slot_mask=slot_mask)
     conditioning = build_slot_conditioning(
-        tokenizer=pipeline.tokenizer,
-        text_encoder=pipeline.text_encoder,
+        tokenizer=graph_tokenizer,
+        text_encoder=graph_text_encoder,
         scene_graph_batch=scene_graph_batch,
         graph_encoder=graph_encoder,
         device=device,
@@ -172,11 +177,14 @@ def main() -> int:
     graph_path = args.checkpoint_dir / "graph_encoder.pt"
     if not graph_path.exists():
         raise FileNotFoundError(f"Missing graph encoder checkpoint: {graph_path}")
-    graph_encoder = _load_graph_encoder(
+    graph_encoder, graph_text_encoder_type = _load_graph_encoder(
         path=graph_path,
-        text_hidden_dim=pipeline.text_encoder.config.hidden_size,
-        slot_dim=args.slot_dim,
-        gnn_layers=args.gnn_layers,
+        device=device,
+    )
+    graph_tokenizer, graph_text_encoder, _encoder_hidden_dim = load_graph_label_encoder(
+        model_id=args.model_id,
+        text_encoder_type=graph_text_encoder_type,
+        torch_dtype=dtype,
         device=device,
     )
 
@@ -184,6 +192,8 @@ def main() -> int:
         prompt=args.prompt,
         pipeline=pipeline,
         graph_encoder=graph_encoder,
+        graph_tokenizer=graph_tokenizer,
+        graph_text_encoder=graph_text_encoder,
         device=device,
         oscr_size=args.oscr_size,
         gnn_layout_sample_mode=args.gnn_layout_sample_mode,
