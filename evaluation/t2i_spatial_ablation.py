@@ -339,6 +339,11 @@ def summarize_records(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def format_metric(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value:.6f}"
+
 def main() -> int:
     args = make_parser().parse_args()
     generated_dir = args.generated_dir.resolve()
@@ -479,14 +484,15 @@ def main() -> int:
     summary_path.write_text(json.dumps(summary_payload, indent=2))
     records_path.write_text(json.dumps(records, indent=2))
 
-    print(
-        "Spatial ablation: "
-        f"detection={summary['detection_success_rate']:.6f} "
-        f"relation|det={summary['relation_accuracy_given_detection']:.6f} "
-        f"e2e={summary['end_to_end_success_rate']:.6f}"
-        if summary["detection_success_rate"] is not None
-        else "Spatial ablation completed, but no prompts were parseable."
-    )
+    if summary["detection_success_rate"] is None:
+        print("Spatial ablation completed, but no prompts were parseable.")
+    else:
+        print(
+            "Spatial ablation: "
+            f"detection={format_metric(summary['detection_success_rate'])} "
+            f"relation|det={format_metric(summary['relation_accuracy_given_detection'])} "
+            f"e2e={format_metric(summary['end_to_end_success_rate'])}"
+        )
     print(f"Summary saved to {summary_path}")
     print(f"Per-image records saved to {records_path}")
     return 0
