@@ -20,7 +20,7 @@ runtime:
   disable_tqdm: false
 
 data:
-  batch_size: 64
+  batch_size: 128
   limit_rows:
   prompt_prefix: a photo of
   eval_fraction: 0.1
@@ -28,10 +28,10 @@ data:
 
 training:
   graph_learning_rate: 1.0e-4
-  max_train_steps: 10000
+  max_train_steps: 5000
   save_every: 1000
-  log_every: 50
-  eval_every: 500
+  log_every: 25
+  eval_every: 250
 
 losses:
   position_loss_weight: 0.0
