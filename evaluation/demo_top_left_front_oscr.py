@@ -351,6 +351,12 @@ def main() -> int:
     graph_encoder.eval()
 
     records: list[dict[str, Any]] = []
+    current_dir = args.output_dir / "current_oscr"
+    fixed_dir = args.output_dir / "top_left_front_oscr"
+    comparison_dir = args.output_dir / "comparison"
+    current_dir.mkdir(parents=True, exist_ok=True)
+    fixed_dir.mkdir(parents=True, exist_ok=True)
+    comparison_dir.mkdir(parents=True, exist_ok=True)
     for index, prompt in enumerate(prompts):
         for sample_index in range(max(1, args.num_layout_samples)):
             sample_seed = int(args.layout_seed) + index * 1000 + sample_index
@@ -387,9 +393,9 @@ def main() -> int:
                 edge_alpha=args.edge_alpha,
             )
             stem = f"{_safe_name(prompt, index)}_sample{sample_index:02d}"
-            current_path = args.output_dir / f"{stem}_current_oscr.png"
-            fixed_path = args.output_dir / f"{stem}_top_left_front_oscr.png"
-            sheet_path = args.output_dir / f"{stem}_comparison.png"
+            current_path = current_dir / f"{stem}.png"
+            fixed_path = fixed_dir / f"{stem}.png"
+            sheet_path = comparison_dir / f"{stem}.png"
             current_oscr.save(current_path)
             fixed_corner.save(fixed_path)
             _make_contact_sheet(

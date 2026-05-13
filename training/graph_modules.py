@@ -537,10 +537,13 @@ class GraphSlotEncoder(nn.Module):
                 sample_edges,
                 self.triple_prior_layers,
             )
-            scene_prior_mu = torch.zeros(self.latent_dim, device=device, dtype=dtype)
-            scene_prior_logvar = torch.zeros_like(scene_prior_mu)
-            obj_prior_mu = torch.zeros(valid_node_count, self.latent_dim, device=device, dtype=dtype)
-            obj_prior_logvar = torch.zeros_like(obj_prior_mu)
+            prior_graph_state = self._triple_graph_readout(prior_nodes, prior_edges)
+            scene_prior_mu, scene_prior_logvar = self._split_stats(
+                self.triple_prior_scene_head(prior_graph_state)
+            )
+            obj_prior_mu, obj_prior_logvar = self._split_stats(
+                self.triple_prior_object_head(prior_nodes)
+            )
 
             if scene_graph_batch.box_targets is not None:
                 posterior_layout = scene_graph_batch.box_targets[batch_index, :valid_node_count].to(
