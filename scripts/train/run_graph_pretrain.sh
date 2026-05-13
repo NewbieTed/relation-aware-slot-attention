@@ -13,6 +13,7 @@ elif [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
 fi
 
 PYTHON_BIN="${PYTHON_BIN:-$DEFAULT_PYTHON}"
+CONFIG_FILE="${CONFIG_FILE:-}"
 DATASET_DIR="${DATASET_DIR:-$ROOT_DIR/data/scop_depth_crops_depth}"
 OUTPUT_DIR="${OUTPUT_DIR:-$ROOT_DIR/outputs/train/graph_pretrain_flux_3dbox}"
 DEVICE="${DEVICE:-auto}"
@@ -38,8 +39,13 @@ INVERSE_RELATION_LOSS_WEIGHT="${INVERSE_RELATION_LOSS_WEIGHT:-0.0}"
 BOX_LOSS_WEIGHT="${BOX_LOSS_WEIGHT:-0.0}"
 BOX3D_LOSS_WEIGHT="${BOX3D_LOSS_WEIGHT:-1.0}"
 
-CMD=(
-  "$PYTHON_BIN" -m training.pretrain_graph_encoder
+CMD=("$PYTHON_BIN" -m training.pretrain_graph_encoder)
+
+if [[ -n "$CONFIG_FILE" ]]; then
+  exec "${CMD[@]}" --config "$CONFIG_FILE"
+fi
+
+CMD+=(
   --dataset-dir "$DATASET_DIR"
   --output-dir "$OUTPUT_DIR"
   --device "$DEVICE"

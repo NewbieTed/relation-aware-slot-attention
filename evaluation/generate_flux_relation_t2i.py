@@ -9,9 +9,19 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 from evaluation.prompt_parser import parse_prompt_to_scene_graph
+from training.config import parse_args_with_config
+from training.flux_inference_runtime import (
+    build_flux_quantization_config,
+    import_seethrough3d_flux,
+    install_condition_lora_processors,
+    pipeline_execution_device,
+    set_pipeline_execution_device,
+    text_encoder_device,
+)
 from training.graph_modules import GraphSlotEncoder, build_slot_conditioning
 from training.oscr_renderer import render_oscr_boxes
 from training.runtime import (
@@ -28,17 +38,26 @@ from training.seethrough_condition import (
     render_blender_oscr_conditions,
     render_seethrough_oscr_and_masks,
 )
-from training.train_relation_flux_lora import (
-    _build_flux_quantization_config,
-    _import_seethrough3d_flux,
-    _install_condition_lora_processors,
-)
+
+OFFICIAL_SEETHROUGH3D_LORA_REPO = "va1bhavagrawa1/seethrough3d-flux.1-weights"
+OFFICIAL_SEETHROUGH3D_LORA_FILENAME = "checkpoints/seethrough3d_release/lora.safetensors"
 
 
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Generate relation-aware FLUX images for a T2I prompt file.")
     parser.add_argument("--prompt-file", type=Path, required=True)
-    parser.add_argument("--checkpoint-dir", type=Path, required=True)
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=Path,
+        default=None,
+        help="Relation-aware checkpoint directory. Used for flux_lora.pt and graph_encoder.pt unless overridden.",
+    )
+    parser.add_argument(
+        "--graph-encoder-path",
+        type=Path,
+        default=None,
+        help="Optional graph encoder checkpoint path. Useful when using an external SeeThrough3D LoRA.",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--model-id", type=str, default=DEFAULT_FLUX_MODEL_ID)
     parser.add_argument("--device", choices=("auto", "cpu", "mps", "cuda"), default="auto")
@@ -57,9 +76,29 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gnn-layers", type=int, default=2)
     parser.add_argument("--lora-rank", type=int, default=32)
     parser.add_argument("--lora-alpha", type=float, default=32.0)
+    parser.add_argument(
+        "--external-lora-safetensors",
+        type=Path,
+        default=None,
+        help="Optional SeeThrough3D-format LoRA .safetensors checkpoint to use instead of checkpoint-dir/flux_lora.pt.",
+    )
+    parser.add_argument(
+        "--use-official-seethrough3d-lora",
+        action="store_true",
+        help="Download and use the released SeeThrough3D FLUX LoRA from Hugging Face.",
+    )
+    parser.add_argument("--official-seethrough3d-lora-repo", type=str, default=OFFICIAL_SEETHROUGH3D_LORA_REPO)
+    parser.add_argument("--official-seethrough3d-lora-filename", type=str, default=OFFICIAL_SEETHROUGH3D_LORA_FILENAME)
+    parser.add_argument(
+        "--official-lora-cache-dir",
+        type=Path,
+        default=None,
+        help="Optional Hugging Face cache directory for the released SeeThrough3D LoRA.",
+    )
     parser.add_argument("--condition-renderer", choices=("seethrough", "legacy", "blender"), default="seethrough")
     parser.add_argument("--oscr-face-alpha", type=float, default=0.10)
     parser.add_argument("--oscr-azimuth-degrees", type=float, default=0.0)
+    parser.add_argument("--oscr-render-size", type=int, default=None)
     parser.add_argument("--blender-bin", type=str, default="blender")
     parser.add_argument("--blender-cache-dir", type=Path, default=None)
     parser.add_argument("--prompt-prefix", type=str, default="a photo of")
@@ -110,6 +149,66 @@ def _load_graph_encoder(
     return encoder
 
 
+def _download_official_lora(args: argparse.Namespace) -> Path:
+    """Download the released SeeThrough3D LoRA using the model-card path."""
+
+    try:
+        from huggingface_hub import hf_hub_download
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "Downloading the official SeeThrough3D LoRA requires huggingface_hub. "
+            "Install the FLUX extras with `python -m pip install -e '.[flux]'`."
+        ) from exc
+    path = hf_hub_download(
+        repo_id=args.official_seethrough3d_lora_repo,
+        filename=args.official_seethrough3d_lora_filename,
+        repo_type="model",
+        cache_dir=str(args.official_lora_cache_dir) if args.official_lora_cache_dir is not None else None,
+    )
+    return Path(path)
+
+
+def _resolve_lora_path(args: argparse.Namespace) -> Path:
+    if args.use_official_seethrough3d_lora:
+        return _download_official_lora(args)
+    if args.external_lora_safetensors is not None:
+        if not args.external_lora_safetensors.exists():
+            raise FileNotFoundError(f"Missing external LoRA checkpoint: {args.external_lora_safetensors}")
+        return args.external_lora_safetensors
+    if args.checkpoint_dir is None:
+        raise ValueError(
+            "Pass --checkpoint-dir for a local relation-aware checkpoint, or use "
+            "--use-official-seethrough3d-lora / --external-lora-safetensors."
+        )
+    lora_path = args.checkpoint_dir / "flux_lora.pt"
+    if not lora_path.exists():
+        raise FileNotFoundError(f"Missing FLUX LoRA checkpoint: {lora_path}")
+    return lora_path
+
+
+def _load_lora_state(path: Path) -> dict[str, torch.Tensor]:
+    if path.suffix == ".safetensors":
+        try:
+            from safetensors import safe_open
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "Loading SeeThrough3D .safetensors LoRA weights requires safetensors."
+            ) from exc
+        state: dict[str, torch.Tensor] = {}
+        with safe_open(path, framework="pt", device="cpu") as handle:
+            for key in handle.keys():
+                state[key] = handle.get_tensor(key)
+        return state
+    return torch.load(path, map_location="cpu")
+
+
+def _infer_lora_rank(state: dict[str, torch.Tensor]) -> int | None:
+    for key, value in state.items():
+        if key.endswith(".down.weight") and value.ndim >= 1:
+            return int(value.shape[0])
+    return None
+
+
 def _load_pipeline(args: argparse.Namespace, device: str, dtype: torch.dtype) -> tuple[Any, Any]:
     (
         FluxPipeline,
@@ -117,10 +216,10 @@ def _load_pipeline(args: argparse.Namespace, device: str, dtype: torch.dtype) ->
         MultiDoubleStreamBlockLoraProcessor,
         MultiSingleStreamBlockLoraProcessor,
         FluxAttnProcessor2_0,
-    ) = _import_seethrough3d_flux()
+    ) = import_seethrough3d_flux()
 
     pipeline = FluxPipeline.from_pretrained(args.model_id, transformer=None, torch_dtype=dtype)
-    quantization_config = _build_flux_quantization_config(args.flux_quantization, dtype)
+    quantization_config = build_flux_quantization_config(args.flux_quantization, dtype)
     transformer_kwargs: dict[str, Any] = {"subfolder": "transformer", "torch_dtype": dtype}
     if quantization_config is not None:
         transformer_kwargs["quantization_config"] = quantization_config
@@ -130,7 +229,11 @@ def _load_pipeline(args: argparse.Namespace, device: str, dtype: torch.dtype) ->
     if args.low_vram:
         pipeline.text_encoder.to("cpu")
         pipeline.text_encoder_2.to("cpu")
-        pipeline.vae.to("cpu")
+        # SeeThrough3D encodes spatial_images inside pipeline.__call__ after
+        # moving them to the execution device, so the VAE must stay there too.
+        # Keeping only the text encoders on CPU preserves most of the low-VRAM
+        # benefit without triggering CPU/CUDA conv mismatches.
+        pipeline.vae.to(device=device, dtype=dtype)
         if quantization_config is None:
             pipeline.transformer.to(device=device, dtype=dtype)
     else:
@@ -146,10 +249,21 @@ def _load_pipeline(args: argparse.Namespace, device: str, dtype: torch.dtype) ->
     pipeline.text_encoder_2.requires_grad_(False)
     pipeline.transformer.requires_grad_(False)
 
-    _install_condition_lora_processors(
+    lora_path = _resolve_lora_path(args)
+    lora_state = _load_lora_state(lora_path)
+    inferred_rank = _infer_lora_rank(lora_state)
+    lora_rank = args.lora_rank
+    lora_alpha = args.lora_alpha
+    if inferred_rank is not None and inferred_rank != args.lora_rank:
+        print(f"Using LoRA rank {inferred_rank} inferred from {lora_path} instead of --lora-rank={args.lora_rank}.")
+        lora_rank = inferred_rank
+    if args.use_official_seethrough3d_lora and inferred_rank is not None:
+        lora_alpha = float(inferred_rank)
+
+    install_condition_lora_processors(
         transformer=pipeline.transformer,
-        rank=args.lora_rank,
-        alpha=args.lora_alpha,
+        rank=lora_rank,
+        alpha=lora_alpha,
         cond_size=args.oscr_size,
         device=device,
         dtype=dtype,
@@ -157,53 +271,14 @@ def _load_pipeline(args: argparse.Namespace, device: str, dtype: torch.dtype) ->
         single_processor_cls=MultiSingleStreamBlockLoraProcessor,
         base_processor_cls=FluxAttnProcessor2_0,
     )
-    lora_path = args.checkpoint_dir / "flux_lora.pt"
-    if not lora_path.exists():
-        raise FileNotFoundError(f"Missing FLUX LoRA checkpoint: {lora_path}")
-    pipeline.transformer.load_state_dict(torch.load(lora_path, map_location=device), strict=False)
+    incompatible = pipeline.transformer.load_state_dict(lora_state, strict=False)
+    print(
+        f"Loaded LoRA from {lora_path} "
+        f"(missing={len(incompatible.missing_keys)}, unexpected={len(incompatible.unexpected_keys)})."
+    )
     pipeline.transformer.eval()
-    _set_pipeline_execution_device(pipeline, device)
+    set_pipeline_execution_device(pipeline, device)
     return pipeline, quantization_config
-
-
-def _pipeline_execution_device(pipeline: Any, fallback: str) -> torch.device:
-    execution_device = getattr(pipeline, "_execution_device", None)
-    if execution_device is None:
-        return torch.device(fallback)
-    return torch.device(execution_device)
-
-
-def _set_pipeline_execution_device(pipeline: Any, device: str) -> None:
-    """Force SeeThrough3D FLUX to prepare inference latents on the transformer device."""
-
-    forced_device = torch.device(device)
-    object.__setattr__(pipeline, "_forced_execution_device", forced_device)
-    if getattr(pipeline.__class__, "_relation_forced_execution_device", False):
-        return
-
-    base_cls = pipeline.__class__
-
-    class ForcedExecutionDevicePipeline(base_cls):  # type: ignore[misc, valid-type]
-        _relation_forced_execution_device = True
-
-        @property
-        def _execution_device(self) -> torch.device:  # type: ignore[override]
-            forced = getattr(self, "_forced_execution_device", None)
-            if forced is not None:
-                return torch.device(forced)
-            return super()._execution_device
-
-    object.__setattr__(pipeline, "__class__", ForcedExecutionDevicePipeline)
-
-
-def _text_encoder_device(pipeline: Any) -> torch.device:
-    """Return the real text-encoder device for low-VRAM prompt pre-encoding."""
-
-    try:
-        return next(pipeline.text_encoder.parameters()).device
-    except StopIteration:
-        return torch.device("cpu")
-
 
 @torch.no_grad()
 def _predict_condition(
@@ -213,6 +288,7 @@ def _predict_condition(
     graph_encoder: GraphSlotEncoder,
     device: str,
     oscr_size: int,
+    oscr_render_size: int | None,
     max_sequence_length: int,
     condition_renderer: str,
     oscr_face_alpha: float,
@@ -238,12 +314,13 @@ def _predict_condition(
     log_sizes = conditioning.slot_log_sizes_3d.to(device)
     slot_mask = conditioning.slot_mask.to(device)
     cond_grid = (oscr_size // 16, oscr_size // 16)
+    render_size = oscr_render_size or oscr_size
     if condition_renderer == "seethrough":
         oscr, cuboids_segmasks = render_seethrough_oscr_and_masks(
             centers=centers,
             log_sizes=log_sizes,
             slot_mask=slot_mask,
-            image_size=oscr_size,
+            image_size=render_size,
             mask_size=cond_grid,
             face_alpha=oscr_face_alpha,
             azimuth_degrees=oscr_azimuth_degrees,
@@ -252,7 +329,7 @@ def _predict_condition(
             centers=centers,
             log_sizes=log_sizes,
             slot_mask=slot_mask,
-            image_size=oscr_size,
+            image_size=render_size,
             mask_size=cond_grid,
             face_alpha=max(oscr_face_alpha, 0.25),
             azimuth_degrees=oscr_azimuth_degrees,
@@ -264,7 +341,7 @@ def _predict_condition(
             slot_mask=slot_mask,
             scene_graphs=[scene_graph],
             prompts=[prompt],
-            image_size=oscr_size,
+            image_size=render_size,
             face_alpha=oscr_face_alpha,
             azimuth_degrees=oscr_azimuth_degrees,
             blender_bin=blender_bin,
@@ -276,7 +353,7 @@ def _predict_condition(
             slot_mask=slot_mask,
             scene_graphs=[scene_graph],
             prompts=[prompt],
-            image_size=oscr_size,
+            image_size=render_size,
             face_alpha=max(oscr_face_alpha, 0.25),
             azimuth_degrees=oscr_azimuth_degrees,
             blender_bin=blender_bin,
@@ -330,6 +407,14 @@ def _predict_condition(
         )
     ]
     cuboids_segmasks = cuboids_segmasks.to(device=device, dtype=torch.uint8)
+    oscr_for_model = oscr
+    if oscr_for_model.shape[-1] != oscr_size or oscr_for_model.shape[-2] != oscr_size:
+        oscr_for_model = F.interpolate(
+            oscr_for_model,
+            size=(oscr_size, oscr_size),
+            mode="bicubic",
+            align_corners=False,
+        ).clamp(-1.0, 1.0)
     layout = {
         "prompt": prompt,
         "binding_prompt": binding_prompt.prompt,
@@ -340,11 +425,11 @@ def _predict_condition(
         "binding_token_count": sum(len(ids) for sample in call_ids for ids in sample),
         "binding_mask_pct": float(cuboids_segmasks.float().mean().mul(100.0).item()),
     }
-    return _tensor_to_pil(oscr[0]), _tensor_to_pil(oscr_viz[0]), binding_prompt.prompt, call_ids, cuboids_segmasks, layout
+    return _tensor_to_pil(oscr_for_model[0]), _tensor_to_pil(oscr_viz[0]), binding_prompt.prompt, call_ids, cuboids_segmasks, layout
 
 
 def main() -> int:
-    args = make_parser().parse_args()
+    args = parse_args_with_config(make_parser(), section="generate")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     samples_dir = args.output_dir / "samples"
     samples_dir.mkdir(parents=True, exist_ok=True)
@@ -356,7 +441,12 @@ def main() -> int:
     pipeline, _quantization_config = _load_pipeline(args, device=device, dtype=dtype)
 
     graph_device = "cpu" if args.low_vram else device
-    graph_path = args.checkpoint_dir / "graph_encoder.pt"
+    if args.graph_encoder_path is not None:
+        graph_path = args.graph_encoder_path
+    elif args.checkpoint_dir is not None:
+        graph_path = args.checkpoint_dir / "graph_encoder.pt"
+    else:
+        raise ValueError("Pass --graph-encoder-path when using an external/official SeeThrough3D LoRA.")
     if not graph_path.exists():
         raise FileNotFoundError(f"Missing graph encoder checkpoint: {graph_path}")
     graph_encoder = _load_graph_encoder(
@@ -377,6 +467,7 @@ def main() -> int:
             graph_encoder=graph_encoder,
             device=device,
             oscr_size=args.oscr_size,
+            oscr_render_size=args.oscr_render_size,
             max_sequence_length=args.max_sequence_length,
             condition_renderer=args.condition_renderer,
             oscr_face_alpha=args.oscr_face_alpha,
@@ -390,7 +481,7 @@ def main() -> int:
         oscr_viz_name = f"{prompt_name}_oscr_viz.png"
         oscr_viz_image.save(condition_dir / oscr_viz_name)
         layout["oscr_viz_file"] = str(Path("conditions") / oscr_viz_name)
-        encoder_device = _text_encoder_device(pipeline)
+        encoder_device = text_encoder_device(pipeline)
         prompt_embeds, pooled_prompt_embeds, _text_ids = pipeline.encode_prompt(
             prompt=binding_prompt,
             prompt_2=binding_prompt,
@@ -402,7 +493,7 @@ def main() -> int:
         pooled_prompt_embeds = pooled_prompt_embeds.to(device=device, dtype=dtype)
         for repeat_index in range(args.samples_per_prompt):
             seed = args.seed + prompt_index * args.samples_per_prompt + repeat_index
-            generator_device = _pipeline_execution_device(pipeline, device)
+            generator_device = pipeline_execution_device(pipeline, device)
             generator = (
                 torch.Generator(device=generator_device).manual_seed(seed)
                 if generator_device.type != "mps"
@@ -441,12 +532,18 @@ def main() -> int:
 
     run_config = {
         "model_id": args.model_id,
-        "checkpoint_dir": str(args.checkpoint_dir),
+        "checkpoint_dir": str(args.checkpoint_dir) if args.checkpoint_dir is not None else None,
+        "graph_encoder_path": str(graph_path),
+        "external_lora_safetensors": str(args.external_lora_safetensors) if args.external_lora_safetensors else None,
+        "use_official_seethrough3d_lora": args.use_official_seethrough3d_lora,
+        "official_seethrough3d_lora_repo": args.official_seethrough3d_lora_repo,
+        "official_seethrough3d_lora_filename": args.official_seethrough3d_lora_filename,
         "prompt_file": str(args.prompt_file),
         "num_prompts": len(prompts),
         "samples_per_prompt": args.samples_per_prompt,
         "image_size": args.image_size,
         "oscr_size": args.oscr_size,
+        "oscr_render_size": args.oscr_render_size,
         "num_inference_steps": args.num_inference_steps,
         "guidance_scale": args.guidance_scale,
         "max_sequence_length": args.max_sequence_length,

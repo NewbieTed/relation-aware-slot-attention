@@ -1,0 +1,37 @@
+paths:
+  dataset_dir: /local1/cse_481_m_l/relation-aware-slot-attention/data/scop_depth_crops_depth
+  output_dir: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/train/graph_pretrain_flux_3dbox
+
+model:
+  model_id: black-forest-labs/FLUX.1-dev
+  slot_dim: 512
+  gnn_layers: 2
+
+runtime:
+  device: cuda
+  mixed_precision: bf16
+  num_workers: 0
+  seed: 42
+  disable_tqdm: false
+
+data:
+  batch_size: 16
+  limit_rows:
+  prompt_prefix: a photo of
+  eval_fraction: 0.1
+  test_fraction: 0.1
+
+training:
+  graph_learning_rate: 1.0e-4
+  max_train_steps: 600
+  save_every: 500
+  log_every: 10
+  eval_every: 250
+
+losses:
+  position_loss_weight: 1.0
+  relation_loss_weight: 8.0
+  embedding_loss_weight: 0.0
+  inverse_relation_loss_weight: 0.0
+  box_loss_weight: 0.0
+  box3d_loss_weight: 1.0

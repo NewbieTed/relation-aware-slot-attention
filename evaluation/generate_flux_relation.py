@@ -1,10 +1,9 @@
 """Generate FLUX.1-dev images with GNN-predicted SeeThrough3D OSCR conditions.
 
-This utility is the inference counterpart to ``training.train_relation_flux_lora``.
 It parses a spatial prompt into a two-object scene graph, asks the frozen graph
 encoder for 3D centers and box sizes, renders those predictions as an OSCR
 condition image, and sends that condition image through the SeeThrough3D FLUX
-condition stream with the trained LoRA processors loaded.
+condition stream with LoRA processors loaded.
 """
 
 from __future__ import annotations
@@ -17,15 +16,12 @@ from typing import Any
 import torch
 from PIL import Image
 
+from training.flux_inference_runtime import import_seethrough3d_flux, install_condition_lora_processors
 from training.graph_modules import GraphSlotEncoder, build_slot_conditioning
 from training.oscr_renderer import render_oscr_boxes
 from training.scene_graph import build_batched_scene_graphs
-from training.train_relation_flux_lora import (
-    DEFAULT_FLUX_MODEL_ID,
-    _import_seethrough3d_flux,
-    _install_condition_lora_processors,
-)
 from training.runtime import (
+    DEFAULT_FLUX_MODEL_ID,
     choose_weight_dtype,
     normalize_graph_encoder_state_dict,
     resolve_torch_device,
@@ -135,7 +131,7 @@ def main() -> int:
         MultiDoubleStreamBlockLoraProcessor,
         MultiSingleStreamBlockLoraProcessor,
         FluxAttnProcessor2_0,
-    ) = _import_seethrough3d_flux()
+    ) = import_seethrough3d_flux()
 
     pipeline = FluxPipeline.from_pretrained(args.model_id, torch_dtype=dtype)
     pipeline.transformer = FluxTransformer2DModel.from_pretrained(
@@ -149,7 +145,7 @@ def main() -> int:
     pipeline.text_encoder_2.requires_grad_(False)
     pipeline.transformer.requires_grad_(False)
 
-    _install_condition_lora_processors(
+    install_condition_lora_processors(
         transformer=pipeline.transformer,
         rank=args.lora_rank,
         alpha=args.lora_alpha,

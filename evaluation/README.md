@@ -5,6 +5,8 @@ architecture:
 
 - `evaluation.generate_flux_relation`: generate one FLUX image from a prompt,
   using the frozen GNN to render an OSCR condition image.
+- `evaluation.generate_flux_relation_t2i`: generate T2I-CompBench prompt-file
+  samples with GNN-predicted OSCR conditions and the released SeeThrough3D LoRA.
 - `evaluation.debug_gnn_prompt`: print detailed GNN message-passing traces for a prompt.
 - `evaluation.visualize_gnn_layout`: visualize predicted GNN centers and box regions.
 - `evaluation.t2i_compbench`: score an existing generated samples directory with
@@ -19,10 +21,8 @@ SD branch rather than reintroducing them here.
 Example FLUX generation:
 
 ```bash
-python3 -m evaluation.generate_flux_relation \
-  --prompt "a cat to the left of a dog" \
-  --checkpoint-dir outputs/train/flux1dev_oscr_lora128/final \
-  --output-dir outputs/debug/flux_cat_left_dog
+python3 -m evaluation.generate_flux_relation_t2i \
+  --config configs/flux/eval_official_seethrough3d_spatial_20p_bf16_512.yaml
 ```
 
 Example scoring of an already generated T2I-CompBench directory:

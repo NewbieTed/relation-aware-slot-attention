@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from ..coco_categories import COCO_CATEGORY_ID_TO_NAME
 from ..models import CocoInstanceAnnotation
 from .schema import SceneEdge, SceneGraph, SceneNode
 
@@ -83,6 +84,56 @@ def _make_node(index: int, label: str, annot: CocoInstanceAnnotation) -> SceneNo
     )
 
 
+def _normalize_label(label: str) -> str:
+    return " ".join(label.lower().replace("_", " ").split())
+
+
+def _annotation_for_label(
+    *,
+    label: str,
+    annots: tuple[CocoInstanceAnnotation, CocoInstanceAnnotation],
+    used_indices: set[int],
+) -> tuple[int, CocoInstanceAnnotation]:
+    """Return the annotation whose COCO category name matches the node label."""
+
+    normalized_label = _normalize_label(label)
+    matches = [
+        (index, annot)
+        for index, annot in enumerate(annots)
+        if index not in used_indices
+        and _normalize_label(COCO_CATEGORY_ID_TO_NAME.get(annot.category_id, "")) == normalized_label
+    ]
+    if len(matches) != 1:
+        annot_names = [
+            COCO_CATEGORY_ID_TO_NAME.get(annot.category_id, f"category_id={annot.category_id}")
+            for annot in annots
+        ]
+        raise ValueError(
+            "Could not uniquely match SCOP-Depth node label to annotation: "
+            f"label={label!r}, annotation_categories={annot_names!r}"
+        )
+    return matches[0]
+
+
+def _annotations_in_node_label_order(
+    *,
+    labels: list[str],
+    annots: tuple[CocoInstanceAnnotation, CocoInstanceAnnotation],
+) -> tuple[CocoInstanceAnnotation, CocoInstanceAnnotation]:
+    """Match annotations to graph nodes by category label, not row position."""
+
+    if len(labels) != len(annots):
+        raise ValueError("SCOP-Depth adapter expects labels and annotations to have equal length")
+
+    ordered_annots: list[CocoInstanceAnnotation] = []
+    used_indices: set[int] = set()
+    for label in labels:
+        index, annot = _annotation_for_label(label=label, annots=annots, used_indices=used_indices)
+        used_indices.add(index)
+        ordered_annots.append(annot)
+    return tuple(ordered_annots)  # type: ignore[return-value]
+
+
 def scene_graph_from_scop_depth_row(row: dict[str, Any]) -> SceneGraph:
     """Convert one SCOP-Depth metadata row into a validated two-node scene graph."""
 
@@ -107,9 +158,14 @@ def scene_graph_from_scop_depth_row(row: dict[str, Any]) -> SceneGraph:
         node_labels_in_order[1]: "obj1",
     }
 
+    annots_in_node_order = _annotations_in_node_label_order(
+        labels=node_labels_in_order,
+        annots=example.annots,
+    )
+
     nodes = (
-        _make_node(0, node_labels_in_order[0], example.annots[0]),
-        _make_node(1, node_labels_in_order[1], example.annots[1]),
+        _make_node(0, node_labels_in_order[0], annots_in_node_order[0]),
+        _make_node(1, node_labels_in_order[1], annots_in_node_order[1]),
     )
 
     edges_list: list[SceneEdge] = []
