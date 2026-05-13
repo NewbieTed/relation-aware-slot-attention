@@ -59,6 +59,7 @@ def _save_state(output_dir: Path, *, step: int, args: argparse.Namespace) -> Non
         "box3d_loss_weight": args.box3d_loss_weight,
         "layout_mode": args.layout_mode,
         "latent_dim": args.latent_dim,
+        "label_embedding_cache": str(args.label_embedding_cache) if args.label_embedding_cache else None,
         "cvae_kl_weight": args.cvae_kl_weight,
         "cvae_kl_warmup_steps": args.cvae_kl_warmup_steps,
     }
@@ -110,6 +111,61 @@ def _metric_keys(layout_mode: str) -> list[str]:
     return keys
 
 
+def _load_label_embedding_cache(
+    path: Path | None,
+    *,
+    model_id: str,
+    text_encoder_type: str,
+    text_hidden_dim: int,
+) -> dict[str, torch.Tensor]:
+    if path is None or not path.exists():
+        return {}
+    payload = torch.load(path, map_location="cpu")
+    metadata = payload.get("metadata", {})
+    expected = {
+        "model_id": model_id,
+        "text_encoder_type": text_encoder_type,
+        "text_hidden_dim": text_hidden_dim,
+    }
+    mismatches = {
+        key: (metadata.get(key), value)
+        for key, value in expected.items()
+        if metadata.get(key) != value
+    }
+    if mismatches:
+        details = ", ".join(
+            f"{key}: cache={cache_value!r}, current={current_value!r}"
+            for key, (cache_value, current_value) in mismatches.items()
+        )
+        raise ValueError(f"Label embedding cache does not match this run ({details}).")
+    embeddings = payload.get("embeddings", {})
+    return {str(label): embedding.detach().cpu() for label, embedding in embeddings.items()}
+
+
+def _save_label_embedding_cache(
+    path: Path | None,
+    cache: dict[str, torch.Tensor],
+    *,
+    model_id: str,
+    text_encoder_type: str,
+    text_hidden_dim: int,
+) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "metadata": {
+                "model_id": model_id,
+                "text_encoder_type": text_encoder_type,
+                "text_hidden_dim": text_hidden_dim,
+            },
+            "embeddings": {label: embedding.detach().cpu() for label, embedding in cache.items()},
+        },
+        path,
+    )
+
+
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Pretrain the SCOP-Depth graph encoder before full relation-aware diffusion training."
@@ -128,6 +184,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gnn-layers", type=int, default=2)
     parser.add_argument("--text-encoder-type", choices=("clip", "t5"), default="clip")
     parser.add_argument("--text-hidden-dim", type=int, default=None)
+    parser.add_argument("--label-embedding-cache", type=Path, default=None)
     parser.add_argument("--layout-mode", choices=("deterministic", "cvae", "triple_cvae"), default="deterministic")
     parser.add_argument("--latent-dim", type=int, default=64)
     parser.add_argument("--save-every", type=int, default=500)
@@ -165,6 +222,7 @@ def _compute_graph_batch_losses(
     cvae_kl_weight: float = 0.0,
     cvae_kl_warmup_steps: int = 1000,
     step: int | None = None,
+    label_embedding_cache: dict[str, torch.Tensor] | None = None,
 ) -> dict[str, torch.Tensor]:
     max_nodes = max(len(graph["nodes"]) for graph in batch["scene_graphs"])  # type: ignore[index]
     slot_targets, slot_mask = bbox_centers_after_crop(
@@ -205,13 +263,7 @@ def _compute_graph_batch_losses(
         graph_encoder=graph_encoder,
         device=device,
         layout_sample_mode="posterior" if _graph_layout_mode(graph_encoder) in {"cvae", "triple_cvae"} else "auto",
-    )
-    pooled_embeddings = pooled_label_embeddings(
-        tokenizer=tokenizer,
-        text_encoder=text_encoder,
-        scene_graph_batch=scene_graph_batch,
-        device=device,
-        dtype=conditioning.slot_embeddings.dtype,
+        label_embedding_cache=label_embedding_cache,
     )
 
     position_loss = F.smooth_l1_loss(
@@ -223,11 +275,22 @@ def _compute_graph_batch_losses(
         conditioning.slot_positions,
         scene_graph_batch,
     )
-    semantic_loss = embedding_alignment_loss(
-        conditioning.slot_embeddings,
-        pooled_embeddings,
-        conditioning.slot_mask,
-    )
+    if embedding_loss_weight:
+        pooled_embeddings = pooled_label_embeddings(
+            tokenizer=tokenizer,
+            text_encoder=text_encoder,
+            scene_graph_batch=scene_graph_batch,
+            device=device,
+            dtype=conditioning.slot_embeddings.dtype,
+            label_embedding_cache=label_embedding_cache,
+        )
+        semantic_loss = embedding_alignment_loss(
+            conditioning.slot_embeddings,
+            pooled_embeddings,
+            conditioning.slot_mask,
+        )
+    else:
+        semantic_loss = conditioning.slot_embeddings.new_tensor(0.0)
     box_loss = log_sigma_loss(
         conditioning.slot_log_sigmas,
         log_sigma_targets,
@@ -290,6 +353,7 @@ def _evaluate_graph_encoder(
     box3d_loss_weight: float,
     cvae_kl_weight: float,
     cvae_kl_warmup_steps: int,
+    label_embedding_cache: dict[str, torch.Tensor] | None = None,
 ) -> dict[str, float]:
     graph_encoder.eval()
     metric_keys = _metric_keys(_graph_layout_mode(graph_encoder))
@@ -311,6 +375,7 @@ def _evaluate_graph_encoder(
             cvae_kl_weight=cvae_kl_weight,
             cvae_kl_warmup_steps=cvae_kl_warmup_steps,
             step=cvae_kl_warmup_steps,
+            label_embedding_cache=label_embedding_cache,
         )
         for key in metric_keys:
             totals[key] += float(metrics[key].item())
@@ -388,6 +453,17 @@ def main() -> int:
             f"{args.text_encoder_type} encoder hidden size {encoder_hidden_dim}."
         )
     args.text_hidden_dim = encoder_hidden_dim
+    label_embedding_cache = _load_label_embedding_cache(
+        args.label_embedding_cache,
+        model_id=args.model_id,
+        text_encoder_type=args.text_encoder_type,
+        text_hidden_dim=encoder_hidden_dim,
+    )
+    if accelerator.is_main_process and args.label_embedding_cache:
+        print(
+            f"Loaded {len(label_embedding_cache)} cached label embeddings from "
+            f"{args.label_embedding_cache}."
+        )
 
     graph_encoder = GraphSlotEncoder(
         text_hidden_dim=encoder_hidden_dim,
@@ -439,6 +515,7 @@ def main() -> int:
                 cvae_kl_weight=args.cvae_kl_weight,
                 cvae_kl_warmup_steps=args.cvae_kl_warmup_steps,
                 step=global_step,
+                label_embedding_cache=label_embedding_cache,
             )
             loss = metrics["loss"]
 
@@ -504,6 +581,7 @@ def main() -> int:
                         box3d_loss_weight=args.box3d_loss_weight,
                         cvae_kl_weight=args.cvae_kl_weight,
                         cvae_kl_warmup_steps=args.cvae_kl_warmup_steps,
+                        label_embedding_cache=label_embedding_cache,
                     ),
                 }
                 metrics_logger.log(eval_log)
@@ -526,6 +604,13 @@ def main() -> int:
                 )
                 _save_state(args.output_dir, step=global_step, args=args)
                 print(f"Saved graph pretraining checkpoint to {checkpoint_dir}")
+                _save_label_embedding_cache(
+                    args.label_embedding_cache,
+                    label_embedding_cache,
+                    model_id=args.model_id,
+                    text_encoder_type=args.text_encoder_type,
+                    text_hidden_dim=encoder_hidden_dim,
+                )
 
             if global_step >= args.max_train_steps:
                 break
@@ -555,6 +640,7 @@ def main() -> int:
                 box3d_loss_weight=args.box3d_loss_weight,
                 cvae_kl_weight=args.cvae_kl_weight,
                 cvae_kl_warmup_steps=args.cvae_kl_warmup_steps,
+                label_embedding_cache=label_embedding_cache,
             ),
         }
         metrics_logger.log(test_log)
@@ -571,6 +657,13 @@ def main() -> int:
         print(summary)
     if accelerator.is_main_process:
         _save_state(args.output_dir, step=global_step, args=args)
+        _save_label_embedding_cache(
+            args.label_embedding_cache,
+            label_embedding_cache,
+            model_id=args.model_id,
+            text_encoder_type=args.text_encoder_type,
+            text_hidden_dim=encoder_hidden_dim,
+        )
         print(f"Graph pretraining finished at step {global_step}.")
     accelerator.wait_for_everyone()
     return 0

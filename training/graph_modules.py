@@ -760,6 +760,7 @@ def pooled_label_embeddings(
     scene_graph_batch: BatchedSceneGraphs,
     device: str,
     dtype: torch.dtype,
+    label_embedding_cache: dict[str, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     batch_size = len(scene_graph_batch.node_labels)
     max_nodes = scene_graph_batch.position_targets.shape[1]
@@ -771,24 +772,41 @@ def pooled_label_embeddings(
         dtype=dtype,
     )
 
+    cache = label_embedding_cache
     for batch_index, labels in enumerate(scene_graph_batch.node_labels):
         if not labels:
             continue
-        text_inputs = tokenizer(
-            labels,
-            padding=True,
-            truncation=True,
-            return_tensors="pt",
-        )
+        missing_labels: list[str] = []
+        missing_indices: list[int] = []
+        if cache is not None:
+            for label_index, label in enumerate(labels):
+                cached = cache.get(label)
+                if cached is None:
+                    missing_labels.append(label)
+                    missing_indices.append(label_index)
+                else:
+                    pooled[batch_index, label_index] = cached.to(device=device, dtype=dtype)
+        else:
+            missing_labels = labels
+            missing_indices = list(range(len(labels)))
+
+        if not missing_labels:
+            continue
+
+        text_inputs = tokenizer(missing_labels, padding=True, truncation=True, return_tensors="pt")
         with torch.no_grad():
             encoded = text_encoder(
                 text_inputs.input_ids.to(device),
                 attention_mask=text_inputs.attention_mask.to(device),
             )[0]
-        pooled[batch_index, : len(labels)] = mean_pool_hidden(
+        encoded_pooled = mean_pool_hidden(
             encoded,
             text_inputs.attention_mask.to(device),
         ).to(dtype=dtype)
+        for target_index, label, embedding in zip(missing_indices, missing_labels, encoded_pooled):
+            pooled[batch_index, target_index] = embedding
+            if cache is not None:
+                cache[label] = embedding.detach().cpu()
     return pooled
 
 
@@ -800,6 +818,7 @@ def build_slot_conditioning(
     graph_encoder: GraphSlotEncoder,
     device: str,
     layout_sample_mode: str = "auto",
+    label_embedding_cache: dict[str, torch.Tensor] | None = None,
 ) -> GraphConditioningOutput:
     graph_dtype = graph_encoder.node_proj.weight.dtype
     pooled = pooled_label_embeddings(
@@ -808,6 +827,7 @@ def build_slot_conditioning(
         scene_graph_batch=scene_graph_batch,
         device=device,
         dtype=graph_dtype,
+        label_embedding_cache=label_embedding_cache,
     )
     return graph_encoder(pooled, scene_graph_batch, layout_sample_mode=layout_sample_mode)
 

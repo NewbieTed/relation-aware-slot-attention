@@ -8,7 +8,8 @@ run inference with the released SeeThrough3D FLUX LoRA.
 
 - `gnn_pretrain_3dbox_triple_cvae_3dsln.yaml`: active GNN training config. It
   uses FLUX T5 object-label embeddings, 5 graph layers, L1 min/max box
-  reconstruction, scene/object CVAE latents, and KL weight `0.1`.
+  reconstruction, scene/object CVAE latents, KL weight `0.1`, and a persistent
+  label-embedding cache under `outputs/cache`.
 - `eval_official_seethrough3d_spatial_1p_bf16_512.yaml`: one-prompt smoke eval.
 - `eval_official_seethrough3d_spatial_20p_bf16_512.yaml`: short benchmark sanity check.
 - `eval_official_seethrough3d_spatial_full_bf16_8bit_512.yaml`: full spatial benchmark run.
@@ -18,6 +19,9 @@ run inference with the released SeeThrough3D FLUX LoRA.
 Train the active 3D_SLN-aligned triple-GNN CVAE:
 
 ```bash
+python3 -m training.precompute_graph_label_cache \
+  --config configs/flux/gnn_pretrain_3dbox_triple_cvae_3dsln.yaml
+
 python3 -m training.pretrain_graph_encoder \
   --config configs/flux/gnn_pretrain_3dbox_triple_cvae_3dsln.yaml
 ```
