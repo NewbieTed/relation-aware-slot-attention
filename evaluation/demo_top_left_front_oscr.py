@@ -50,6 +50,24 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", choices=("auto", "cpu", "mps", "cuda"), default="auto")
     parser.add_argument("--image-size", type=int, default=CANVAS_SIZE)
     parser.add_argument(
+        "--layout-sample-mode",
+        choices=("prior_mean", "prior_sample"),
+        default="prior_mean",
+        help="Use prior_mean for deterministic layout or prior_sample for stochastic CVAE samples.",
+    )
+    parser.add_argument(
+        "--num-layout-samples",
+        type=int,
+        default=1,
+        help="Number of GNN layout samples to render per prompt.",
+    )
+    parser.add_argument(
+        "--layout-seed",
+        type=int,
+        default=42,
+        help="Base seed for reproducible stochastic layout samples.",
+    )
+    parser.add_argument(
         "--depth-offset-scale",
         type=float,
         default=0.18,
@@ -280,6 +298,7 @@ def _predict_prompt(
     text_encoder: object,
     graph_encoder: torch.nn.Module,
     device: str,
+    layout_sample_mode: str,
 ) -> tuple[dict[str, Any], list[str], torch.Tensor, torch.Tensor, torch.Tensor]:
     scene_graph = parse_prompt_to_scene_graph(prompt)
     node_count = len(scene_graph["nodes"])
@@ -296,6 +315,7 @@ def _predict_prompt(
         scene_graph_batch=batched_graph,
         graph_encoder=graph_encoder,
         device=device,
+        layout_sample_mode=layout_sample_mode,
     )
     labels = [str(node["label"]) for node in scene_graph["nodes"]]
     return (
@@ -332,57 +352,67 @@ def main() -> int:
 
     records: list[dict[str, Any]] = []
     for index, prompt in enumerate(prompts):
-        scene_graph, labels, centers, log_sizes, slot_mask = _predict_prompt(
-            prompt=prompt,
-            tokenizer=tokenizer,
-            text_encoder=text_encoder,
-            graph_encoder=graph_encoder,
-            device=device,
-        )
-        current_oscr = _tensor_oscr_to_pil(
-            render_oscr_boxes(
-                centers=centers.detach().cpu(),
-                log_sizes=log_sizes.detach().cpu(),
-                slot_mask=slot_mask.detach().cpu(),
+        for sample_index in range(max(1, args.num_layout_samples)):
+            sample_seed = int(args.layout_seed) + index * 1000 + sample_index
+            if args.layout_sample_mode == "prior_sample":
+                torch.manual_seed(sample_seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(sample_seed)
+            scene_graph, labels, centers, log_sizes, slot_mask = _predict_prompt(
+                prompt=prompt,
+                tokenizer=tokenizer,
+                text_encoder=text_encoder,
+                graph_encoder=graph_encoder,
+                device=device,
+                layout_sample_mode=args.layout_sample_mode,
+            )
+            current_oscr = _tensor_oscr_to_pil(
+                render_oscr_boxes(
+                    centers=centers.detach().cpu(),
+                    log_sizes=log_sizes.detach().cpu(),
+                    slot_mask=slot_mask.detach().cpu(),
+                    image_size=args.image_size,
+                )[0]
+            )
+            fixed_corner = render_fixed_corner_oscr(
+                centers=centers,
+                log_sizes=log_sizes,
+                slot_mask=slot_mask,
+                labels=labels,
                 image_size=args.image_size,
-            )[0]
-        )
-        fixed_corner = render_fixed_corner_oscr(
-            centers=centers,
-            log_sizes=log_sizes,
-            slot_mask=slot_mask,
-            labels=labels,
-            image_size=args.image_size,
-            depth_offset_scale=args.depth_offset_scale,
-            front_alpha=args.front_alpha,
-            side_alpha=args.side_alpha,
-            back_alpha=args.back_alpha,
-            edge_alpha=args.edge_alpha,
-        )
-        stem = _safe_name(prompt, index)
-        current_path = args.output_dir / f"{stem}_current_oscr.png"
-        fixed_path = args.output_dir / f"{stem}_top_left_front_oscr.png"
-        sheet_path = args.output_dir / f"{stem}_comparison.png"
-        current_oscr.save(current_path)
-        fixed_corner.save(fixed_path)
-        _make_contact_sheet(
-            prompt=prompt,
-            current=current_oscr,
-            fixed_corner=fixed_corner,
-            output_path=sheet_path,
-        )
-        record = {
-            "prompt": prompt,
-            "scene_graph": scene_graph,
-            "labels": labels,
-            "predicted_centers": centers[0].detach().cpu().to(torch.float32).tolist(),
-            "predicted_sizes": log_sizes[0].detach().cpu().to(torch.float32).exp().tolist(),
-            "current_oscr": str(current_path),
-            "top_left_front_oscr": str(fixed_path),
-            "comparison": str(sheet_path),
-        }
-        records.append(record)
-        print(f"Saved demo for prompt {index}: {sheet_path}")
+                depth_offset_scale=args.depth_offset_scale,
+                front_alpha=args.front_alpha,
+                side_alpha=args.side_alpha,
+                back_alpha=args.back_alpha,
+                edge_alpha=args.edge_alpha,
+            )
+            stem = f"{_safe_name(prompt, index)}_sample{sample_index:02d}"
+            current_path = args.output_dir / f"{stem}_current_oscr.png"
+            fixed_path = args.output_dir / f"{stem}_top_left_front_oscr.png"
+            sheet_path = args.output_dir / f"{stem}_comparison.png"
+            current_oscr.save(current_path)
+            fixed_corner.save(fixed_path)
+            _make_contact_sheet(
+                prompt=f"{prompt} | {args.layout_sample_mode} seed={sample_seed}",
+                current=current_oscr,
+                fixed_corner=fixed_corner,
+                output_path=sheet_path,
+            )
+            record = {
+                "prompt": prompt,
+                "sample_index": sample_index,
+                "layout_sample_mode": args.layout_sample_mode,
+                "layout_seed": sample_seed,
+                "scene_graph": scene_graph,
+                "labels": labels,
+                "predicted_centers": centers[0].detach().cpu().to(torch.float32).tolist(),
+                "predicted_sizes": log_sizes[0].detach().cpu().to(torch.float32).exp().tolist(),
+                "current_oscr": str(current_path),
+                "top_left_front_oscr": str(fixed_path),
+                "comparison": str(sheet_path),
+            }
+            records.append(record)
+            print(f"Saved demo for prompt {index} sample {sample_index}: {sheet_path}")
 
     (args.output_dir / "top_left_front_oscr_records.json").write_text(json.dumps(records, indent=2))
     return 0
