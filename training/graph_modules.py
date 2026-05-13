@@ -919,29 +919,37 @@ def _diagonal_gaussian_kl(
     prior_mu: torch.Tensor,
     prior_logvar: torch.Tensor,
 ) -> torch.Tensor:
+    posterior_mu = posterior_mu.float()
+    posterior_logvar = posterior_logvar.float()
+    prior_mu = prior_mu.float()
+    prior_logvar = prior_logvar.float()
     prior_var = torch.exp(prior_logvar)
     posterior_var = torch.exp(posterior_logvar)
     delta = posterior_mu - prior_mu
-    return 0.5 * (
+    kl = 0.5 * (
         prior_logvar
         - posterior_logvar
         + (posterior_var + delta.pow(2)) / prior_var.clamp_min(1e-8)
         - 1.0
     )
+    return kl.clamp_min(0.0)
 
 
 def cvae_kl_loss(output: GraphConditioningOutput) -> torch.Tensor:
-    """KL to ``N(0, I)`` for scene-level and optional object-level CVAE latents."""
+    """Conditional CVAE KL between posterior and graph-conditioned prior."""
 
-    if output.posterior_mu is None or output.posterior_logvar is None:
+    if (
+        output.prior_mu is None
+        or output.prior_logvar is None
+        or output.posterior_mu is None
+        or output.posterior_logvar is None
+    ):
         return output.slot_positions.new_tensor(0.0)
-    prior_mu = torch.zeros_like(output.posterior_mu)
-    prior_logvar = torch.zeros_like(output.posterior_logvar)
     scene_kl = _diagonal_gaussian_kl(
         output.posterior_mu,
         output.posterior_logvar,
-        prior_mu,
-        prior_logvar,
+        output.prior_mu,
+        output.prior_logvar,
     ).sum(dim=-1).mean()
     if (
         output.object_prior_mu is None
@@ -949,19 +957,17 @@ def cvae_kl_loss(output: GraphConditioningOutput) -> torch.Tensor:
         or output.object_posterior_mu is None
         or output.object_posterior_logvar is None
     ):
-        return scene_kl
-    object_prior_mu = torch.zeros_like(output.object_posterior_mu)
-    object_prior_logvar = torch.zeros_like(output.object_posterior_logvar)
+        return scene_kl.to(output.slot_positions.dtype)
     object_kl = _diagonal_gaussian_kl(
         output.object_posterior_mu,
         output.object_posterior_logvar,
-        object_prior_mu,
-        object_prior_logvar,
+        output.object_prior_mu,
+        output.object_prior_logvar,
     ).sum(dim=-1)
     if not output.slot_mask.any():
-        return scene_kl
+        return scene_kl.to(output.slot_positions.dtype)
     object_kl = object_kl[output.slot_mask].mean()
-    return scene_kl + object_kl
+    return (scene_kl + object_kl).to(output.slot_positions.dtype)
 
 
 def relation_loss(
