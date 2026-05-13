@@ -17,9 +17,9 @@ cd /local1/cse_481_m_l/relation-aware-slot-attention
 nohup bash -lc '
 source .venv-flux/bin/activate
 export CUDA_VISIBLE_DEVICES=7
-CONFIG_FILE=configs/flux/gnn_pretrain_3dbox.yaml \
+CONFIG_FILE=configs/flux/gnn_pretrain_3dbox_triple_cvae_3dsln.yaml \
 bash scripts/train/run_graph_pretrain.sh
-' > logs/gnn_pretrain_3dbox.log 2>&1 &
+' > logs/gnn_pretrain_3dbox_triple_cvae_3dsln.log 2>&1 &
 ```
 
 The resulting checkpoint is later passed to FLUX/SeeThrough3D inference with

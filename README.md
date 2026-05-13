@@ -34,7 +34,7 @@ If you only need the SeeThrough3D checkout:
 ## Current Workflow
 
 1. Build SCOP-Depth cropped/depth data.
-2. Pretrain the GNN with position, relation, and 3D box-size losses.
+2. Pretrain the GNN with the active 3D_SLN-aligned triple-CVAE config.
 3. Use the frozen GNN to predict 3D boxes for new prompts.
 4. Render GNN-predicted 3D boxes into OSCR condition images.
 5. Run FLUX.1-dev inference with the official SeeThrough3D LoRA.
@@ -44,36 +44,12 @@ Example GNN training:
 
 ```bash
 python3 -m training.pretrain_graph_encoder \
-  --dataset-dir data/scop_depth_crops_depth \
-  --output-dir outputs/train/graph_pretrain_flux_3dbox \
-  --position-loss-weight 1.0 \
-  --relation-loss-weight 8.0 \
-  --box3d-loss-weight 1.0 \
-  --embedding-loss-weight 0.0 \
-  --inverse-relation-loss-weight 0.0
+  --config configs/flux/gnn_pretrain_3dbox_triple_cvae_3dsln.yaml
 ```
 
-Optional probabilistic GNN training:
-
-```bash
-python3 -m training.pretrain_graph_encoder \
-  --config configs/flux/gnn_pretrain_3dbox_cvae.yaml
-```
-
-The CVAE mode keeps the same GNN message passing but replaces the deterministic
-layout head with a scene-level latent variable, so one prompt can sample multiple
-plausible OSCR layouts.
-
-Optional 3D_SLN-style triple-GNN CVAE training:
-
-```bash
-python3 -m training.pretrain_graph_encoder \
-  --config configs/flux/gnn_pretrain_3dbox_triple_cvae.yaml
-```
-
-The triple-CVAE mode makes relation edges contextual, samples both scene-level
-and object-level latents, and runs a decoder triple-GNN before predicting OSCR
-centers and 3D sizes.
+This config uses FLUX T5 object-label embeddings, 5 triple-GNN layers,
+scene-level and object-level CVAE latents, normalized min/max 3D box L1 loss,
+and 3D_SLN-style KL regularization.
 
 Example generation/debug:
 
