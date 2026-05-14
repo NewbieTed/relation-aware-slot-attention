@@ -112,6 +112,15 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--blender-bin", type=str, default="blender")
     parser.add_argument("--blender-cache-dir", type=Path, default=None)
     parser.add_argument("--prompt-prefix", type=str, default="a photo of")
+    parser.add_argument(
+        "--generation-prompt-suffix",
+        type=str,
+        default="",
+        help=(
+            "Optional qualitative-only text appended after the binding prompt. "
+            "The GNN/OSCR layout still uses the original prompt."
+        ),
+    )
     return parser
 
 
@@ -499,10 +508,11 @@ def main() -> int:
         oscr_viz_name = f"{prompt_name}_oscr_viz.png"
         oscr_viz_image.save(condition_dir / oscr_viz_name)
         layout["oscr_viz_file"] = str(Path("conditions") / oscr_viz_name)
+        generation_prompt = " ".join([binding_prompt, args.generation_prompt_suffix]).strip()
         encoder_device = text_encoder_device(pipeline)
         prompt_embeds, pooled_prompt_embeds, _text_ids = pipeline.encode_prompt(
-            prompt=binding_prompt,
-            prompt_2=binding_prompt,
+            prompt=generation_prompt,
+            prompt_2=generation_prompt,
             device=encoder_device,
             num_images_per_prompt=1,
             max_sequence_length=args.max_sequence_length,
@@ -543,6 +553,7 @@ def main() -> int:
                     "repeat_index": repeat_index,
                     "seed": seed,
                     "file_name": filename,
+                    "generation_prompt": generation_prompt,
                     "layout": layout,
                 }
             )
@@ -574,6 +585,7 @@ def main() -> int:
         "blender_bin": args.blender_bin,
         "blender_cache_dir": str(args.blender_cache_dir or (args.output_dir / "blender_condition_cache")),
         "prompt_prefix": args.prompt_prefix,
+        "generation_prompt_suffix": args.generation_prompt_suffix,
         "gnn_layout_sample_mode": args.gnn_layout_sample_mode,
         "seed": args.seed,
     }
