@@ -296,6 +296,12 @@ class GraphSlotEncoder(nn.Module):
                 nn.SiLU(),
                 nn.Linear(slot_dim, slot_dim),
             )
+            self.triple_decoder_film = nn.Sequential(
+                nn.LayerNorm(latent_dim * 2),
+                nn.Linear(latent_dim * 2, slot_dim),
+                nn.SiLU(),
+                nn.Linear(slot_dim, slot_dim * 2),
+            )
             self.triple_position_head = nn.Sequential(
                 nn.LayerNorm(slot_dim),
                 nn.Linear(slot_dim, slot_dim),
@@ -589,8 +595,12 @@ class GraphSlotEncoder(nn.Module):
                 object_z = obj_prior_mu
 
             scene_z_nodes = scene_z.unsqueeze(0).expand(valid_node_count, -1)
+            z_context = torch.cat([scene_z_nodes, object_z], dim=-1)
+            film = self.triple_decoder_film(z_context)
+            gamma, beta = film.chunk(2, dim=-1)
+            modulated_prior_nodes = prior_nodes * (1.0 + 0.1 * gamma.tanh()) + 0.1 * beta
             decoder_nodes = self.triple_decoder_node_in(
-                torch.cat([prior_nodes, scene_z_nodes, object_z], dim=-1)
+                torch.cat([modulated_prior_nodes, z_context], dim=-1)
             )
             decoder_nodes, decoder_edges = self._run_triple_layers(
                 decoder_nodes,
