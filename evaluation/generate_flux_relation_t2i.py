@@ -121,6 +121,15 @@ def make_parser() -> argparse.ArgumentParser:
             "The GNN/OSCR layout still uses the original prompt."
         ),
     )
+    parser.add_argument(
+        "--generation-scene-prefix",
+        type=str,
+        default="",
+        help=(
+            "Optional qualitative-only scene text inserted after the subject anchors "
+            "and before the relation prompt, while preserving token binding offsets."
+        ),
+    )
     return parser
 
 
@@ -314,6 +323,7 @@ def _predict_condition(
     blender_cache_dir: Path,
     prompt_prefix: str,
     gnn_layout_sample_mode: str,
+    generation_scene_prefix: str = "",
 ) -> tuple[Any, Any, str, list[list[torch.Tensor]], torch.Tensor, dict[str, Any]]:
     scene_graph = parse_prompt_to_scene_graph(prompt)
     node_count = len(scene_graph["nodes"])
@@ -417,6 +427,17 @@ def _predict_condition(
         scene_graph=scene_graph,
         prefix=prompt_prefix,
     )
+    if generation_scene_prefix.strip():
+        subject_list = binding_prompt.prompt[: binding_prompt.subject_spans[-1][1]]
+        generation_prompt_for_binding = build_binding_prompt(
+            original_prompt=f"{generation_scene_prefix.strip()}, {prompt}",
+            scene_graph=scene_graph,
+            prefix=prompt_prefix,
+        )
+        # Keep the same subject-anchor prefix, but let the relation phrase carry
+        # the richer scene text. This preserves the object token offsets.
+        if generation_prompt_for_binding.prompt.startswith(subject_list):
+            binding_prompt = generation_prompt_for_binding
     call_ids = [
         call_ids_from_binding_prompt(
             tokenizer=pipeline.tokenizer_2,
@@ -502,6 +523,7 @@ def main() -> int:
             blender_cache_dir=args.blender_cache_dir or (args.output_dir / "blender_condition_cache"),
             prompt_prefix=args.prompt_prefix,
             gnn_layout_sample_mode=args.gnn_layout_sample_mode,
+            generation_scene_prefix=args.generation_scene_prefix,
         )
         condition_dir = args.output_dir / "conditions"
         condition_dir.mkdir(parents=True, exist_ok=True)
@@ -586,6 +608,7 @@ def main() -> int:
         "blender_cache_dir": str(args.blender_cache_dir or (args.output_dir / "blender_condition_cache")),
         "prompt_prefix": args.prompt_prefix,
         "generation_prompt_suffix": args.generation_prompt_suffix,
+        "generation_scene_prefix": args.generation_scene_prefix,
         "gnn_layout_sample_mode": args.gnn_layout_sample_mode,
         "seed": args.seed,
     }
