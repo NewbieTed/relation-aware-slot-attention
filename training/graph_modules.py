@@ -143,12 +143,14 @@ class GraphSlotEncoder(nn.Module):
         num_layers: int = 2,
         layout_mode: str = "deterministic",
         latent_dim: int = 64,
+        decoder_node_dropout: float = 0.0,
     ) -> None:
         super().__init__()
         if layout_mode not in {"deterministic", "cvae", "triple_cvae"}:
             raise ValueError(f"Unsupported layout_mode: {layout_mode}")
         self.layout_mode = layout_mode
         self.latent_dim = latent_dim
+        self.decoder_node_dropout = float(decoder_node_dropout)
         self.node_proj = nn.Linear(text_hidden_dim, slot_dim)
         self.relation_embedding = nn.Embedding(len(RELATION_VOCAB), relation_dim)
         self.layers = nn.ModuleList(
@@ -598,7 +600,12 @@ class GraphSlotEncoder(nn.Module):
             z_context = torch.cat([scene_z_nodes, object_z], dim=-1)
             film = self.triple_decoder_film(z_context)
             gamma, beta = film.chunk(2, dim=-1)
-            modulated_prior_nodes = prior_nodes * (1.0 + 0.1 * gamma.tanh()) + 0.1 * beta
+            decoder_prior_nodes = F.dropout(
+                prior_nodes,
+                p=self.decoder_node_dropout,
+                training=self.training and self.decoder_node_dropout > 0.0,
+            )
+            modulated_prior_nodes = decoder_prior_nodes * (1.0 + 0.1 * gamma.tanh()) + 0.1 * beta
             decoder_nodes = self.triple_decoder_node_in(
                 torch.cat([modulated_prior_nodes, z_context], dim=-1)
             )

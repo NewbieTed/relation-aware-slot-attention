@@ -11,6 +11,7 @@ model:
   gnn_layers: 5
   layout_mode: triple_cvae
   latent_dim: 64
+  decoder_node_dropout: 0.2
 
 runtime:
   device: cuda
