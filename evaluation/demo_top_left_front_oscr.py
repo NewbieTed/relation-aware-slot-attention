@@ -68,6 +68,12 @@ def make_parser() -> argparse.ArgumentParser:
         help="Base seed for reproducible stochastic layout samples.",
     )
     parser.add_argument(
+        "--layout-z-scale",
+        type=float,
+        default=1.0,
+        help="Debug multiplier for sampled latent displacement around the prior/posterior mean.",
+    )
+    parser.add_argument(
         "--debug-latents",
         action="store_true",
         help="Print prior/posterior latent stats and sampled z values for each layout sample.",
@@ -407,6 +413,7 @@ def _predict_prompt(
     graph_encoder: torch.nn.Module,
     device: str,
     layout_sample_mode: str,
+    layout_z_scale: float,
 ) -> tuple[dict[str, Any], list[str], torch.Tensor, torch.Tensor, torch.Tensor, object]:
     scene_graph = parse_prompt_to_scene_graph(prompt)
     node_count = len(scene_graph["nodes"])
@@ -424,6 +431,7 @@ def _predict_prompt(
         graph_encoder=graph_encoder,
         device=device,
         layout_sample_mode=layout_sample_mode,
+        layout_z_scale=layout_z_scale,
     )
     labels = [str(node["label"]) for node in scene_graph["nodes"]]
     return (
@@ -480,6 +488,7 @@ def main() -> int:
                 graph_encoder=graph_encoder,
                 device=device,
                 layout_sample_mode=args.layout_sample_mode,
+                layout_z_scale=args.layout_z_scale,
             )
             if args.debug_latents:
                 _print_latent_debug(
@@ -528,6 +537,7 @@ def main() -> int:
                 "prompt": prompt,
                 "sample_index": sample_index,
                 "layout_sample_mode": args.layout_sample_mode,
+                "layout_z_scale": args.layout_z_scale,
                 "layout_seed": sample_seed,
                 "scene_graph": scene_graph,
                 "labels": labels,

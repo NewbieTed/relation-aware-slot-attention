@@ -349,6 +349,7 @@ class GraphSlotEncoder(nn.Module):
         scene_graph_batch: BatchedSceneGraphs,
         *,
         layout_sample_mode: str = "auto",
+        layout_z_scale: float = 1.0,
     ) -> GraphConditioningOutput:
         if layout_sample_mode not in {"auto", "posterior", "prior_sample", "prior_mean"}:
             raise ValueError(f"Unsupported layout_sample_mode: {layout_sample_mode}")
@@ -359,6 +360,7 @@ class GraphSlotEncoder(nn.Module):
                 node_states,
                 scene_graph_batch,
                 layout_sample_mode=layout_sample_mode,
+                layout_z_scale=layout_z_scale,
             )
         relation_logits: list[torch.Tensor] = []
 
@@ -411,6 +413,7 @@ class GraphSlotEncoder(nn.Module):
                 node_states,
                 scene_graph_batch,
                 layout_sample_mode=layout_sample_mode,
+                layout_z_scale=layout_z_scale,
             )
         else:
             slot_positions = self.position_head(node_states)
@@ -489,6 +492,7 @@ class GraphSlotEncoder(nn.Module):
         scene_graph_batch: BatchedSceneGraphs,
         *,
         layout_sample_mode: str,
+        layout_z_scale: float,
     ) -> GraphConditioningOutput:
         batch_size, max_nodes, _ = node_states.shape
         device = node_states.device
@@ -573,9 +577,13 @@ class GraphSlotEncoder(nn.Module):
             if layout_sample_mode == "posterior" or (layout_sample_mode == "auto" and self.training):
                 scene_z = self._reparameterize(scene_posterior_mu, scene_posterior_logvar)
                 object_z = self._reparameterize(obj_posterior_mu, obj_posterior_logvar)
+                scene_z = scene_posterior_mu + layout_z_scale * (scene_z - scene_posterior_mu)
+                object_z = obj_posterior_mu + layout_z_scale * (object_z - obj_posterior_mu)
             elif layout_sample_mode == "prior_sample":
                 scene_z = self._reparameterize(scene_prior_mu, scene_prior_logvar)
                 object_z = self._reparameterize(obj_prior_mu, obj_prior_logvar)
+                scene_z = scene_prior_mu + layout_z_scale * (scene_z - scene_prior_mu)
+                object_z = obj_prior_mu + layout_z_scale * (object_z - obj_prior_mu)
             else:
                 scene_z = scene_prior_mu
                 object_z = obj_prior_mu
@@ -678,6 +686,7 @@ class GraphSlotEncoder(nn.Module):
         scene_graph_batch: BatchedSceneGraphs,
         *,
         layout_sample_mode: str,
+        layout_z_scale: float,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -719,8 +728,10 @@ class GraphSlotEncoder(nn.Module):
 
         if layout_sample_mode == "posterior" or (layout_sample_mode == "auto" and self.training):
             z = self._reparameterize(posterior_mu, posterior_logvar)
+            z = posterior_mu + layout_z_scale * (z - posterior_mu)
         elif layout_sample_mode == "prior_sample":
             z = self._reparameterize(prior_mu, prior_logvar)
+            z = prior_mu + layout_z_scale * (z - prior_mu)
         else:
             z = prior_mu
 
@@ -822,6 +833,7 @@ def build_slot_conditioning(
     device: str,
     layout_sample_mode: str = "auto",
     label_embedding_cache: dict[str, torch.Tensor] | None = None,
+    layout_z_scale: float = 1.0,
 ) -> GraphConditioningOutput:
     graph_dtype = graph_encoder.node_proj.weight.dtype
     pooled = pooled_label_embeddings(
@@ -832,7 +844,12 @@ def build_slot_conditioning(
         dtype=graph_dtype,
         label_embedding_cache=label_embedding_cache,
     )
-    return graph_encoder(pooled, scene_graph_batch, layout_sample_mode=layout_sample_mode)
+    return graph_encoder(
+        pooled,
+        scene_graph_batch,
+        layout_sample_mode=layout_sample_mode,
+        layout_z_scale=layout_z_scale,
+    )
 
 
 def embedding_alignment_loss(
