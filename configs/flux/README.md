@@ -10,6 +10,10 @@ run inference with the released SeeThrough3D FLUX LoRA.
   uses FLUX T5 object-label embeddings, 5 graph layers, L1 min/max box
   reconstruction, scene/object CVAE latents, KL weight `0.1`, and a persistent
   label-embedding cache under `outputs/cache`.
+- `gnn_pretrain_3dbox_triple_cvae_3dsln_dropout02_rel1_box02.yaml`: CVAE
+  follow-up config for layout diversity. It keeps decoder node dropout at
+  `0.2`, lowers exact 3D box reconstruction to `0.2`, and adds relation loss
+  weight `1.0` so sampled boxes can move while preserving spatial relations.
 - `gnn_pretrain_3dbox_deterministic_clip.yaml`: deterministic 3D box GNN
   recovery config using FLUX CLIP label embeddings. This is the closest config
   to the earlier deterministic GNN path: 2 graph layers, 600 steps, center loss,
