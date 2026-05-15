@@ -6,6 +6,14 @@ run inference with the released SeeThrough3D FLUX LoRA.
 
 ## Files
 
+Training configs live directly in `configs/flux/`. Evaluation configs are split
+by purpose:
+
+- `eval/smoke/`: tiny 3-prompt, 1-image runs for checking that generation and
+  scoring still work before starting expensive jobs.
+- `eval/official/`: longer SeeThrough3D/FLUX benchmark configs used for actual
+  reporting.
+
 - `gnn_pretrain_3dbox_triple_cvae_3dsln.yaml`: active GNN training config. It
   uses FLUX T5 object-label embeddings, 5 graph layers, L1 min/max box
   reconstruction, scene/object CVAE latents, KL weight `0.1`, and a persistent
@@ -21,9 +29,9 @@ run inference with the released SeeThrough3D FLUX LoRA.
 - `gnn_pretrain_3dbox_deterministic_t5.yaml`: deterministic 3D box GNN with the
   same losses and schedule as the CLIP version, but using FLUX T5 label
   embeddings so we can compare the text encoder effect directly.
-- `eval_official_seethrough3d_spatial_1p_bf16_512.yaml`: one-prompt smoke eval.
-- `eval_official_seethrough3d_spatial_20p_bf16_512.yaml`: short benchmark sanity check.
-- `eval_official_seethrough3d_spatial_full_bf16_8bit_512.yaml`: full spatial benchmark run.
+- `eval/official/eval_official_seethrough3d_spatial_1p_bf16_512.yaml`: one-prompt smoke eval.
+- `eval/official/eval_official_seethrough3d_spatial_20p_bf16_512.yaml`: short benchmark sanity check.
+- `eval/official/eval_official_seethrough3d_spatial_full_bf16_8bit_512.yaml`: full spatial benchmark run.
 
 ## Examples
 
@@ -56,7 +64,7 @@ python3 -m training.pretrain_graph_encoder \
 Run the one-prompt SeeThrough3D smoke benchmark:
 
 ```bash
-CONFIG_FILE=configs/flux/eval_official_seethrough3d_spatial_1p_bf16_512.yaml \
+CONFIG_FILE=configs/flux/eval/official/eval_official_seethrough3d_spatial_1p_bf16_512.yaml \
 bash scripts/benchmark/run_flux_relation_t2icompbench.sh
 ```
 

@@ -1,7 +1,7 @@
 generate:
   prompt_file: /local1/cse_481_m_l/relation-aware-slot-attention/external/T2I-CompBench/examples/dataset/3d_spatial_val.txt
-  graph_encoder_path: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/train/graph_pretrain_flux_3dbox_deterministic_t5_b128_600/final/graph_encoder.pt
-  output_dir: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/eval/smoke_flux_gnn_t5_3d_spatial_512_3p1i
+  graph_encoder_path: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/train/final_models/graph_pretrain_flux_3dbox_deterministic_clip_b128_600/final/graph_encoder.pt
+  output_dir: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/eval/smoke_flux_gnn_clip_3d_spatial_512_3p1i
   model_id: black-forest-labs/FLUX.1-dev
   device: cuda
   mixed_precision: bf16
@@ -27,12 +27,12 @@ generate:
   oscr_face_alpha: 0.0025
   oscr_azimuth_degrees: 0.0
   blender_bin: /local1/cse_481_m_l/blender/blender-3.6.19-linux-x64/blender
-  blender_cache_dir: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/cache/blender_smoke_flux_gnn_t5_3d_spatial_512_3p1i
+  blender_cache_dir: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/cache/blender_smoke_flux_gnn_clip_3d_spatial_512_3p1i
   prompt_prefix: a photo of
 
 benchmark:
   benchmark: 3d_spatial
   t2i_root: /local1/cse_481_m_l/relation-aware-slot-attention/external/T2I-CompBench
   t2i_python: /local1/cse_481_m_l/relation-aware-slot-attention/.venv-t2i/bin/python
-  output_dir: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/eval/smoke_flux_gnn_t5_3d_spatial_512_3p1i
+  output_dir: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/eval/smoke_flux_gnn_clip_3d_spatial_512_3p1i
   prompt_file: /local1/cse_481_m_l/relation-aware-slot-attention/external/T2I-CompBench/examples/dataset/3d_spatial_val.txt
