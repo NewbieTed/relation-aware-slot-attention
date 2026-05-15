@@ -60,6 +60,8 @@ def _save_state(output_dir: Path, *, step: int, args: argparse.Namespace) -> Non
         "layout_mode": args.layout_mode,
         "latent_dim": args.latent_dim,
         "decoder_node_dropout": args.decoder_node_dropout,
+        "decoder_box_residual": args.decoder_box_residual,
+        "decoder_box_residual_scale": args.decoder_box_residual_scale,
         "label_embedding_cache": str(args.label_embedding_cache) if args.label_embedding_cache else None,
         "cvae_kl_weight": args.cvae_kl_weight,
         "cvae_kl_warmup_steps": args.cvae_kl_warmup_steps,
@@ -189,6 +191,8 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--layout-mode", choices=("deterministic", "cvae", "triple_cvae"), default="deterministic")
     parser.add_argument("--latent-dim", type=int, default=64)
     parser.add_argument("--decoder-node-dropout", type=float, default=0.0)
+    parser.add_argument("--decoder-box-residual", action="store_true")
+    parser.add_argument("--decoder-box-residual-scale", type=float, default=0.25)
     parser.add_argument("--save-every", type=int, default=500)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--eval-every", type=int, default=250)
@@ -474,6 +478,8 @@ def main() -> int:
         layout_mode=args.layout_mode,
         latent_dim=args.latent_dim,
         decoder_node_dropout=args.decoder_node_dropout,
+        decoder_box_residual=args.decoder_box_residual,
+        decoder_box_residual_scale=args.decoder_box_residual_scale,
     ).to(device)
     optimizer = torch.optim.AdamW(
         graph_encoder.parameters(),

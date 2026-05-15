@@ -24,6 +24,10 @@ by purpose:
   follow-up config for layout diversity. It keeps decoder node dropout at
   `0.2`, lowers exact 3D box reconstruction to `0.2`, and adds relation loss
   weight `1.0` so sampled boxes can move while preserving spatial relations.
+- `gnn_pretrain_3dbox_triple_cvae_3dsln_residual_dropout02_rel1_box02_1500.yaml`:
+  short architecture-search run that adds a latent-conditioned residual box
+  delta on top of the decoder's base box prediction. It uses the same loss
+  balance as `dropout02_rel1_box02`, but only trains for `1500` steps.
 - `gnn_pretrain_3dbox_deterministic_clip.yaml`: deterministic 3D box GNN
   recovery config using FLUX CLIP label embeddings. This is the closest config
   to the earlier deterministic GNN path: 2 graph layers, 600 steps, center loss,

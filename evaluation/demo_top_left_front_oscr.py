@@ -451,7 +451,7 @@ def main() -> int:
     device = resolve_torch_device(args.device)
 
     state_dict = normalize_graph_encoder_state_dict(torch.load(args.graph_encoder_path, map_location="cpu"))
-    _slot_dim, text_hidden_dim, _gnn_layers, _layout_mode, _latent_dim = infer_graph_encoder_config(state_dict)
+    _slot_dim, text_hidden_dim, _gnn_layers, _layout_mode, _latent_dim, _decoder_box_residual = infer_graph_encoder_config(state_dict)
     text_encoder_type = infer_text_encoder_type(text_hidden_dim)
     tokenizer, text_encoder, encoder_hidden_dim = load_graph_label_encoder(
         model_id=args.model_id,

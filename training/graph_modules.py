@@ -144,6 +144,8 @@ class GraphSlotEncoder(nn.Module):
         layout_mode: str = "deterministic",
         latent_dim: int = 64,
         decoder_node_dropout: float = 0.0,
+        decoder_box_residual: bool = False,
+        decoder_box_residual_scale: float = 0.25,
     ) -> None:
         super().__init__()
         if layout_mode not in {"deterministic", "cvae", "triple_cvae"}:
@@ -151,6 +153,8 @@ class GraphSlotEncoder(nn.Module):
         self.layout_mode = layout_mode
         self.latent_dim = latent_dim
         self.decoder_node_dropout = float(decoder_node_dropout)
+        self.decoder_box_residual = bool(decoder_box_residual)
+        self.decoder_box_residual_scale = float(decoder_box_residual_scale)
         self.node_proj = nn.Linear(text_hidden_dim, slot_dim)
         self.relation_embedding = nn.Embedding(len(RELATION_VOCAB), relation_dim)
         self.layers = nn.ModuleList(
@@ -323,6 +327,14 @@ class GraphSlotEncoder(nn.Module):
                 nn.SiLU(),
                 nn.Linear(slot_dim, 6),
             )
+            if self.decoder_box_residual:
+                self.triple_box_3d_delta_head = nn.Sequential(
+                    nn.LayerNorm(slot_dim + latent_dim * 2),
+                    nn.Linear(slot_dim + latent_dim * 2, slot_dim),
+                    nn.SiLU(),
+                    nn.Linear(slot_dim, 6),
+                    nn.Tanh(),
+                )
             self.posterior_head = nn.Sequential(
                 nn.LayerNorm(slot_dim * 2),
                 nn.Linear(slot_dim * 2, slot_dim),
@@ -616,6 +628,13 @@ class GraphSlotEncoder(nn.Module):
                 self.triple_decoder_layers,
             )
             raw_boxes = self.triple_box_3d_head(decoder_nodes).sigmoid()
+            if self.decoder_box_residual:
+                base_boxes = self.triple_box_3d_head(prior_nodes).sigmoid()
+                delta_input = torch.cat([decoder_nodes, z_context], dim=-1)
+                box_delta = self.triple_box_3d_delta_head(delta_input)
+                raw_boxes = (
+                    base_boxes + self.decoder_box_residual_scale * box_delta
+                ).clamp(min=0.0, max=1.0)
             box_mins = torch.minimum(raw_boxes[:, :3], raw_boxes[:, 3:])
             box_maxs = torch.maximum(raw_boxes[:, :3], raw_boxes[:, 3:])
             boxes = torch.cat([box_mins, box_maxs], dim=-1)

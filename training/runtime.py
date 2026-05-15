@@ -92,7 +92,7 @@ def normalize_graph_encoder_state_dict(checkpoint: object) -> dict[str, torch.Te
     return state_dict
 
 
-def infer_graph_encoder_config(state_dict: dict[str, torch.Tensor]) -> tuple[int, int, int, str, int]:
+def infer_graph_encoder_config(state_dict: dict[str, torch.Tensor]) -> tuple[int, int, int, str, int, bool]:
     """Infer graph encoder dimensions and layout mode from a saved state."""
 
     node_weight = state_dict.get("node_proj.weight")
@@ -114,13 +114,16 @@ def infer_graph_encoder_config(state_dict: dict[str, torch.Tensor]) -> tuple[int
     if "triple_prior_scene_head.3.weight" in state_dict:
         layout_mode = "triple_cvae"
         latent_dim = int(state_dict["triple_prior_scene_head.3.weight"].shape[0] // 2)
+        decoder_box_residual = "triple_box_3d_delta_head.3.weight" in state_dict
     elif "prior_head.3.weight" in state_dict:
         layout_mode = "cvae"
         latent_dim = int(state_dict["prior_head.3.weight"].shape[0] // 2)
+        decoder_box_residual = False
     else:
         layout_mode = "deterministic"
         latent_dim = 64
-    return slot_dim, text_hidden_dim, len(layer_indices), layout_mode, latent_dim
+        decoder_box_residual = False
+    return slot_dim, text_hidden_dim, len(layer_indices), layout_mode, latent_dim, decoder_box_residual
 
 
 def infer_text_encoder_type(text_hidden_dim: int) -> str:
@@ -181,7 +184,14 @@ def load_graph_encoder(
     """Load a saved graph encoder with its inferred architecture."""
 
     state_dict = normalize_graph_encoder_state_dict(torch.load(path, map_location="cpu"))
-    slot_dim, inferred_text_hidden_dim, gnn_layers, layout_mode, latent_dim = infer_graph_encoder_config(state_dict)
+    (
+        slot_dim,
+        inferred_text_hidden_dim,
+        gnn_layers,
+        layout_mode,
+        latent_dim,
+        decoder_box_residual,
+    ) = infer_graph_encoder_config(state_dict)
     if text_hidden_dim != inferred_text_hidden_dim:
         raise ValueError(
             "Graph encoder text embedding dimension mismatch: "
@@ -193,6 +203,7 @@ def load_graph_encoder(
         num_layers=gnn_layers,
         layout_mode=layout_mode,
         latent_dim=latent_dim,
+        decoder_box_residual=decoder_box_residual,
     ).to(device=device, dtype=dtype)
     encoder.load_state_dict(state_dict, strict=False)
     encoder.eval()
