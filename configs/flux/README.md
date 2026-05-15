@@ -11,6 +11,8 @@ by purpose:
 
 - `eval/smoke/`: tiny 3-prompt, 1-image runs for checking that generation and
   scoring still work before starting expensive jobs.
+- `eval/full/`: final 512px, 5-images-per-prompt benchmark configs for the
+  paper comparison.
 - `eval/official/`: longer SeeThrough3D/FLUX benchmark configs used for actual
   reporting.
 
