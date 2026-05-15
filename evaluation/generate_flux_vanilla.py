@@ -11,6 +11,7 @@ from typing import Any
 import torch
 from tqdm.auto import tqdm
 
+from training.config import parse_args_with_config
 from training.runtime import DEFAULT_FLUX_MODEL_ID, choose_weight_dtype, resolve_torch_device, set_seed
 
 
@@ -104,7 +105,7 @@ def _load_pipeline(args: argparse.Namespace, device: str, dtype: torch.dtype) ->
 
 
 def main() -> int:
-    args = make_parser().parse_args()
+    args = parse_args_with_config(make_parser(), section="generate")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     samples_dir = args.output_dir / "samples"
     samples_dir.mkdir(parents=True, exist_ok=True)
