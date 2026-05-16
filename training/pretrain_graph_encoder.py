@@ -414,6 +414,7 @@ def main() -> int:
         seed=args.seed,
         eval_fraction=args.eval_fraction,
         test_fraction=args.test_fraction,
+        load_images=False,
     )
     if accelerator.is_main_process:
         write_split_manifest(

@@ -55,3 +55,8 @@ python3 -m training.augment_scop_layouts \
   --num-samples 48 \
   --seed 42
 ```
+
+For graph pretraining on a large augmented dataset, the trainer uses metadata
+only and skips image loading. This keeps the symlinked crops available for
+visual inspection without spending training time decoding images that the GNN
+does not consume.
