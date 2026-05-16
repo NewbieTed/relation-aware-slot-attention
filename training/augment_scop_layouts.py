@@ -12,6 +12,8 @@ from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont
 
+from scop_depth.prompt_graph import scene_graph_from_scop_depth_row
+
 
 RELATION_ALIASES = {
     "left": "left_of",
@@ -29,6 +31,7 @@ RELATION_ALIASES = {
     "behind": "behind",
     "hidden by": "behind",
 }
+SUPPORTED_RELATIONS = {"left_of", "right_of", "above", "below", "in_front_of", "behind"}
 
 
 def make_parser() -> argparse.ArgumentParser:
@@ -69,24 +72,64 @@ def dump_rows(path: Path, rows: list[dict[str, Any]]) -> None:
 
 
 def relation_from_row(row: dict[str, Any]) -> tuple[int, int, str] | None:
-    if not row.get("oros"):
-        return None
-    rel = row["oros"][0]
-    labels = [item.get("category_name") for item in row.get("annots", [])]
-    if len(rel) != 3 or len(labels) < 2:
-        return None
-    source_label, phrase, target_label = rel
-    normalized = RELATION_ALIASES.get(str(phrase).strip().lower())
-    if normalized is None:
-        return None
     try:
-        source_index = labels.index(source_label)
-        target_index = labels.index(target_label)
-    except ValueError:
+        graph = scene_graph_from_scop_depth_row(row)
+    except (KeyError, ValueError, TypeError):
         return None
-    if source_index == target_index:
+    node_id_to_index = {node.id: index for index, node in enumerate(graph.nodes)}
+    for edge in graph.edges:
+        relation = "behind" if edge.relation == "hidden_by" else edge.relation
+        if relation not in SUPPORTED_RELATIONS:
+            continue
+        source_index = node_id_to_index[edge.source_id]
+        target_index = node_id_to_index[edge.target_id]
+        if source_index != target_index:
+            return source_index, target_index, relation
+    return None
+
+
+def _same_bbox(left: list[float] | tuple[float, ...], right: list[float] | tuple[float, ...]) -> bool:
+    return len(left) == len(right) and all(abs(float(a) - float(b)) < 1e-4 for a, b in zip(left, right))
+
+
+def canonicalize_row(row: dict[str, Any]) -> dict[str, Any] | None:
+    try:
+        graph = scene_graph_from_scop_depth_row(row)
+    except (KeyError, ValueError, TypeError):
         return None
-    return source_index, target_index, normalized
+
+    ordered_indices: list[int] = []
+    used_indices: set[int] = set()
+    for node in graph.nodes:
+        match_index = None
+        for index, annot in enumerate(row.get("annots", [])):
+            if index in used_indices:
+                continue
+            if int(annot.get("category_id", -1)) != int(node.category_id):
+                continue
+            if node.bbox is not None and not _same_bbox(annot.get("bbox", []), node.bbox):
+                continue
+            match_index = index
+            break
+        if match_index is None:
+            return None
+        used_indices.add(match_index)
+        ordered_indices.append(match_index)
+
+    if len(ordered_indices) != 2:
+        return None
+
+    new_row = copy.deepcopy(row)
+    new_row["annots"] = [copy.deepcopy(row["annots"][index]) for index in ordered_indices]
+    if row.get("depth"):
+        new_depth = copy.deepcopy(row["depth"])
+        for new_index, old_index in enumerate(ordered_indices):
+            old_key = f"bbox{old_index + 1}"
+            new_key = f"bbox{new_index + 1}"
+            if old_key in row["depth"]:
+                new_depth[new_key] = copy.deepcopy(row["depth"][old_key])
+        new_row["depth"] = new_depth
+    return new_row
 
 
 def original_box_01(row: dict[str, Any], node_index: int) -> tuple[float, float, float, float, float, float]:
@@ -227,7 +270,13 @@ def augment_row(row: dict[str, Any], rng: random.Random, args: argparse.Namespac
 
 
 def is_augmentable_row(row: dict[str, Any]) -> bool:
-    return relation_from_row(row) is not None and row.get("image_size") is not None and len(row.get("annots", [])) >= 2
+    canonical_row = canonicalize_row(row)
+    return (
+        canonical_row is not None
+        and relation_from_row(canonical_row) is not None
+        and canonical_row.get("image_size") is not None
+        and len(canonical_row.get("annots", [])) >= 2
+    )
 
 
 def link_or_copy_image(input_dir: Path, output_dir: Path, file_name: str, *, copy_images: bool) -> None:
@@ -275,9 +324,10 @@ def main() -> int:
     all_rows = load_rows(args.input_dir / "metadata.jsonl")
     rows: list[dict[str, Any]] = []
     for row in all_rows:
-        if not is_augmentable_row(row):
+        canonical_row = canonicalize_row(row)
+        if canonical_row is None or not is_augmentable_row(canonical_row):
             continue
-        rows.append(row)
+        rows.append(canonical_row)
         if args.limit_rows is not None and len(rows) >= args.limit_rows:
             break
     args.output_dir.mkdir(parents=True, exist_ok=True)
