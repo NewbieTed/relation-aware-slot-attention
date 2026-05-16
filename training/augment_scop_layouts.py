@@ -571,13 +571,12 @@ def draw_overlap_sample(rows: list[dict[str, Any]], dataset_dir: Path, output_pa
     width, height = rows[0].get("image_size") or [512, 512]
     scale_x = 512 / float(width)
     scale_y = 512 / float(height)
-    colors = [(0, 180, 255, 80), (255, 60, 120, 80)]
     outlines = [(0, 180, 255, 210), (255, 60, 120, 210)]
     for row in rows:
         for index, annot in enumerate(row["annots"]):
             x, y, w, h = annot["bbox"]
             rect = [x * scale_x, y * scale_y, (x + w) * scale_x, (y + h) * scale_y]
-            draw.rectangle(rect, fill=colors[index], outline=outlines[index], width=2)
+            draw.rectangle(rect, outline=outlines[index], width=2)
     image = Image.alpha_composite(image.convert("RGBA"), overlay)
     draw = ImageDraw.Draw(image, "RGBA")
     rel = rows[0].get("augmented_layout", {}).get("relation", "unknown")
