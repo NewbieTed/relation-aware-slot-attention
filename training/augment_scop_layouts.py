@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 import copy
 import json
 import math
@@ -12,6 +13,7 @@ from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont
 
+from scop_depth.coco_categories import COCO_CATEGORY_ID_TO_NAME
 from scop_depth.prompt_graph import scene_graph_from_scop_depth_row
 
 
@@ -53,6 +55,11 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--size-jitter", type=float, default=0.20)
     parser.add_argument("--min-size", type=float, default=0.08)
     parser.add_argument("--max-size", type=float, default=0.70)
+    parser.add_argument("--empirical-weight", type=float, default=0.50)
+    parser.add_argument("--original-jitter-weight", type=float, default=0.30)
+    parser.add_argument("--synthetic-weight", type=float, default=0.20)
+    parser.add_argument("--empirical-jitter", type=float, default=0.06)
+    parser.add_argument("--original-center-jitter", type=float, default=0.08)
     parser.add_argument("--copy-images", action="store_true")
     parser.add_argument("--num-samples", type=int, default=24)
     return parser
@@ -148,9 +155,100 @@ def original_box_01(row: dict[str, Any], node_index: int) -> tuple[float, float,
     return cx, cy, z_center, sx, sy, sz
 
 
+def category_key(row: dict[str, Any], node_index: int) -> str:
+    annot = row["annots"][node_index]
+    return str(annot.get("category_id", annot.get("category_name", f"node{node_index}")))
+
+
+def category_label(row: dict[str, Any], node_index: int) -> str:
+    annot = row["annots"][node_index]
+    if annot.get("category_name"):
+        return str(annot["category_name"])
+    category_id = annot.get("category_id")
+    return COCO_CATEGORY_ID_TO_NAME.get(int(category_id), f"obj{node_index}") if category_id is not None else f"obj{node_index}"
+
+
+def collect_empirical_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    category_stats: dict[str, dict[str, list[list[float]]]] = defaultdict(lambda: {"centers": [], "sizes": []})
+    relation_stats: dict[str, dict[str, list[list[float]]]] = defaultdict(lambda: {"deltas": []})
+    relation_counts: dict[str, int] = defaultdict(int)
+    category_counts: dict[str, int] = defaultdict(int)
+
+    for row in rows:
+        relation_info = relation_from_row(row)
+        if relation_info is None:
+            continue
+        source_index, target_index, relation = relation_info
+        boxes = [original_box_01(row, 0), original_box_01(row, 1)]
+        for node_index, box in enumerate(boxes):
+            key = category_key(row, node_index)
+            category_stats[key]["centers"].append(list(box[:3]))
+            category_stats[key]["sizes"].append(list(box[3:]))
+            category_counts[key] += 1
+        source_center = boxes[source_index][:3]
+        target_center = boxes[target_index][:3]
+        relation_stats[relation]["deltas"].append([target_center[i] - source_center[i] for i in range(3)])
+        relation_counts[relation] += 1
+
+    return {
+        "category_stats": category_stats,
+        "relation_stats": relation_stats,
+        "category_counts": dict(category_counts),
+        "relation_counts": dict(relation_counts),
+    }
+
+
 def jitter_size(base: float, rng: random.Random, *, jitter: float, min_size: float, max_size: float) -> float:
     factor = math.exp(rng.gauss(0.0, jitter))
     return max(min_size, min(max_size, base * factor))
+
+
+def clamp_center(value: float, *, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def shifted_into_bounds(source: list[float], target: list[float], *, low: float, high: float) -> tuple[list[float], list[float]]:
+    source = list(source)
+    target = list(target)
+    for axis in range(3):
+        min_value = min(source[axis], target[axis])
+        max_value = max(source[axis], target[axis])
+        if min_value < low:
+            shift = low - min_value
+            source[axis] += shift
+            target[axis] += shift
+        if max_value > high:
+            shift = high - max_value
+            source[axis] += shift
+            target[axis] += shift
+        source[axis] = clamp_center(source[axis], low=low, high=high)
+        target[axis] = clamp_center(target[axis], low=low, high=high)
+    return source, target
+
+
+def relation_axis_and_sign(relation: str) -> tuple[int, float]:
+    if relation in {"left_of", "above", "behind"}:
+        return {"left_of": 0, "above": 1, "behind": 2}[relation], 1.0
+    return {"right_of": 0, "below": 1, "in_front_of": 2}[relation], -1.0
+
+
+def enforce_relation_gap(
+    source: list[float],
+    target: list[float],
+    relation: str,
+    rng: random.Random,
+    args: argparse.Namespace,
+    *,
+    preferred_gap: float | None = None,
+) -> tuple[list[float], list[float]]:
+    axis, sign = relation_axis_and_sign(relation)
+    gap = preferred_gap if preferred_gap is not None else rng.uniform(args.min_gap, args.max_gap)
+    gap = max(args.min_gap, min(args.max_gap, abs(gap)))
+    midpoint = (source[axis] + target[axis]) * 0.5
+    midpoint = clamp_center(midpoint, low=args.center_low + gap * 0.5, high=args.center_high - gap * 0.5)
+    source[axis] = midpoint - sign * gap * 0.5
+    target[axis] = midpoint + sign * gap * 0.5
+    return shifted_into_bounds(source, target, low=args.center_low, high=args.center_high)
 
 
 def sample_pair_centers(
@@ -174,6 +272,150 @@ def sample_pair_centers(
     else:
         a[axis], b[axis] = high_value, low_value
     return a, b
+
+
+def sample_vector(values: list[list[float]], fallback: list[float], rng: random.Random) -> list[float]:
+    if not values:
+        return list(fallback)
+    return list(rng.choice(values))
+
+
+def sample_sizes(row: dict[str, Any], stats: dict[str, Any], rng: random.Random, args: argparse.Namespace) -> list[list[float]]:
+    category_stats = stats["category_stats"]
+    sizes: list[list[float]] = []
+    for node_index in range(2):
+        fallback = list(original_box_01(row, node_index)[3:])
+        key = category_key(row, node_index)
+        base = sample_vector(category_stats.get(key, {}).get("sizes", []), fallback, rng)
+        sizes.append(
+            [
+                jitter_size(base[axis], rng, jitter=args.size_jitter, min_size=args.min_size, max_size=args.max_size)
+                for axis in range(3)
+            ]
+        )
+    return sizes
+
+
+def sample_synthetic_layout(
+    row: dict[str, Any],
+    relation: str,
+    rng: random.Random,
+    args: argparse.Namespace,
+    stats: dict[str, Any],
+) -> tuple[list[list[float]], list[list[float]], str]:
+    source_center, target_center = sample_pair_centers(
+        relation,
+        rng,
+        min_gap=args.min_gap,
+        max_gap=args.max_gap,
+        center_low=args.center_low,
+        center_high=args.center_high,
+    )
+    return [source_center, target_center], sample_sizes(row, stats, rng, args), "synthetic"
+
+
+def sample_original_jitter_layout(
+    row: dict[str, Any],
+    source_index: int,
+    target_index: int,
+    relation: str,
+    rng: random.Random,
+    args: argparse.Namespace,
+    stats: dict[str, Any],
+) -> tuple[list[list[float]], list[list[float]], str]:
+    original = [original_box_01(row, 0), original_box_01(row, 1)]
+    centers = [
+        [
+            clamp_center(original[node_index][axis] + rng.gauss(0.0, args.original_center_jitter), low=args.center_low, high=args.center_high)
+            for axis in range(3)
+        ]
+        for node_index in range(2)
+    ]
+    axis, _ = relation_axis_and_sign(relation)
+    original_gap = abs(original[target_index][axis] - original[source_index][axis])
+    preferred_gap = original_gap * math.exp(rng.gauss(0.0, args.empirical_jitter))
+    centers[source_index], centers[target_index] = enforce_relation_gap(
+        centers[source_index],
+        centers[target_index],
+        relation,
+        rng,
+        args,
+        preferred_gap=preferred_gap,
+    )
+    return centers, sample_sizes(row, stats, rng, args), "original_jitter"
+
+
+def sample_empirical_layout(
+    row: dict[str, Any],
+    source_index: int,
+    target_index: int,
+    relation: str,
+    rng: random.Random,
+    args: argparse.Namespace,
+    stats: dict[str, Any],
+) -> tuple[list[list[float]], list[list[float]], str]:
+    category_stats = stats["category_stats"]
+    relation_deltas = stats["relation_stats"].get(relation, {}).get("deltas", [])
+    original = [original_box_01(row, 0), original_box_01(row, 1)]
+    centers = [
+        sample_vector(category_stats.get(category_key(row, node_index), {}).get("centers", []), list(original[node_index][:3]), rng)
+        for node_index in range(2)
+    ]
+    delta = sample_vector(
+        relation_deltas,
+        [original[target_index][axis] - original[source_index][axis] for axis in range(3)],
+        rng,
+    )
+    delta = [value + rng.gauss(0.0, args.empirical_jitter) for value in delta]
+    source_center = centers[source_index]
+    target_center = [source_center[axis] + delta[axis] for axis in range(3)]
+    source_center, target_center = shifted_into_bounds(
+        source_center,
+        target_center,
+        low=args.center_low,
+        high=args.center_high,
+    )
+    axis, sign = relation_axis_and_sign(relation)
+    if sign * (target_center[axis] - source_center[axis]) < args.min_gap:
+        source_center, target_center = enforce_relation_gap(source_center, target_center, relation, rng, args)
+    centers[source_index] = source_center
+    centers[target_index] = target_center
+    return centers, sample_sizes(row, stats, rng, args), "empirical"
+
+
+def choose_layout(
+    row: dict[str, Any],
+    source_index: int,
+    target_index: int,
+    relation: str,
+    rng: random.Random,
+    args: argparse.Namespace,
+    stats: dict[str, Any],
+) -> tuple[list[list[float]], list[list[float]], str]:
+    weights = [
+        ("empirical", max(0.0, args.empirical_weight)),
+        ("original_jitter", max(0.0, args.original_jitter_weight)),
+        ("synthetic", max(0.0, args.synthetic_weight)),
+    ]
+    total = sum(weight for _, weight in weights)
+    draw = rng.uniform(0.0, total if total > 0 else 1.0)
+    running = 0.0
+    mode = "synthetic"
+    for candidate, weight in weights:
+        running += weight
+        if draw <= running:
+            mode = candidate
+            break
+
+    if mode == "empirical":
+        return sample_empirical_layout(row, source_index, target_index, relation, rng, args, stats)
+    if mode == "original_jitter":
+        return sample_original_jitter_layout(row, source_index, target_index, relation, rng, args, stats)
+    centers, sizes, name = sample_synthetic_layout(row, relation, rng, args, stats)
+    ordered_centers = [None, None]
+    ordered_centers[source_index] = centers[0]
+    ordered_centers[target_index] = centers[1]
+    return ordered_centers, sizes, name  # type: ignore[return-value]
 
 
 def center_size_to_bbox(center: list[float], size: list[float], image_size: list[int]) -> tuple[list[float], dict[str, float]]:
@@ -217,7 +459,13 @@ def satisfies_relation(row: dict[str, Any], source_index: int, target_index: int
     return False
 
 
-def augment_row(row: dict[str, Any], rng: random.Random, args: argparse.Namespace, variant_index: int) -> dict[str, Any] | None:
+def augment_row(
+    row: dict[str, Any],
+    rng: random.Random,
+    args: argparse.Namespace,
+    variant_index: int,
+    stats: dict[str, Any],
+) -> dict[str, Any] | None:
     relation_info = relation_from_row(row)
     if relation_info is None:
         return None
@@ -226,25 +474,7 @@ def augment_row(row: dict[str, Any], rng: random.Random, args: argparse.Namespac
     if image_size is None:
         return None
 
-    source_center, target_center = sample_pair_centers(
-        relation,
-        rng,
-        min_gap=args.min_gap,
-        max_gap=args.max_gap,
-        center_low=args.center_low,
-        center_high=args.center_high,
-    )
-    original = [original_box_01(row, 0), original_box_01(row, 1)]
-    sizes = [
-        [
-            jitter_size(original[i][3 + axis], rng, jitter=args.size_jitter, min_size=args.min_size, max_size=args.max_size)
-            for axis in range(3)
-        ]
-        for i in range(2)
-    ]
-    centers = [None, None]
-    centers[source_index] = source_center
-    centers[target_index] = target_center
+    centers, sizes, sample_mode = choose_layout(row, source_index, target_index, relation, rng, args, stats)
 
     new_row = copy.deepcopy(row)
     new_row["augmented_layout"] = {
@@ -254,6 +484,9 @@ def augment_row(row: dict[str, Any], rng: random.Random, args: argparse.Namespac
         "relation": relation,
         "source_index": source_index,
         "target_index": target_index,
+        "sample_mode": sample_mode,
+        "source_category": category_key(row, source_index),
+        "target_category": category_key(row, target_index),
     }
     new_depth = copy.deepcopy(row.get("depth") or {})
     for node_index in range(2):
@@ -303,7 +536,7 @@ def draw_sample(row: dict[str, Any], dataset_dir: Path, output_path: Path) -> No
         x, y, w, h = annot["bbox"]
         rect = [x * scale_x, y * scale_y, (x + w) * scale_x, (y + h) * scale_y]
         draw.rectangle(rect, outline=colors[index], width=4)
-        label = annot.get("category_name", f"obj{index}")
+        label = category_label(row, index)
         depth = row.get("depth", {}).get(f"bbox{index + 1}", {}).get("median", 0.5)
         draw.text((rect[0] + 4, rect[1] + 4), f"{label} z={depth:.2f}", fill=(255, 255, 255, 255), font=font)
     lines = [" / ".join(" ".join(map(str, oro)) for oro in row.get("oros", []))]
@@ -330,6 +563,12 @@ def main() -> int:
         rows.append(canonical_row)
         if args.limit_rows is not None and len(rows) >= args.limit_rows:
             break
+    stats_rows = []
+    for row in all_rows:
+        canonical_row = canonicalize_row(row)
+        if canonical_row is not None and is_augmentable_row(canonical_row):
+            stats_rows.append(canonical_row)
+    stats = collect_empirical_stats(stats_rows)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     augmented_rows: list[dict[str, Any]] = []
@@ -337,7 +576,7 @@ def main() -> int:
     for row_index, row in enumerate(rows):
         link_or_copy_image(args.input_dir, args.output_dir, row["file_name"], copy_images=args.copy_images)
         for variant_index in range(args.variants_per_row):
-            new_row = augment_row(row, rng, args, variant_index)
+            new_row = augment_row(row, rng, args, variant_index, stats)
             if new_row is None:
                 failures.append({"row_index": row_index, "seq": row.get("seq")})
                 continue
@@ -368,8 +607,16 @@ def main() -> int:
         "output_dir": str(args.output_dir),
         "source_rows_total": len(all_rows),
         "usable_input_rows": len(rows),
+        "stats_rows": len(stats_rows),
         "variants_per_row": args.variants_per_row,
         "augmented_rows": len(augmented_rows),
+        "sampling_weights": {
+            "empirical": args.empirical_weight,
+            "original_jitter": args.original_jitter_weight,
+            "synthetic": args.synthetic_weight,
+        },
+        "relation_counts": stats["relation_counts"],
+        "category_count": len(stats["category_counts"]),
         "failed_generation_attempts": len(failures),
         "checked_rows": checked,
         "failed_checks": failed_checks[:100],

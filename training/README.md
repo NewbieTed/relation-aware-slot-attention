@@ -28,8 +28,11 @@ still lazily encode and append any unseen labels if the cache is incomplete.
 diversity experiments. It reuses the original cropped images by symlinking them
 into a new dataset folder, writes new relation-preserving 3D box/depth values
 to `metadata.jsonl`, saves an `augmentation_report.json`, and renders sampled
-box overlays under `samples/`. The report includes relation checks, so a build
-fails loudly if any sampled layout violates the requested relation.
+box overlays under `samples/`. The sampler mixes category-level empirical
+size/position priors, relation-level empirical offsets, jitter around the
+original row, and broad synthetic relation-valid layouts. The report includes
+relation checks, so a build fails loudly if any sampled layout violates the
+requested relation.
 
 Example graph pretraining:
 
