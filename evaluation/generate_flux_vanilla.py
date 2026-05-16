@@ -127,11 +127,12 @@ def main() -> int:
 
     records: list[dict[str, object]] = []
     sample_index = 0
+    execution_device = torch.device(getattr(pipeline, "_execution_device", device))
     for prompt_index, prompt in enumerate(tqdm(prompts, desc="VanillaFluxGeneration")):
         prompt_name = _safe_prompt_for_filename(prompt)
         for repeat_index in range(args.samples_per_prompt):
             seed = args.seed + prompt_index * args.samples_per_prompt + repeat_index
-            generator = torch.Generator(device=device).manual_seed(seed) if device != "mps" else None
+            generator = torch.Generator(device=execution_device).manual_seed(seed) if device != "mps" else None
             image = pipeline(
                 prompt=prompt,
                 height=args.image_size,
