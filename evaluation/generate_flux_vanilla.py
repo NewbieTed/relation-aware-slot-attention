@@ -94,11 +94,16 @@ def _load_pipeline(args: argparse.Namespace, device: str, dtype: torch.dtype) ->
 
     pipeline.set_progress_bar_config(disable=True)
     if args.low_vram and device == "cuda":
-        # Vanilla FLUX has no GNN/OSCR overhead, but the full text encoders,
-        # transformer, and VAE can still exceed a 24GB GPU at 512px. Sequential
-        # offload is slower than model-level offload but is the safest smoke
-        # path when multiple benchmarks are sharing the machine.
-        pipeline.enable_sequential_cpu_offload()
+        if quantization_config is not None:
+            # Match the relation-aware loader: keep the large frozen text
+            # encoders on CPU, while the quantized transformer and VAE stay on
+            # CUDA. This avoids bitsandbytes/offload hook interactions that can
+            # still OOM or move tensors to the wrong device.
+            pipeline.text_encoder.to("cpu")
+            pipeline.text_encoder_2.to("cpu")
+            pipeline.vae.to(device=device, dtype=dtype)
+        else:
+            pipeline.enable_sequential_cpu_offload()
     elif quantization_config is None:
         pipeline.to(device)
     else:
