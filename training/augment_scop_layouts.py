@@ -62,6 +62,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--original-center-jitter", type=float, default=0.08)
     parser.add_argument("--copy-images", action="store_true")
     parser.add_argument("--num-samples", type=int, default=24)
+    parser.add_argument("--progress-every", type=int, default=1000)
     return parser
 
 
@@ -512,6 +513,15 @@ def is_augmentable_row(row: dict[str, Any]) -> bool:
     )
 
 
+def maybe_print_progress(message: str, current: int, total: int | None, every: int) -> None:
+    if every <= 0:
+        return
+    if current != 1 and current % every != 0 and (total is None or current != total):
+        return
+    suffix = f"/{total}" if total is not None else ""
+    print(f"{message}: {current}{suffix}", flush=True)
+
+
 def link_or_copy_image(input_dir: Path, output_dir: Path, file_name: str, *, copy_images: bool) -> None:
     source = input_dir / file_name
     target = output_dir / file_name
@@ -556,18 +566,21 @@ def main() -> int:
     rng = random.Random(args.seed)
     all_rows = load_rows(args.input_dir / "metadata.jsonl")
     rows: list[dict[str, Any]] = []
-    for row in all_rows:
+    for raw_index, row in enumerate(all_rows, start=1):
         canonical_row = canonicalize_row(row)
         if canonical_row is None or not is_augmentable_row(canonical_row):
+            maybe_print_progress("Selecting usable rows", raw_index, len(all_rows), args.progress_every)
             continue
         rows.append(canonical_row)
+        maybe_print_progress("Selecting usable rows", raw_index, len(all_rows), args.progress_every)
         if args.limit_rows is not None and len(rows) >= args.limit_rows:
             break
     stats_rows = []
-    for row in all_rows:
+    for raw_index, row in enumerate(all_rows, start=1):
         canonical_row = canonicalize_row(row)
         if canonical_row is not None and is_augmentable_row(canonical_row):
             stats_rows.append(canonical_row)
+        maybe_print_progress("Collecting stats rows", raw_index, len(all_rows), args.progress_every)
     stats = collect_empirical_stats(stats_rows)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -581,6 +594,7 @@ def main() -> int:
                 failures.append({"row_index": row_index, "seq": row.get("seq")})
                 continue
             augmented_rows.append(new_row)
+        maybe_print_progress("Augmenting usable rows", row_index + 1, len(rows), args.progress_every)
 
     if not augmented_rows:
         raise RuntimeError("No augmented rows were created")
@@ -597,6 +611,7 @@ def main() -> int:
         if not satisfies_relation(row, source_index, target_index, relation, args.min_gap * 0.8):
             failed_checks.append({"row_index": row_index, "reason": "relation_violation"})
         checked += 1
+        maybe_print_progress("Checking augmented rows", row_index + 1, len(augmented_rows), args.progress_every)
 
     sample_dir = args.output_dir / "samples"
     for sample_index, row in enumerate(rng.sample(augmented_rows, min(args.num_samples, len(augmented_rows)))):
