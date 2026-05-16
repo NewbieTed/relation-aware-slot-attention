@@ -53,6 +53,9 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--center-low", type=float, default=0.12)
     parser.add_argument("--center-high", type=float, default=0.88)
     parser.add_argument("--size-jitter", type=float, default=0.20)
+    parser.add_argument("--aspect-jitter", type=float, default=0.08)
+    parser.add_argument("--max-aspect-ratio-change", type=float, default=1.35)
+    parser.add_argument("--max-sample-attempts", type=int, default=50)
     parser.add_argument("--min-size", type=float, default=0.08)
     parser.add_argument("--max-size", type=float, default=0.70)
     parser.add_argument("--empirical-weight", type=float, default=0.50)
@@ -204,6 +207,23 @@ def jitter_size(base: float, rng: random.Random, *, jitter: float, min_size: flo
     return max(min_size, min(max_size, base * factor))
 
 
+def jitter_size_with_aspect(
+    base: list[float],
+    rng: random.Random,
+    args: argparse.Namespace,
+) -> list[float]:
+    base_w = max(args.min_size, min(args.max_size, base[0]))
+    base_h = max(args.min_size, min(args.max_size, base[1]))
+    base_z = max(args.min_size, min(args.max_size, base[2]))
+    scale_xy = math.exp(rng.gauss(0.0, args.size_jitter))
+    aspect_delta = math.exp(rng.gauss(0.0, args.aspect_jitter))
+    aspect_delta = max(1.0 / args.max_aspect_ratio_change, min(args.max_aspect_ratio_change, aspect_delta))
+    width = max(args.min_size, min(args.max_size, base_w * scale_xy * math.sqrt(aspect_delta)))
+    height = max(args.min_size, min(args.max_size, base_h * scale_xy / math.sqrt(aspect_delta)))
+    depth = max(args.min_size, min(args.max_size, base_z * math.exp(rng.gauss(0.0, args.size_jitter))))
+    return [width, height, depth]
+
+
 def clamp_center(value: float, *, low: float, high: float) -> float:
     return max(low, min(high, value))
 
@@ -288,12 +308,13 @@ def sample_sizes(row: dict[str, Any], stats: dict[str, Any], rng: random.Random,
         fallback = list(original_box_01(row, node_index)[3:])
         key = category_key(row, node_index)
         base = sample_vector(category_stats.get(key, {}).get("sizes", []), fallback, rng)
-        sizes.append(
-            [
-                jitter_size(base[axis], rng, jitter=args.size_jitter, min_size=args.min_size, max_size=args.max_size)
-                for axis in range(3)
-            ]
-        )
+        original_aspect = max(fallback[0], args.min_size) / max(fallback[1], args.min_size)
+        sampled_aspect = max(base[0], args.min_size) / max(base[1], args.min_size)
+        if sampled_aspect / original_aspect > args.max_aspect_ratio_change:
+            base[1] = max(args.min_size, base[0] / (original_aspect * args.max_aspect_ratio_change))
+        elif original_aspect / sampled_aspect > args.max_aspect_ratio_change:
+            base[0] = max(args.min_size, base[1] * original_aspect / args.max_aspect_ratio_change)
+        sizes.append(jitter_size_with_aspect(base, rng, args))
     return sizes
 
 
@@ -441,6 +462,25 @@ def center_size_to_bbox(center: list[float], size: list[float], image_size: list
     return [x, y, w, h], depth
 
 
+def bbox_inside_image(bbox: list[float], image_size: list[int]) -> bool:
+    width, height = image_size
+    x, y, w, h = bbox
+    return x >= 0.0 and y >= 0.0 and w > 0.0 and h > 0.0 and x + w <= width and y + h <= height
+
+
+def aspect_ratio_valid(original_row: dict[str, Any], new_row: dict[str, Any], args: argparse.Namespace) -> bool:
+    for node_index in range(2):
+        _, _, old_w, old_h = [float(v) for v in original_row["annots"][node_index]["bbox"]]
+        _, _, new_w, new_h = [float(v) for v in new_row["annots"][node_index]["bbox"]]
+        old_ratio = max(old_h, 1e-6) / max(old_w, 1e-6)
+        new_ratio = max(new_h, 1e-6) / max(new_w, 1e-6)
+        if new_ratio / old_ratio > args.max_aspect_ratio_change:
+            return False
+        if old_ratio / new_ratio > args.max_aspect_ratio_change:
+            return False
+    return True
+
+
 def satisfies_relation(row: dict[str, Any], source_index: int, target_index: int, relation: str, margin: float) -> bool:
     source = original_box_01(row, source_index)
     target = original_box_01(row, target_index)
@@ -475,32 +515,43 @@ def augment_row(
     if image_size is None:
         return None
 
-    centers, sizes, sample_mode = choose_layout(row, source_index, target_index, relation, rng, args, stats)
+    for attempt_index in range(args.max_sample_attempts):
+        centers, sizes, sample_mode = choose_layout(row, source_index, target_index, relation, rng, args, stats)
 
-    new_row = copy.deepcopy(row)
-    new_row["augmented_layout"] = {
-        "source_dataset": str(args.input_dir),
-        "source_seq": row.get("seq"),
-        "variant_index": variant_index,
-        "relation": relation,
-        "source_index": source_index,
-        "target_index": target_index,
-        "sample_mode": sample_mode,
-        "source_category": category_key(row, source_index),
-        "target_category": category_key(row, target_index),
-    }
-    new_depth = copy.deepcopy(row.get("depth") or {})
-    for node_index in range(2):
-        bbox, depth_stats = center_size_to_bbox(centers[node_index], sizes[node_index], image_size)
-        new_row["annots"][node_index]["bbox"] = bbox
-        new_depth[f"bbox{node_index + 1}"] = {
-            **new_depth.get(f"bbox{node_index + 1}", {}),
-            **depth_stats,
+        new_row = copy.deepcopy(row)
+        new_row["augmented_layout"] = {
+            "source_dataset": str(args.input_dir),
+            "source_seq": row.get("seq"),
+            "variant_index": variant_index,
+            "relation": relation,
+            "source_index": source_index,
+            "target_index": target_index,
+            "sample_mode": sample_mode,
+            "sample_attempt": attempt_index + 1,
+            "source_category": category_key(row, source_index),
+            "target_category": category_key(row, target_index),
         }
-    new_row["depth"] = new_depth
-    if not satisfies_relation(new_row, source_index, target_index, relation, args.min_gap * 0.8):
-        return None
-    return new_row
+        new_depth = copy.deepcopy(row.get("depth") or {})
+        boxes_fit = True
+        for node_index in range(2):
+            bbox, depth_stats = center_size_to_bbox(centers[node_index], sizes[node_index], image_size)
+            if not bbox_inside_image(bbox, image_size):
+                boxes_fit = False
+                break
+            new_row["annots"][node_index]["bbox"] = bbox
+            new_depth[f"bbox{node_index + 1}"] = {
+                **new_depth.get(f"bbox{node_index + 1}", {}),
+                **depth_stats,
+            }
+        if not boxes_fit:
+            continue
+        new_row["depth"] = new_depth
+        if not aspect_ratio_valid(row, new_row, args):
+            continue
+        if not satisfies_relation(new_row, source_index, target_index, relation, args.min_gap * 0.8):
+            continue
+        return new_row
+    return None
 
 
 def is_augmentable_row(row: dict[str, Any]) -> bool:
