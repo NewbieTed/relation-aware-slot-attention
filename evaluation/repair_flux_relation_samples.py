@@ -20,7 +20,6 @@ from evaluation.generate_flux_relation_t2i import (
     _load_graph_encoder,
     _load_pipeline,
     _predict_condition,
-    _resolve_graph_path,
 )
 from training.config import _load_raw_config, _section_config
 from training.flux_inference_runtime import pipeline_execution_device, text_encoder_device
@@ -43,6 +42,20 @@ def _namespace_from_config(config_path: Path) -> argparse.Namespace:
 
 def _load_records(samples_jsonl: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in samples_jsonl.read_text().splitlines() if line.strip()]
+
+
+def _resolve_graph_path(args: argparse.Namespace) -> Path:
+    graph_encoder_path = getattr(args, "graph_encoder_path", None)
+    checkpoint_dir = getattr(args, "checkpoint_dir", None)
+    if graph_encoder_path is not None:
+        path = Path(graph_encoder_path)
+    elif checkpoint_dir is not None:
+        path = Path(checkpoint_dir) / "graph_encoder.pt"
+    else:
+        raise ValueError("Config must provide graph_encoder_path or checkpoint_dir.")
+    if not path.exists():
+        raise FileNotFoundError(f"Missing graph encoder checkpoint: {path}")
+    return path
 
 
 @torch.no_grad()
@@ -78,12 +91,13 @@ def main() -> int:
 
     pipeline, _quantization_config = _load_pipeline(gen_args, device=device, dtype=dtype)
     graph_path = _resolve_graph_path(gen_args)
-    graph_encoder, text_encoder_type, _text_hidden_dim = _load_graph_encoder(path=graph_path, device=device)
-    graph_tokenizer, graph_text_encoder = load_graph_label_encoder(
+    graph_device = "cpu" if gen_args.low_vram else device
+    graph_encoder, text_encoder_type, _text_hidden_dim = _load_graph_encoder(path=graph_path, device=graph_device)
+    graph_tokenizer, graph_text_encoder, _encoder_hidden_dim = load_graph_label_encoder(
         gen_args.model_id,
         text_encoder_type=text_encoder_type,
-        device=device,
-        dtype=torch.float32,
+        device=graph_device,
+        torch_dtype=dtype,
     )
 
     condition_cache: dict[int, tuple[Any, Any, str, Any, Any]] = {}
