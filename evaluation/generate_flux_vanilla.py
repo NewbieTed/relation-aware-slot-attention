@@ -12,6 +12,7 @@ import torch
 from tqdm.auto import tqdm
 
 from training.config import parse_args_with_config
+from training.flux_inference_runtime import set_pipeline_execution_device
 from training.runtime import DEFAULT_FLUX_MODEL_ID, choose_weight_dtype, resolve_torch_device, set_seed
 
 
@@ -102,6 +103,7 @@ def _load_pipeline(args: argparse.Namespace, device: str, dtype: torch.dtype) ->
             pipeline.text_encoder.to("cpu")
             pipeline.text_encoder_2.to("cpu")
             pipeline.vae.to(device=device, dtype=dtype)
+            set_pipeline_execution_device(pipeline, device)
         else:
             pipeline.enable_sequential_cpu_offload()
     elif quantization_config is None:
