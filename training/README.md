@@ -48,6 +48,7 @@ python3 -m training.augment_scop_layouts \
   --input-dir /local1/cse_481_m_l/relation-aware-slot-attention/data/scop_depth_crops_depth \
   --output-dir /local1/cse_481_m_l/relation-aware-slot-attention/data/scop_depth_crops_depth_aug_rel4 \
   --variants-per-row 4 \
+  --limit-rows 100 \
   --num-samples 48 \
   --seed 42
 ```

@@ -41,6 +41,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--variants-per-row", type=int, default=4)
+    parser.add_argument("--limit-rows", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--min-gap", type=float, default=0.18)
     parser.add_argument("--max-gap", type=float, default=0.70)
@@ -268,6 +269,8 @@ def main() -> int:
     args = make_parser().parse_args()
     rng = random.Random(args.seed)
     rows = load_rows(args.input_dir / "metadata.jsonl")
+    if args.limit_rows is not None:
+        rows = rows[: args.limit_rows]
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     augmented_rows: list[dict[str, Any]] = []
