@@ -561,6 +561,34 @@ def draw_sample(row: dict[str, Any], dataset_dir: Path, output_path: Path) -> No
     image.save(output_path)
 
 
+def draw_overlap_sample(rows: list[dict[str, Any]], dataset_dir: Path, output_path: Path) -> None:
+    if not rows:
+        return
+    image = Image.open(dataset_dir / rows[0]["file_name"]).convert("RGB").resize((512, 512), Image.Resampling.BICUBIC)
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay, "RGBA")
+    font = ImageFont.load_default()
+    width, height = rows[0].get("image_size") or [512, 512]
+    scale_x = 512 / float(width)
+    scale_y = 512 / float(height)
+    colors = [(0, 180, 255, 80), (255, 60, 120, 80)]
+    outlines = [(0, 180, 255, 210), (255, 60, 120, 210)]
+    for row in rows:
+        for index, annot in enumerate(row["annots"]):
+            x, y, w, h = annot["bbox"]
+            rect = [x * scale_x, y * scale_y, (x + w) * scale_x, (y + h) * scale_y]
+            draw.rectangle(rect, fill=colors[index], outline=outlines[index], width=2)
+    image = Image.alpha_composite(image.convert("RGBA"), overlay)
+    draw = ImageDraw.Draw(image, "RGBA")
+    rel = rows[0].get("augmented_layout", {}).get("relation", "unknown")
+    text = f"{rows[0].get('file_name')}\n{len(rows)} proposed boxes overlaid\nrelation={rel}"
+    box = draw.multiline_textbbox((0, 0), text, font=font)
+    draw.rectangle([0, 0, box[2] + 12, box[3] + 12], fill=(0, 0, 0, 180))
+    draw.multiline_text((6, 6), text, fill=(255, 255, 255, 255), font=font)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    image.convert("RGB").save(output_path)
+
+
 def main() -> int:
     args = make_parser().parse_args()
     rng = random.Random(args.seed)
@@ -616,6 +644,14 @@ def main() -> int:
     sample_dir = args.output_dir / "samples"
     for sample_index, row in enumerate(rng.sample(augmented_rows, min(args.num_samples, len(augmented_rows)))):
         draw_sample(row, args.output_dir, sample_dir / f"sample_{sample_index:03d}.jpg")
+
+    rows_by_file: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in augmented_rows:
+        rows_by_file[row["file_name"]].append(row)
+    overlap_dir = args.output_dir / "samples_overlap"
+    overlap_items = list(rows_by_file.items())
+    for sample_index, (_, rows_for_file) in enumerate(rng.sample(overlap_items, min(args.num_samples, len(overlap_items)))):
+        draw_overlap_sample(rows_for_file, args.output_dir, overlap_dir / f"overlap_{sample_index:03d}.jpg")
 
     report = {
         "input_dir": str(args.input_dir),
