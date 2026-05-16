@@ -24,6 +24,13 @@ Before training, `training.precompute_graph_label_cache` can fill the
 T5/CLIP object-label embeddings out of the hot training loop; training will
 still lazily encode and append any unseen labels if the cache is incomplete.
 
+`training.augment_scop_layouts` creates a derived SCOP-Depth dataset for layout
+diversity experiments. It reuses the original cropped images by symlinking them
+into a new dataset folder, writes new relation-preserving 3D box/depth values
+to `metadata.jsonl`, saves an `augmentation_report.json`, and renders sampled
+box overlays under `samples/`. The report includes relation checks, so a build
+fails loudly if any sampled layout violates the requested relation.
+
 Example graph pretraining:
 
 ```bash
@@ -32,4 +39,15 @@ python3 -m training.precompute_graph_label_cache \
 
 python3 -m training.pretrain_graph_encoder \
   --config configs/flux/gnn_pretrain_3dbox_triple_cvae_3dsln.yaml
+```
+
+Example augmented-layout dataset build:
+
+```bash
+python3 -m training.augment_scop_layouts \
+  --input-dir /local1/cse_481_m_l/relation-aware-slot-attention/data/scop_depth_crops_depth \
+  --output-dir /local1/cse_481_m_l/relation-aware-slot-attention/data/scop_depth_crops_depth_aug_rel4 \
+  --variants-per-row 4 \
+  --num-samples 48 \
+  --seed 42
 ```
