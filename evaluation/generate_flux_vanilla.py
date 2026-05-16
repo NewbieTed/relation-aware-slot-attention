@@ -115,6 +115,15 @@ def _load_pipeline(args: argparse.Namespace, device: str, dtype: torch.dtype) ->
     return pipeline
 
 
+def _module_device(module: torch.nn.Module | None) -> torch.device | None:
+    if module is None:
+        return None
+    try:
+        return next(module.parameters()).device
+    except StopIteration:
+        return None
+
+
 def main() -> int:
     args = parse_args_with_config(make_parser(), section="generate")
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -130,18 +139,34 @@ def main() -> int:
     records: list[dict[str, object]] = []
     sample_index = 0
     execution_device = torch.device(getattr(pipeline, "_execution_device", device))
+    text_device = _module_device(getattr(pipeline, "text_encoder", None))
+    preencode_on_text_device = text_device is not None and text_device != execution_device
     for prompt_index, prompt in enumerate(tqdm(prompts, desc="VanillaFluxGeneration")):
         prompt_name = _safe_prompt_for_filename(prompt)
+        prompt_embeds = None
+        pooled_prompt_embeds = None
+        if preencode_on_text_device:
+            prompt_embeds, pooled_prompt_embeds, _ = pipeline.encode_prompt(
+                prompt=prompt,
+                prompt_2=prompt,
+                device=text_device,
+                num_images_per_prompt=1,
+                max_sequence_length=args.max_sequence_length,
+            )
+            prompt_embeds = prompt_embeds.to(device=execution_device, dtype=dtype)
+            pooled_prompt_embeds = pooled_prompt_embeds.to(device=execution_device, dtype=dtype)
         for repeat_index in range(args.samples_per_prompt):
             seed = args.seed + prompt_index * args.samples_per_prompt + repeat_index
             generator = torch.Generator(device=execution_device).manual_seed(seed) if device != "mps" else None
             image = pipeline(
-                prompt=prompt,
+                prompt=None if preencode_on_text_device else prompt,
                 height=args.image_size,
                 width=args.image_size,
                 num_inference_steps=args.num_inference_steps,
                 guidance_scale=args.guidance_scale,
                 generator=generator,
+                prompt_embeds=prompt_embeds,
+                pooled_prompt_embeds=pooled_prompt_embeds,
                 max_sequence_length=args.max_sequence_length,
             ).images[0]
             filename = f"{prompt_name}_{sample_index:06d}.png"
