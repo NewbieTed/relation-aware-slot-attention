@@ -226,6 +226,10 @@ def augment_row(row: dict[str, Any], rng: random.Random, args: argparse.Namespac
     return new_row
 
 
+def is_augmentable_row(row: dict[str, Any]) -> bool:
+    return relation_from_row(row) is not None and row.get("image_size") is not None and len(row.get("annots", [])) >= 2
+
+
 def link_or_copy_image(input_dir: Path, output_dir: Path, file_name: str, *, copy_images: bool) -> None:
     source = input_dir / file_name
     target = output_dir / file_name
@@ -268,9 +272,14 @@ def draw_sample(row: dict[str, Any], dataset_dir: Path, output_path: Path) -> No
 def main() -> int:
     args = make_parser().parse_args()
     rng = random.Random(args.seed)
-    rows = load_rows(args.input_dir / "metadata.jsonl")
-    if args.limit_rows is not None:
-        rows = rows[: args.limit_rows]
+    all_rows = load_rows(args.input_dir / "metadata.jsonl")
+    rows: list[dict[str, Any]] = []
+    for row in all_rows:
+        if not is_augmentable_row(row):
+            continue
+        rows.append(row)
+        if args.limit_rows is not None and len(rows) >= args.limit_rows:
+            break
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     augmented_rows: list[dict[str, Any]] = []
@@ -307,7 +316,8 @@ def main() -> int:
     report = {
         "input_dir": str(args.input_dir),
         "output_dir": str(args.output_dir),
-        "input_rows": len(rows),
+        "source_rows_total": len(all_rows),
+        "usable_input_rows": len(rows),
         "variants_per_row": args.variants_per_row,
         "augmented_rows": len(augmented_rows),
         "failed_generation_attempts": len(failures),
