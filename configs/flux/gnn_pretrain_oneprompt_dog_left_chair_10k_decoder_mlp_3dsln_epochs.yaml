@@ -32,10 +32,10 @@ data:
 
 training:
   graph_learning_rate: 1.0e-4
-  max_train_steps: 8000
-  save_every: 1000
+  max_train_steps: 1000
+  save_every: 250
   log_every: 25
-  eval_every: 500
+  eval_every: 250
 
 losses:
   position_loss_weight: 0.0
