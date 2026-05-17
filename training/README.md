@@ -60,3 +60,13 @@ For graph pretraining on a large augmented dataset, the trainer uses metadata
 only and skips image loading. This keeps the symlinked crops available for
 visual inspection without spending training time decoding images that the GNN
 does not consume.
+
+For one-prompt distribution tests, set `prompt_filter` in the config. The filter
+matches the exact prompt produced by `prompt_prefix` plus the SCOP relation, so
+all train/eval/test rows share the same text graph while retaining different
+augmented target boxes.
+
+`training.augment_scop_layouts` can also build a one-prompt augmented dataset by
+combining `--prompt-filter` with `--target-augmented-rows`. In this mode it
+samples matching source rows with replacement until the requested number of
+valid bbox pairs has been written.

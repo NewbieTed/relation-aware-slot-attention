@@ -15,6 +15,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from scop_depth.coco_categories import COCO_CATEGORY_ID_TO_NAME
 from scop_depth.prompt_graph import scene_graph_from_scop_depth_row
+from training.prompts import prompt_from_scop_depth_row
 
 
 RELATION_ALIASES = {
@@ -46,7 +47,9 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--variants-per-row", type=int, default=4)
+    parser.add_argument("--target-augmented-rows", type=int, default=None)
     parser.add_argument("--limit-rows", type=int, default=None)
+    parser.add_argument("--prompt-filter", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--min-gap", type=float, default=0.18)
     parser.add_argument("--max-gap", type=float, default=0.70)
@@ -65,6 +68,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--original-center-jitter", type=float, default=0.08)
     parser.add_argument("--copy-images", action="store_true")
     parser.add_argument("--num-samples", type=int, default=24)
+    parser.add_argument("--max-overlap-boxes", type=int, default=200)
     parser.add_argument("--progress-every", type=int, default=1000)
     return parser
 
@@ -573,6 +577,14 @@ def maybe_print_progress(message: str, current: int, total: int | None, every: i
     print(f"{message}: {current}{suffix}", flush=True)
 
 
+def prompt_matches(row: dict[str, Any], *, prompt_filter: str | None) -> bool:
+    if not prompt_filter:
+        return True
+    expected = " ".join(prompt_filter.split()).lower()
+    actual = " ".join(prompt_from_scop_depth_row(row).split()).lower()
+    return actual == expected
+
+
 def link_or_copy_image(input_dir: Path, output_dir: Path, file_name: str, *, copy_images: bool) -> None:
     source = input_dir / file_name
     target = output_dir / file_name
@@ -612,9 +624,12 @@ def draw_sample(row: dict[str, Any], dataset_dir: Path, output_path: Path) -> No
     image.save(output_path)
 
 
-def draw_overlap_sample(rows: list[dict[str, Any]], dataset_dir: Path, output_path: Path) -> None:
+def draw_overlap_sample(rows: list[dict[str, Any]], dataset_dir: Path, output_path: Path, *, max_boxes: int) -> None:
     if not rows:
         return
+    if max_boxes > 0 and len(rows) > max_boxes:
+        step = max(1, len(rows) // max_boxes)
+        rows = rows[::step][:max_boxes]
     image = Image.open(dataset_dir / rows[0]["file_name"]).convert("RGB").resize((512, 512), Image.Resampling.BICUBIC)
     overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay, "RGBA")
@@ -646,7 +661,7 @@ def main() -> int:
     rows: list[dict[str, Any]] = []
     for raw_index, row in enumerate(all_rows, start=1):
         canonical_row = canonicalize_row(row)
-        if canonical_row is None or not is_augmentable_row(canonical_row):
+        if canonical_row is None or not is_augmentable_row(canonical_row) or not prompt_matches(canonical_row, prompt_filter=args.prompt_filter):
             maybe_print_progress("Selecting usable rows", raw_index, len(all_rows), args.progress_every)
             continue
         rows.append(canonical_row)
@@ -664,18 +679,39 @@ def main() -> int:
 
     augmented_rows: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
-    for row_index, row in enumerate(rows):
-        link_or_copy_image(args.input_dir, args.output_dir, row["file_name"], copy_images=args.copy_images)
-        for variant_index in range(args.variants_per_row):
-            new_row = augment_row(row, rng, args, variant_index, stats)
+    if args.target_augmented_rows is not None:
+        attempts = 0
+        max_attempts = max(args.target_augmented_rows * 20, args.target_augmented_rows + 1000)
+        while len(augmented_rows) < args.target_augmented_rows and attempts < max_attempts:
+            attempts += 1
+            row_index = rng.randrange(len(rows))
+            row = rows[row_index]
+            link_or_copy_image(args.input_dir, args.output_dir, row["file_name"], copy_images=args.copy_images)
+            new_row = augment_row(row, rng, args, len(augmented_rows), stats)
             if new_row is None:
                 failures.append({"row_index": row_index, "seq": row.get("seq")})
                 continue
             augmented_rows.append(new_row)
-        maybe_print_progress("Augmenting usable rows", row_index + 1, len(rows), args.progress_every)
+            maybe_print_progress("Augmenting target rows", len(augmented_rows), args.target_augmented_rows, args.progress_every)
+    else:
+        for row_index, row in enumerate(rows):
+            link_or_copy_image(args.input_dir, args.output_dir, row["file_name"], copy_images=args.copy_images)
+            for variant_index in range(args.variants_per_row):
+                new_row = augment_row(row, rng, args, variant_index, stats)
+                if new_row is None:
+                    failures.append({"row_index": row_index, "seq": row.get("seq")})
+                    continue
+                augmented_rows.append(new_row)
+            maybe_print_progress("Augmenting usable rows", row_index + 1, len(rows), args.progress_every)
 
     if not augmented_rows:
         raise RuntimeError("No augmented rows were created")
+    if args.target_augmented_rows is not None and len(augmented_rows) < args.target_augmented_rows:
+        raise RuntimeError(
+            "Could not create the requested number of augmented rows: "
+            f"created={len(augmented_rows)}, target={args.target_augmented_rows}, "
+            f"failures={len(failures)}"
+        )
     dump_rows(args.output_dir / "metadata.jsonl", augmented_rows)
 
     checked = 0
@@ -701,7 +737,12 @@ def main() -> int:
     overlap_dir = args.output_dir / "samples_overlap"
     overlap_items = list(rows_by_file.items())
     for sample_index, (_, rows_for_file) in enumerate(rng.sample(overlap_items, min(args.num_samples, len(overlap_items)))):
-        draw_overlap_sample(rows_for_file, args.output_dir, overlap_dir / f"overlap_{sample_index:03d}.jpg")
+        draw_overlap_sample(
+            rows_for_file,
+            args.output_dir,
+            overlap_dir / f"overlap_{sample_index:03d}.jpg",
+            max_boxes=args.max_overlap_boxes,
+        )
 
     report = {
         "input_dir": str(args.input_dir),
@@ -710,6 +751,8 @@ def main() -> int:
         "usable_input_rows": len(rows),
         "stats_rows": len(stats_rows),
         "variants_per_row": args.variants_per_row,
+        "target_augmented_rows": args.target_augmented_rows,
+        "prompt_filter": args.prompt_filter,
         "augmented_rows": len(augmented_rows),
         "sampling_weights": {
             "empirical": args.empirical_weight,

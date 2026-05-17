@@ -178,9 +178,18 @@ def build_dataset_splits(
     eval_fraction: float = 0.1,
     test_fraction: float = 0.1,
     load_images: bool = True,
+    prompt_filter: str | None = None,
 ) -> dict[str, SCOPDepthTextToImageDataset]:
     dataset_path = Path(dataset_dir)
     rows = load_metadata_rows(dataset_path)
+    if prompt_filter:
+        normalized_filter = " ".join(prompt_filter.split()).lower()
+        rows = [
+            row
+            for row in rows
+            if " ".join(prompt_from_scop_depth_row(row, prefix=prompt_prefix).split()).lower()
+            == normalized_filter
+        ]
     rng = random.Random(seed)
     rng.shuffle(rows)
     if limit_rows is not None:

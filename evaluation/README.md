@@ -9,6 +9,8 @@ architecture:
   samples with GNN-predicted OSCR conditions and the released SeeThrough3D LoRA.
 - `evaluation.debug_gnn_prompt`: print detailed GNN/CVAE message-passing and
   layout-head traces for a prompt.
+- `evaluation.debug_layout_spread`: print compact per-object center/size spread
+  summaries across many stochastic layout samples.
 - `evaluation.visualize_gnn_layout`: visualize predicted GNN centers and box regions.
 - `evaluation.t2i_compbench`: score an existing generated samples directory with
   a prepared T2I-CompBench checkout.

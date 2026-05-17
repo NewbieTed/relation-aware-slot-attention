@@ -63,6 +63,7 @@ def _save_state(output_dir: Path, *, step: int, args: argparse.Namespace) -> Non
         "decoder_box_residual": args.decoder_box_residual,
         "decoder_box_residual_scale": args.decoder_box_residual_scale,
         "label_embedding_cache": str(args.label_embedding_cache) if args.label_embedding_cache else None,
+        "prompt_filter": args.prompt_filter,
         "cvae_kl_weight": args.cvae_kl_weight,
         "cvae_kl_warmup_steps": args.cvae_kl_warmup_steps,
     }
@@ -198,6 +199,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-every", type=int, default=250)
     parser.add_argument("--limit-rows", type=int, default=None)
     parser.add_argument("--prompt-prefix", type=str, default="a photo of")
+    parser.add_argument("--prompt-filter", type=str, default=None)
     parser.add_argument("--eval-fraction", type=float, default=0.1)
     parser.add_argument("--test-fraction", type=float, default=0.1)
     parser.add_argument("--position-loss-weight", type=float, default=1.0)
@@ -415,6 +417,7 @@ def main() -> int:
         eval_fraction=args.eval_fraction,
         test_fraction=args.test_fraction,
         load_images=False,
+        prompt_filter=args.prompt_filter,
     )
     if accelerator.is_main_process:
         write_split_manifest(
