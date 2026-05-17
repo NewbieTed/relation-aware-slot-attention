@@ -144,15 +144,19 @@ class GraphSlotEncoder(nn.Module):
         layout_mode: str = "deterministic",
         latent_dim: int = 64,
         decoder_node_dropout: float = 0.0,
+        decoder_mode: str = "triple_gnn",
         decoder_box_residual: bool = False,
         decoder_box_residual_scale: float = 0.25,
     ) -> None:
         super().__init__()
         if layout_mode not in {"deterministic", "cvae", "triple_cvae"}:
             raise ValueError(f"Unsupported layout_mode: {layout_mode}")
+        if decoder_mode not in {"triple_gnn", "mlp"}:
+            raise ValueError(f"Unsupported decoder_mode: {decoder_mode}")
         self.layout_mode = layout_mode
         self.latent_dim = latent_dim
         self.decoder_node_dropout = float(decoder_node_dropout)
+        self.decoder_mode = decoder_mode
         self.decoder_box_residual = bool(decoder_box_residual)
         self.decoder_box_residual_scale = float(decoder_box_residual_scale)
         self.node_proj = nn.Linear(text_hidden_dim, slot_dim)
@@ -251,9 +255,10 @@ class GraphSlotEncoder(nn.Module):
             self.triple_posterior_layers = nn.ModuleList(
                 TripleGraphConvLayer(slot_dim, slot_dim) for _ in range(num_layers)
             )
-            self.triple_decoder_layers = nn.ModuleList(
-                TripleGraphConvLayer(slot_dim, slot_dim) for _ in range(num_layers)
-            )
+            if self.decoder_mode == "triple_gnn":
+                self.triple_decoder_layers = nn.ModuleList(
+                    TripleGraphConvLayer(slot_dim, slot_dim) for _ in range(num_layers)
+                )
             self.triple_node_readout_score = nn.Sequential(
                 nn.LayerNorm(slot_dim),
                 nn.Linear(slot_dim, slot_dim // 2),
@@ -621,12 +626,13 @@ class GraphSlotEncoder(nn.Module):
             decoder_nodes = self.triple_decoder_node_in(
                 torch.cat([modulated_prior_nodes, z_context], dim=-1)
             )
-            decoder_nodes, decoder_edges = self._run_triple_layers(
-                decoder_nodes,
-                prior_edges,
-                sample_edges,
-                self.triple_decoder_layers,
-            )
+            if self.decoder_mode == "triple_gnn":
+                decoder_nodes, _decoder_edges = self._run_triple_layers(
+                    decoder_nodes,
+                    prior_edges,
+                    sample_edges,
+                    self.triple_decoder_layers,
+                )
             raw_boxes = self.triple_box_3d_head(decoder_nodes).sigmoid()
             if self.decoder_box_residual:
                 base_boxes = self.triple_box_3d_head(prior_nodes).sigmoid()

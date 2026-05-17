@@ -184,7 +184,7 @@ def _load_graph_encoder(
     device: str,
 ) -> tuple[GraphSlotEncoder, str, int]:
     state_dict = normalize_graph_encoder_state_dict(torch.load(path, map_location="cpu"))
-    _slot_dim, text_hidden_dim, _gnn_layers, _layout_mode, _latent_dim, _decoder_box_residual = infer_graph_encoder_config(state_dict)
+    _slot_dim, text_hidden_dim, _gnn_layers, _layout_mode, _latent_dim, _decoder_mode, _decoder_box_residual = infer_graph_encoder_config(state_dict)
     text_encoder_type = infer_text_encoder_type(text_hidden_dim)
     encoder = load_graph_encoder(
         path=path,
