@@ -12,7 +12,7 @@ generate:
   oscr_render_size: 512
   num_inference_steps: 28
   guidance_scale: 3.5
-  max_sequence_length: 128
+  max_sequence_length: 256
   samples_per_prompt: 1
   limit_prompts: 3
   seed: 42
@@ -29,7 +29,8 @@ generate:
   blender_bin: /local1/cse_481_m_l/blender/blender-3.6.19-linux-x64/blender
   blender_cache_dir: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/cache/blender_smoke_flux_triple_cvae_dropout02_rel1_box02_spatial_512_prompt_addons_3p1i
   prompt_prefix: a photo of
-  background_prompt: in a bright indoor scene
+  generation_scene_prefix: in a bright indoor room with visible walls, floor, and natural window light
+  background_prompt: detailed realistic room background
   style_prompt: natural photo
   quality_prompt: high detail
 
