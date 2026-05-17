@@ -11,6 +11,8 @@ architecture:
   layout-head traces for a prompt.
 - `evaluation.debug_layout_spread`: print compact per-object center/size spread
   summaries across many stochastic layout samples.
+- `evaluation.debug_dataset_layout_spread`: print the same compact spread
+  summary for target boxes stored in a SCOP-style `metadata.jsonl` folder.
 - `evaluation.visualize_gnn_layout`: visualize predicted GNN centers and box regions.
 - `evaluation.t2i_compbench`: score an existing generated samples directory with
   a prepared T2I-CompBench checkout.
