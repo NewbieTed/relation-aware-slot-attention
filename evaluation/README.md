@@ -30,6 +30,20 @@ python3 -m evaluation.generate_flux_relation_t2i \
   --config configs/flux/eval_official_seethrough3d_spatial_20p_bf16_512.yaml
 ```
 
+Generation-only prompt add-ons can be supplied without changing the relation
+graph used by the GNN:
+
+```yaml
+generate:
+  background_prompt: in a bright kitchen
+  style_prompt: natural photo
+  quality_prompt: high detail
+```
+
+The parser also keeps comma-style prompt-file add-ons out of object labels, so
+`a dog to the left of a chair, in a bright kitchen` still parses as `dog` and
+`chair` for layout.
+
 Example GNN/CVAE trace:
 
 ```bash

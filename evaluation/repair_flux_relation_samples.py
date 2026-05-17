@@ -21,6 +21,7 @@ from evaluation.generate_flux_relation_t2i import (
     _load_pipeline,
     _predict_condition,
 )
+from evaluation.prompt_parser import compose_generation_prompt, prompt_additions_from_args
 from training.config import _load_raw_config, _section_config
 from training.flux_inference_runtime import pipeline_execution_device, text_encoder_device
 from training.runtime import choose_weight_dtype, load_graph_label_encoder, resolve_torch_device, set_seed
@@ -88,6 +89,7 @@ def main() -> int:
     device = resolve_torch_device(gen_args.device)
     dtype = choose_weight_dtype(device, gen_args.mixed_precision)
     set_seed(gen_args.seed)
+    prompt_additions = prompt_additions_from_args(gen_args)
 
     pipeline, _quantization_config = _load_pipeline(gen_args, device=device, dtype=dtype)
     graph_path = _resolve_graph_path(gen_args)
@@ -126,11 +128,11 @@ def main() -> int:
                 blender_cache_dir=gen_args.blender_cache_dir or (output_dir / "blender_condition_cache"),
                 prompt_prefix=gen_args.prompt_prefix,
                 gnn_layout_sample_mode=gen_args.gnn_layout_sample_mode,
-                generation_scene_prefix=getattr(gen_args, "generation_scene_prefix", ""),
+                prompt_additions=prompt_additions,
             )[:5]
 
         oscr_image, _oscr_viz_image, binding_prompt, call_ids, cuboids_segmasks = condition_cache[prompt_index]
-        generation_prompt = " ".join([binding_prompt, getattr(gen_args, "generation_prompt_suffix", "")]).strip()
+        generation_prompt = compose_generation_prompt(binding_prompt, prompt_additions)
         encoder_device = text_encoder_device(pipeline)
         prompt_embeds, pooled_prompt_embeds, _text_ids = pipeline.encode_prompt(
             prompt=generation_prompt,

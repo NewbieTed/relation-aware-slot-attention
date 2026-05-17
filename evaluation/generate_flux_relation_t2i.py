@@ -12,7 +12,12 @@ import torch
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 
-from evaluation.prompt_parser import parse_prompt_to_scene_graph
+from evaluation.prompt_parser import (
+    PromptAdditions,
+    compose_generation_prompt,
+    parse_prompt_to_scene_graph,
+    prompt_additions_from_args,
+)
 from training.config import parse_args_with_config
 from training.flux_inference_runtime import (
     build_flux_quantization_config,
@@ -129,6 +134,24 @@ def make_parser() -> argparse.ArgumentParser:
             "Optional qualitative-only scene text inserted after the subject anchors "
             "and before the relation prompt, while preserving token binding offsets."
         ),
+    )
+    parser.add_argument(
+        "--background-prompt",
+        type=str,
+        default="",
+        help="Optional generation-only background/setting text appended after the bound relation prompt.",
+    )
+    parser.add_argument(
+        "--style-prompt",
+        type=str,
+        default="",
+        help="Optional generation-only visual style text appended after the bound relation prompt.",
+    )
+    parser.add_argument(
+        "--quality-prompt",
+        type=str,
+        default="",
+        help="Optional generation-only quality/detail text appended after the bound relation prompt.",
     )
     return parser
 
@@ -323,8 +346,9 @@ def _predict_condition(
     blender_cache_dir: Path,
     prompt_prefix: str,
     gnn_layout_sample_mode: str,
-    generation_scene_prefix: str = "",
+    prompt_additions: PromptAdditions | None = None,
 ) -> tuple[Any, Any, str, list[list[torch.Tensor]], torch.Tensor, dict[str, Any]]:
+    prompt_additions = prompt_additions or PromptAdditions()
     scene_graph = parse_prompt_to_scene_graph(prompt)
     node_count = len(scene_graph["nodes"])
     targets = torch.zeros(1, node_count, 3, device=device)
@@ -427,10 +451,10 @@ def _predict_condition(
         scene_graph=scene_graph,
         prefix=prompt_prefix,
     )
-    if generation_scene_prefix.strip():
+    if prompt_additions.scene_prefix:
         subject_list = binding_prompt.prompt[: binding_prompt.subject_spans[-1][1]]
         generation_prompt_for_binding = build_binding_prompt(
-            original_prompt=f"{generation_scene_prefix.strip()}, {prompt}",
+            original_prompt=f"{prompt_additions.scene_prefix}, {prompt}",
             scene_graph=scene_graph,
             prefix=prompt_prefix,
         )
@@ -458,6 +482,12 @@ def _predict_condition(
     layout = {
         "prompt": prompt,
         "binding_prompt": binding_prompt.prompt,
+        "generation_prompt": compose_generation_prompt(binding_prompt.prompt, prompt_additions),
+        "generation_scene_prefix": prompt_additions.scene_prefix,
+        "background_prompt": prompt_additions.background,
+        "style_prompt": prompt_additions.style,
+        "quality_prompt": prompt_additions.quality,
+        "generation_prompt_suffix": prompt_additions.suffix,
         "graph_layout_mode": getattr(graph_encoder, "layout_mode", "deterministic"),
         "gnn_layout_sample_mode": gnn_layout_sample_mode,
         "nodes": scene_graph["nodes"],
@@ -480,6 +510,7 @@ def main() -> int:
     dtype = choose_weight_dtype(device, args.mixed_precision)
     set_seed(args.seed)
     prompts = _read_prompts(args.prompt_file, args.limit_prompts)
+    prompt_additions = prompt_additions_from_args(args)
     pipeline, _quantization_config = _load_pipeline(args, device=device, dtype=dtype)
 
     graph_device = "cpu" if args.low_vram else device
@@ -523,14 +554,14 @@ def main() -> int:
             blender_cache_dir=args.blender_cache_dir or (args.output_dir / "blender_condition_cache"),
             prompt_prefix=args.prompt_prefix,
             gnn_layout_sample_mode=args.gnn_layout_sample_mode,
-            generation_scene_prefix=args.generation_scene_prefix,
+            prompt_additions=prompt_additions,
         )
         condition_dir = args.output_dir / "conditions"
         condition_dir.mkdir(parents=True, exist_ok=True)
         oscr_viz_name = f"{prompt_name}_oscr_viz.png"
         oscr_viz_image.save(condition_dir / oscr_viz_name)
         layout["oscr_viz_file"] = str(Path("conditions") / oscr_viz_name)
-        generation_prompt = " ".join([binding_prompt, args.generation_prompt_suffix]).strip()
+        generation_prompt = compose_generation_prompt(binding_prompt, prompt_additions)
         encoder_device = text_encoder_device(pipeline)
         prompt_embeds, pooled_prompt_embeds, _text_ids = pipeline.encode_prompt(
             prompt=generation_prompt,
@@ -607,8 +638,11 @@ def main() -> int:
         "blender_bin": args.blender_bin,
         "blender_cache_dir": str(args.blender_cache_dir or (args.output_dir / "blender_condition_cache")),
         "prompt_prefix": args.prompt_prefix,
-        "generation_prompt_suffix": args.generation_prompt_suffix,
-        "generation_scene_prefix": args.generation_scene_prefix,
+        "generation_prompt_suffix": prompt_additions.suffix,
+        "generation_scene_prefix": prompt_additions.scene_prefix,
+        "background_prompt": prompt_additions.background,
+        "style_prompt": prompt_additions.style,
+        "quality_prompt": prompt_additions.quality,
         "gnn_layout_sample_mode": args.gnn_layout_sample_mode,
         "seed": args.seed,
     }

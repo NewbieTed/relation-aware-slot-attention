@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import re
 
 RELATION_PATTERN_SPECS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -50,6 +51,26 @@ PROMPT_PREFIX_RE = re.compile(
 )
 LEADING_ARTICLE_RE = re.compile(r"^(?:a|an|the)\s+", re.IGNORECASE)
 TRAILING_PUNCT_RE = re.compile(r"[.,;:!?]+$")
+TRAILING_ADDON_RE = re.compile(
+    r"(?P<object>.+?)"
+    r"(?P<separator>"
+    r"\s*[,;:]\s+"
+    r"|\s+\b(?:in|inside|within|at|against|with|without|featuring|surrounded by|on)\b\s+"
+    r")"
+    r"(?P<addon>.+)$",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class PromptAdditions:
+    """Generation-only text that should not change the parsed relation graph."""
+
+    scene_prefix: str = ""
+    background: str = ""
+    style: str = ""
+    quality: str = ""
+    suffix: str = ""
 
 
 def _clean_phrase(text: str) -> str:
@@ -58,6 +79,60 @@ def _clean_phrase(text: str) -> str:
     cleaned = cleaned.strip()
     cleaned = LEADING_ARTICLE_RE.sub("", cleaned)
     return " ".join(cleaned.split())
+
+
+def _strip_trailing_addons(text: str) -> tuple[str, str]:
+    """Split an object phrase from trailing scene/style text when present.
+
+    Prompt files sometimes carry useful generation text after the relation,
+    for example ``a dog left of a chair, in a kitchen``. The graph encoder only
+    wants the object label, while the full text can still be used by FLUX.
+    """
+
+    text = text.strip()
+    match = TRAILING_ADDON_RE.match(text)
+    if match is None:
+        return text, ""
+    object_text = match.group("object").strip()
+    separator = match.group("separator").strip()
+    addon_text = match.group("addon").strip()
+    if not object_text or not addon_text:
+        return text, ""
+    if separator and separator[0] not in ",;:":
+        addon_text = f"{separator} {addon_text}"
+    return object_text, addon_text
+
+
+def _normalize_addition(text: str | None) -> str:
+    if text is None:
+        return ""
+    return " ".join(str(text).strip(" ,;").split())
+
+
+def prompt_additions_from_args(args: object) -> PromptAdditions:
+    """Read optional generation add-ons from an argparse namespace."""
+
+    return PromptAdditions(
+        scene_prefix=_normalize_addition(getattr(args, "generation_scene_prefix", "")),
+        background=_normalize_addition(getattr(args, "background_prompt", "")),
+        style=_normalize_addition(getattr(args, "style_prompt", "")),
+        quality=_normalize_addition(getattr(args, "quality_prompt", "")),
+        suffix=_normalize_addition(getattr(args, "generation_prompt_suffix", "")),
+    )
+
+
+def compose_generation_prompt(base_prompt: str, additions: PromptAdditions | None = None) -> str:
+    """Append optional generation-only prompt text to an already-bound prompt."""
+
+    additions = additions or PromptAdditions()
+    parts = [
+        _normalize_addition(base_prompt),
+        additions.background,
+        additions.style,
+        additions.quality,
+        additions.suffix,
+    ]
+    return ", ".join(part for part in parts if part)
 
 
 def parse_prompt_to_scene_graph(prompt: str) -> dict[str, object]:
@@ -82,7 +157,8 @@ def parse_prompt_to_scene_graph(prompt: str) -> dict[str, object]:
         raise ValueError(f"Could not parse a supported spatial relation from prompt: {prompt}")
 
     left = _clean_phrase(prompt[: match_span[0]])
-    right = _clean_phrase(prompt[match_span[1] :])
+    right_raw, trailing_addon = _strip_trailing_addons(prompt[match_span[1] :])
+    right = _clean_phrase(right_raw)
     if not left or not right:
         raise ValueError(f"Could not parse subject/object phrases from prompt: {prompt}")
 
@@ -106,5 +182,7 @@ def parse_prompt_to_scene_graph(prompt: str) -> dict[str, object]:
         ],
         "metadata": {
             "parser": "rule_based",
+            "core_prompt": " ".join(f"{prompt[: match_span[1]]} {right_raw}".split()),
+            "trailing_generation_addon": _normalize_addition(trailing_addon),
         },
     }

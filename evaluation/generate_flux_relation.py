@@ -32,7 +32,7 @@ from training.runtime import (
     set_seed,
 )
 
-from .prompt_parser import parse_prompt_to_scene_graph
+from .prompt_parser import compose_generation_prompt, parse_prompt_to_scene_graph, prompt_additions_from_args
 
 
 def make_parser() -> argparse.ArgumentParser:
@@ -59,6 +59,10 @@ def make_parser() -> argparse.ArgumentParser:
         default="auto",
         help="For CVAE graph checkpoints, use prior_mean for deterministic boxes or prior_sample for stochastic boxes.",
     )
+    parser.add_argument("--background-prompt", type=str, default="")
+    parser.add_argument("--style-prompt", type=str, default="")
+    parser.add_argument("--quality-prompt", type=str, default="")
+    parser.add_argument("--generation-prompt-suffix", type=str, default="")
     return parser
 
 
@@ -132,6 +136,7 @@ def _predict_layout(
 
 def main() -> int:
     args = make_parser().parse_args()
+    prompt_additions = prompt_additions_from_args(args)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     device = resolve_torch_device(args.device)
     dtype = choose_weight_dtype(device, args.mixed_precision)
@@ -199,11 +204,17 @@ def main() -> int:
         gnn_layout_sample_mode=args.gnn_layout_sample_mode,
     )
     oscr_image.save(args.output_dir / "oscr_condition.png")
-    (args.output_dir / "predicted_layout.json").write_text(json.dumps(layout, indent=2))
 
     generator = torch.Generator(device=device).manual_seed(args.seed) if device != "mps" else None
+    generation_prompt = compose_generation_prompt(args.prompt, prompt_additions)
+    layout["generation_prompt"] = generation_prompt
+    layout["background_prompt"] = prompt_additions.background
+    layout["style_prompt"] = prompt_additions.style
+    layout["quality_prompt"] = prompt_additions.quality
+    layout["generation_prompt_suffix"] = prompt_additions.suffix
+    (args.output_dir / "predicted_layout.json").write_text(json.dumps(layout, indent=2))
     image = pipeline(
-        prompt=args.prompt,
+        prompt=generation_prompt,
         height=args.image_size,
         width=args.image_size,
         num_inference_steps=args.num_inference_steps,
