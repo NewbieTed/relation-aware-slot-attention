@@ -7,7 +7,7 @@ from typing import Any
 
 import torch
 
-from training.graph_targets import bbox_log_sizes_3d_after_crop, bbox_centers_after_crop
+from training.graph_targets import bbox_minmax_3d_after_crop
 from training.prompts import prompt_from_scop_depth_row
 
 
@@ -87,13 +87,14 @@ def main() -> int:
         raise ValueError("No rows matched the requested dataset/filter.")
 
     image_sizes = [tuple(row.get("image_size") or (512, 512)) for row in rows]
-    centers, mask = bbox_centers_after_crop(rows, image_sizes, max_nodes=2, device=torch.device("cpu"))
-    log_sizes, _ = bbox_log_sizes_3d_after_crop(rows, image_sizes, max_nodes=2, device=torch.device("cpu"))
-    sizes = log_sizes.exp()
+    boxes, mask = bbox_minmax_3d_after_crop(rows, image_sizes, max_nodes=2, device=torch.device("cpu"))
+    centers = (boxes[..., :3] + boxes[..., 3:]) * 0.5
+    sizes = boxes[..., 3:] - boxes[..., :3]
     labels = labels_from_row(rows[0])
 
     print(f"Dataset: {args.dataset_dir}")
     print(f"Rows: {len(rows)}")
+    print("Coordinate space: unit cube [0, 1], derived from box3d [x0,y0,z0,x1,y1,z1]")
     if args.prompt_filter:
         print(f"Prompt filter: {args.prompt_filter}")
     for object_index, label in enumerate(labels[:2]):
