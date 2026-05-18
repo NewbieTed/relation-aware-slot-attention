@@ -147,6 +147,7 @@ class GraphSlotEncoder(nn.Module):
         decoder_mode: str = "triple_gnn",
         decoder_box_residual: bool = False,
         decoder_box_residual_scale: float = 0.25,
+        decoder_film_scale: float = 0.1,
         use_scene_latent: bool = False,
     ) -> None:
         super().__init__()
@@ -160,6 +161,11 @@ class GraphSlotEncoder(nn.Module):
         self.decoder_mode = decoder_mode
         self.decoder_box_residual = bool(decoder_box_residual)
         self.decoder_box_residual_scale = float(decoder_box_residual_scale)
+        self.register_buffer(
+            "decoder_film_scale",
+            torch.tensor(float(decoder_film_scale), dtype=torch.float32),
+            persistent=True,
+        )
         self.use_scene_latent = bool(use_scene_latent)
         self.node_proj = nn.Linear(text_hidden_dim, slot_dim)
         self.relation_embedding = nn.Embedding(len(RELATION_VOCAB), relation_dim)
@@ -644,7 +650,10 @@ class GraphSlotEncoder(nn.Module):
                 p=self.decoder_node_dropout,
                 training=self.training and self.decoder_node_dropout > 0.0,
             )
-            modulated_prior_nodes = decoder_prior_nodes * (1.0 + 0.1 * gamma.tanh()) + 0.1 * beta
+            modulated_prior_nodes = (
+                decoder_prior_nodes * (1.0 + self.decoder_film_scale * gamma.tanh())
+                + self.decoder_film_scale * beta
+            )
             decoder_nodes = self.triple_decoder_node_in(
                 torch.cat([modulated_prior_nodes, z_context], dim=-1)
             )

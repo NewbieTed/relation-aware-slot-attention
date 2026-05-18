@@ -459,6 +459,7 @@ def main() -> int:
         _latent_dim,
         _decoder_mode,
         _decoder_box_residual,
+        _decoder_film_scale,
         _use_scene_latent,
     ) = infer_graph_encoder_config(state_dict)
     text_encoder_type = infer_text_encoder_type(text_hidden_dim)

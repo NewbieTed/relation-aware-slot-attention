@@ -92,7 +92,7 @@ def normalize_graph_encoder_state_dict(checkpoint: object) -> dict[str, torch.Te
     return state_dict
 
 
-def infer_graph_encoder_config(state_dict: dict[str, torch.Tensor]) -> tuple[int, int, int, str, int, str, bool, bool]:
+def infer_graph_encoder_config(state_dict: dict[str, torch.Tensor]) -> tuple[int, int, int, str, int, str, bool, float, bool]:
     """Infer graph encoder dimensions and layout mode from a saved state."""
 
     node_weight = state_dict.get("node_proj.weight")
@@ -116,6 +116,7 @@ def infer_graph_encoder_config(state_dict: dict[str, torch.Tensor]) -> tuple[int
         latent_dim = int(state_dict["triple_prior_scene_head.3.weight"].shape[0] // 2)
         decoder_mode = "triple_gnn" if "triple_decoder_layers.0.triple_mlp.0.weight" in state_dict else "mlp"
         decoder_box_residual = "triple_box_3d_delta_head.3.weight" in state_dict
+        decoder_film_scale = float(state_dict.get("decoder_film_scale", torch.tensor(0.1)).item())
         decoder_in = state_dict.get("triple_decoder_node_in.1.weight")
         use_scene_latent = bool(decoder_in is not None and int(decoder_in.shape[1]) == slot_dim + latent_dim * 2)
     elif "prior_head.3.weight" in state_dict:
@@ -123,12 +124,14 @@ def infer_graph_encoder_config(state_dict: dict[str, torch.Tensor]) -> tuple[int
         latent_dim = int(state_dict["prior_head.3.weight"].shape[0] // 2)
         decoder_mode = "triple_gnn"
         decoder_box_residual = False
+        decoder_film_scale = 0.1
         use_scene_latent = False
     else:
         layout_mode = "deterministic"
         latent_dim = 64
         decoder_mode = "triple_gnn"
         decoder_box_residual = False
+        decoder_film_scale = 0.1
         use_scene_latent = False
     return (
         slot_dim,
@@ -138,6 +141,7 @@ def infer_graph_encoder_config(state_dict: dict[str, torch.Tensor]) -> tuple[int
         latent_dim,
         decoder_mode,
         decoder_box_residual,
+        decoder_film_scale,
         use_scene_latent,
     )
 
@@ -208,6 +212,7 @@ def load_graph_encoder(
         latent_dim,
         decoder_mode,
         decoder_box_residual,
+        decoder_film_scale,
         use_scene_latent,
     ) = infer_graph_encoder_config(state_dict)
     if text_hidden_dim != inferred_text_hidden_dim:
@@ -223,6 +228,7 @@ def load_graph_encoder(
         latent_dim=latent_dim,
         decoder_mode=decoder_mode,
         decoder_box_residual=decoder_box_residual,
+        decoder_film_scale=decoder_film_scale,
         use_scene_latent=use_scene_latent,
     ).to(device=device, dtype=dtype)
     encoder.load_state_dict(state_dict, strict=False)

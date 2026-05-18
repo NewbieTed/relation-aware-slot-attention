@@ -63,6 +63,7 @@ def _save_state(output_dir: Path, *, step: int, args: argparse.Namespace) -> Non
         "decoder_mode": args.decoder_mode,
         "decoder_box_residual": args.decoder_box_residual,
         "decoder_box_residual_scale": args.decoder_box_residual_scale,
+        "decoder_film_scale": args.decoder_film_scale,
         "use_scene_latent": args.use_scene_latent,
         "label_embedding_cache": str(args.label_embedding_cache) if args.label_embedding_cache else None,
         "prompt_filter": args.prompt_filter,
@@ -198,6 +199,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--decoder-mode", choices=("triple_gnn", "mlp"), default="triple_gnn")
     parser.add_argument("--decoder-box-residual", action="store_true")
     parser.add_argument("--decoder-box-residual-scale", type=float, default=0.25)
+    parser.add_argument("--decoder-film-scale", type=float, default=0.1)
     parser.add_argument("--use-scene-latent", action="store_true")
     parser.add_argument("--save-every", type=int, default=500)
     parser.add_argument("--log-every", type=int, default=10)
@@ -518,6 +520,7 @@ def main() -> int:
         decoder_mode=args.decoder_mode,
         decoder_box_residual=args.decoder_box_residual,
         decoder_box_residual_scale=args.decoder_box_residual_scale,
+        decoder_film_scale=args.decoder_film_scale,
         use_scene_latent=args.use_scene_latent,
     ).to(device)
     optimizer = torch.optim.AdamW(
