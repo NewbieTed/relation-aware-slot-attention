@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import Any
 
 import torch
 
 from evaluation.prompt_parser import parse_prompt_to_scene_graph
+from training.dataset import load_metadata_rows
+from training.graph_targets import bbox_minmax_3d_after_crop
 from training.graph_modules import build_slot_conditioning
+from training.prompts import prompt_from_scop_depth_row, scene_graph_payload_from_row
 from training.runtime import (
     DEFAULT_FLUX_MODEL_ID,
     infer_graph_encoder_config,
@@ -23,13 +27,16 @@ def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Summarize stochastic GNN layout spread for prompts.")
     parser.add_argument("--prompt", action="append", default=[], help="Prompt to inspect. Can be repeated.")
     parser.add_argument("--prompt-file", type=Path, default=None)
+    parser.add_argument("--dataset-dir", type=Path, default=None, help="SCOP-style metadata folder for posterior-mode debugging.")
     parser.add_argument("--graph-encoder-path", type=Path, required=True)
     parser.add_argument("--model-id", type=str, default=DEFAULT_FLUX_MODEL_ID)
     parser.add_argument("--device", choices=("auto", "cpu", "mps", "cuda"), default="auto")
-    parser.add_argument("--layout-sample-mode", choices=("prior_mean", "prior_sample"), default="prior_sample")
+    parser.add_argument("--layout-sample-mode", choices=("prior_mean", "prior_sample", "posterior"), default="prior_sample")
     parser.add_argument("--num-layout-samples", type=int, default=32)
     parser.add_argument("--layout-seed", type=int, default=42)
     parser.add_argument("--layout-z-scale", type=float, default=1.0)
+    parser.add_argument("--posterior-rows", type=int, default=64, help="Maximum matching dataset rows to use in posterior mode.")
+    parser.add_argument("--posterior-samples-per-row", type=int, default=1)
     parser.add_argument("--list-samples", action="store_true")
     return parser
 
@@ -56,6 +63,24 @@ def summarize_tensor(values: torch.Tensor) -> dict[str, torch.Tensor]:
         "max": values.max(dim=0).values,
         "range": values.max(dim=0).values - values.min(dim=0).values,
     }
+
+
+def normalize_prompt(prompt: str) -> str:
+    return " ".join(prompt.split()).lower()
+
+
+def rows_for_prompt(dataset_dir: Path, prompt: str, *, limit: int | None) -> list[dict[str, Any]]:
+    expected = normalize_prompt(prompt)
+    rows = [
+        row
+        for row in load_metadata_rows(dataset_dir)
+        if normalize_prompt(prompt_from_scop_depth_row(row)) == expected
+    ]
+    if limit is not None:
+        rows = rows[:limit]
+    if not rows:
+        raise ValueError(f"No rows in {dataset_dir} matched prompt: {prompt}")
+    return rows
 
 
 @torch.no_grad()
@@ -85,6 +110,51 @@ def predict_once(
         graph_encoder=graph_encoder,
         device=device,
         layout_sample_mode=layout_sample_mode,
+        layout_z_scale=layout_z_scale,
+    )
+    labels = [str(node["label"]) for node in scene_graph["nodes"]]
+    centers = conditioning.slot_positions[0, :node_count].detach().cpu().to(torch.float32)
+    sizes = conditioning.slot_log_sizes_3d[0, :node_count].detach().cpu().to(torch.float32).exp()
+    return labels, centers, sizes
+
+
+@torch.no_grad()
+def predict_posterior_row(
+    *,
+    row: dict[str, Any],
+    tokenizer: object,
+    text_encoder: object,
+    graph_encoder: torch.nn.Module,
+    device: str,
+    layout_z_scale: float,
+) -> tuple[list[str], torch.Tensor, torch.Tensor]:
+    scene_graph = scene_graph_payload_from_row(row)
+    node_count = len(scene_graph["nodes"])
+    image_size = tuple(row.get("image_size") or (512, 512))
+    box_targets, slot_mask = bbox_minmax_3d_after_crop(
+        [row],
+        [image_size],
+        max_nodes=node_count,
+        device=torch.device(device),
+    )
+    centers_01 = (box_targets[..., :3] + box_targets[..., 3:]) * 0.5
+    sizes_01 = (box_targets[..., 3:] - box_targets[..., :3]).clamp_min(0.03)
+    slot_targets = centers_01.mul(2.0).sub(1.0)
+    log_size_targets = sizes_01.log()
+    batched_graph = build_batched_scene_graphs(
+        [scene_graph],
+        slot_targets=slot_targets,
+        slot_mask=slot_mask,
+        log_size_targets=log_size_targets,
+        box_targets=box_targets,
+    )
+    conditioning = build_slot_conditioning(
+        tokenizer=tokenizer,
+        text_encoder=text_encoder,
+        scene_graph_batch=batched_graph,
+        graph_encoder=graph_encoder,
+        device=device,
+        layout_sample_mode="posterior",
         layout_z_scale=layout_z_scale,
     )
     labels = [str(node["label"]) for node in scene_graph["nodes"]]
@@ -148,23 +218,44 @@ def main() -> int:
         all_centers: list[torch.Tensor] = []
         all_sizes: list[torch.Tensor] = []
         labels: list[str] | None = None
-        for sample_index in range(max(1, args.num_layout_samples)):
-            sample_seed = int(args.layout_seed) + prompt_index * 1000 + sample_index
-            if args.layout_sample_mode == "prior_sample":
-                torch.manual_seed(sample_seed)
-                if torch.cuda.is_available():
-                    torch.cuda.manual_seed_all(sample_seed)
-            labels, centers, sizes = predict_once(
-                prompt=prompt,
-                tokenizer=tokenizer,
-                text_encoder=text_encoder,
-                graph_encoder=graph_encoder,
-                device=device,
-                layout_sample_mode=args.layout_sample_mode,
-                layout_z_scale=args.layout_z_scale,
-            )
-            all_centers.append(centers)
-            all_sizes.append(sizes)
+        if args.layout_sample_mode == "posterior":
+            if args.dataset_dir is None:
+                raise ValueError("--dataset-dir is required for --layout-sample-mode posterior")
+            rows = rows_for_prompt(args.dataset_dir, prompt, limit=args.posterior_rows)
+            for row_index, row in enumerate(rows):
+                for sample_index in range(max(1, args.posterior_samples_per_row)):
+                    sample_seed = int(args.layout_seed) + prompt_index * 100000 + row_index * 1000 + sample_index
+                    torch.manual_seed(sample_seed)
+                    if torch.cuda.is_available():
+                        torch.cuda.manual_seed_all(sample_seed)
+                    labels, centers, sizes = predict_posterior_row(
+                        row=row,
+                        tokenizer=tokenizer,
+                        text_encoder=text_encoder,
+                        graph_encoder=graph_encoder,
+                        device=device,
+                        layout_z_scale=args.layout_z_scale,
+                    )
+                    all_centers.append(centers)
+                    all_sizes.append(sizes)
+        else:
+            for sample_index in range(max(1, args.num_layout_samples)):
+                sample_seed = int(args.layout_seed) + prompt_index * 1000 + sample_index
+                if args.layout_sample_mode == "prior_sample":
+                    torch.manual_seed(sample_seed)
+                    if torch.cuda.is_available():
+                        torch.cuda.manual_seed_all(sample_seed)
+                labels, centers, sizes = predict_once(
+                    prompt=prompt,
+                    tokenizer=tokenizer,
+                    text_encoder=text_encoder,
+                    graph_encoder=graph_encoder,
+                    device=device,
+                    layout_sample_mode=args.layout_sample_mode,
+                    layout_z_scale=args.layout_z_scale,
+                )
+                all_centers.append(centers)
+                all_sizes.append(sizes)
 
         if labels is None:
             continue
@@ -176,6 +267,11 @@ def main() -> int:
             f"  mode={args.layout_sample_mode}, samples={centers_tensor.shape[0]}, "
             f"seed={args.layout_seed}, z_scale={args.layout_z_scale}"
         )
+        if args.layout_sample_mode == "posterior":
+            print(
+                f"  posterior_rows={min(args.posterior_rows, centers_tensor.shape[0])}, "
+                f"samples_per_row={args.posterior_samples_per_row}"
+            )
         for object_index, label in enumerate(labels):
             print_object_summary(
                 label,
