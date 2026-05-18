@@ -68,6 +68,7 @@ def _save_state(output_dir: Path, *, step: int, args: argparse.Namespace) -> Non
         "prompt_filter": args.prompt_filter,
         "cvae_kl_weight": args.cvae_kl_weight,
         "cvae_kl_warmup_steps": args.cvae_kl_warmup_steps,
+        "cvae_best_of_k": args.cvae_best_of_k,
     }
     (output_dir / "training_state.json").write_text(json.dumps(payload, indent=2))
 
@@ -214,6 +215,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--box3d-loss-weight", type=float, default=0.0)
     parser.add_argument("--cvae-kl-weight", type=float, default=0.0)
     parser.add_argument("--cvae-kl-warmup-steps", type=int, default=1000)
+    parser.add_argument("--cvae-best-of-k", type=int, default=1)
     parser.add_argument("--disable-tqdm", action="store_true")
     return parser
 
@@ -233,6 +235,7 @@ def _compute_graph_batch_losses(
     box3d_loss_weight: float = 0.0,
     cvae_kl_weight: float = 0.0,
     cvae_kl_warmup_steps: int = 1000,
+    cvae_best_of_k: int = 1,
     step: int | None = None,
     label_embedding_cache: dict[str, torch.Tensor] | None = None,
 ) -> dict[str, torch.Tensor]:
@@ -268,13 +271,14 @@ def _compute_graph_batch_losses(
         log_size_targets=log_size_3d_targets,
         box_targets=box_3d_targets,
     )
+    layout_mode = _graph_layout_mode(graph_encoder)
     conditioning = build_slot_conditioning(
         tokenizer=tokenizer,
         text_encoder=text_encoder,
         scene_graph_batch=scene_graph_batch,
         graph_encoder=graph_encoder,
         device=device,
-        layout_sample_mode="posterior" if _graph_layout_mode(graph_encoder) in {"cvae", "triple_cvae"} else "auto",
+        layout_sample_mode="posterior" if layout_mode in {"cvae", "triple_cvae"} else "auto",
         label_embedding_cache=label_embedding_cache,
     )
 
@@ -308,12 +312,35 @@ def _compute_graph_batch_losses(
         log_sigma_targets,
         conditioning.slot_mask,
     )
-    if _graph_layout_mode(graph_encoder) == "triple_cvae":
+    if layout_mode == "triple_cvae":
         box3d_loss = box_3d_l1_loss(
             conditioning.slot_boxes_3d,
             box_3d_targets,
             conditioning.slot_mask,
         )
+        if graph_encoder.training and cvae_best_of_k > 1:
+            best_box3d_loss = box3d_loss
+            best_conditioning = conditioning
+            for _sample_index in range(cvae_best_of_k - 1):
+                candidate = build_slot_conditioning(
+                    tokenizer=tokenizer,
+                    text_encoder=text_encoder,
+                    scene_graph_batch=scene_graph_batch,
+                    graph_encoder=graph_encoder,
+                    device=device,
+                    layout_sample_mode="posterior",
+                    label_embedding_cache=label_embedding_cache,
+                )
+                candidate_box3d_loss = box_3d_l1_loss(
+                    candidate.slot_boxes_3d,
+                    box_3d_targets,
+                    candidate.slot_mask,
+                )
+                if float(candidate_box3d_loss.detach().cpu()) < float(best_box3d_loss.detach().cpu()):
+                    best_box3d_loss = candidate_box3d_loss
+                    best_conditioning = candidate
+            conditioning = best_conditioning
+            box3d_loss = best_box3d_loss
     else:
         box3d_loss = log_size_3d_loss(
             conditioning.slot_log_sizes_3d,
@@ -365,6 +392,7 @@ def _evaluate_graph_encoder(
     box3d_loss_weight: float,
     cvae_kl_weight: float,
     cvae_kl_warmup_steps: int,
+    cvae_best_of_k: int = 1,
     label_embedding_cache: dict[str, torch.Tensor] | None = None,
 ) -> dict[str, float]:
     graph_encoder.eval()
@@ -386,6 +414,7 @@ def _evaluate_graph_encoder(
             box3d_loss_weight=box3d_loss_weight,
             cvae_kl_weight=cvae_kl_weight,
             cvae_kl_warmup_steps=cvae_kl_warmup_steps,
+            cvae_best_of_k=1,
             step=cvae_kl_warmup_steps,
             label_embedding_cache=label_embedding_cache,
         )
@@ -533,6 +562,7 @@ def main() -> int:
                 box3d_loss_weight=args.box3d_loss_weight,
                 cvae_kl_weight=args.cvae_kl_weight,
                 cvae_kl_warmup_steps=args.cvae_kl_warmup_steps,
+                cvae_best_of_k=args.cvae_best_of_k,
                 step=global_step,
                 label_embedding_cache=label_embedding_cache,
             )
@@ -600,6 +630,7 @@ def main() -> int:
                         box3d_loss_weight=args.box3d_loss_weight,
                         cvae_kl_weight=args.cvae_kl_weight,
                         cvae_kl_warmup_steps=args.cvae_kl_warmup_steps,
+                        cvae_best_of_k=1,
                         label_embedding_cache=label_embedding_cache,
                     ),
                 }
@@ -659,6 +690,7 @@ def main() -> int:
                 box3d_loss_weight=args.box3d_loss_weight,
                 cvae_kl_weight=args.cvae_kl_weight,
                 cvae_kl_warmup_steps=args.cvae_kl_warmup_steps,
+                cvae_best_of_k=1,
                 label_embedding_cache=label_embedding_cache,
             ),
         }
