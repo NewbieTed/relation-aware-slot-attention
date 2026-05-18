@@ -483,8 +483,28 @@ def main() -> int:
     )
     metric_keys = _metric_keys(args.layout_mode)
 
+    # Resume from latest checkpoint if one exists in output_dir
+    resume_step = 0
+    if args.output_dir.exists():
+        checkpoints = sorted(args.output_dir.glob("checkpoint-??????"))
+        if checkpoints:
+            latest = checkpoints[-1]
+            resume_step = int(latest.name.split("-")[1])
+            encoder_ckpt = latest / "graph_encoder.pt"
+            optimizer_ckpt = latest / "optimizer.pt"
+            if encoder_ckpt.exists():
+                accelerator.unwrap_model(graph_encoder).load_state_dict(
+                    torch.load(encoder_ckpt, map_location=device)
+                )
+            if optimizer_ckpt.exists():
+                optimizer.load_state_dict(
+                    torch.load(optimizer_ckpt, map_location=device)
+                )
+            if accelerator.is_main_process:
+                print(f"Resumed training from {latest} (step {resume_step})")
+
     if accelerator.is_main_process:
-        _save_state(args.output_dir, step=0, args=args)
+        _save_state(args.output_dir, step=resume_step, args=args)
     metrics_logger = MetricsLogger(
         args.output_dir,
         fieldnames=["step", "split", *metric_keys],
@@ -494,8 +514,9 @@ def main() -> int:
         disable=is_tqdm_disabled(args) or not accelerator.is_local_main_process,
         desc="GraphPretraining",
     )
+    progress_bar.update(resume_step)
 
-    global_step = 0
+    global_step = resume_step
     running = {key: 0.0 for key in metric_keys}
     running_steps = 0
     while global_step < args.max_train_steps:

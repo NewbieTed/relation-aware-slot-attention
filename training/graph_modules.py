@@ -598,7 +598,7 @@ class GraphSlotEncoder(nn.Module):
             z_context = torch.cat([scene_z_nodes, object_z], dim=-1)
             film = self.triple_decoder_film(z_context)
             gamma, beta = film.chunk(2, dim=-1)
-            modulated_prior_nodes = prior_nodes * (1.0 + 0.1 * gamma.tanh()) + 0.1 * beta
+            modulated_prior_nodes = prior_nodes * (1.0 + gamma.tanh()) + beta
             decoder_nodes = self.triple_decoder_node_in(
                 torch.cat([modulated_prior_nodes, z_context], dim=-1)
             )
@@ -972,12 +972,13 @@ def cvae_kl_loss(output: GraphConditioningOutput) -> torch.Tensor:
         or output.posterior_logvar is None
     ):
         return output.slot_positions.new_tensor(0.0)
+    _FREE_BITS = 0.5
     scene_kl = _diagonal_gaussian_kl(
         output.posterior_mu,
         output.posterior_logvar,
         output.prior_mu,
         output.prior_logvar,
-    ).sum(dim=-1).mean()
+    ).clamp(min=_FREE_BITS).sum(dim=-1).mean()
     if (
         output.object_prior_mu is None
         or output.object_prior_logvar is None
@@ -990,7 +991,7 @@ def cvae_kl_loss(output: GraphConditioningOutput) -> torch.Tensor:
         output.object_posterior_logvar,
         output.object_prior_mu,
         output.object_prior_logvar,
-    ).sum(dim=-1)
+    ).clamp(min=_FREE_BITS).sum(dim=-1)
     if not output.slot_mask.any():
         return scene_kl.to(output.slot_positions.dtype)
     object_kl = object_kl[output.slot_mask].mean()
