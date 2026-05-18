@@ -5,9 +5,9 @@ project and wants to understand exactly how a prompt becomes predicted 3D object
 boxes. The goal of this module is to predict object layouts that can later be
 rendered into OSCR images for SeeThrough3D/FLUX inference.
 
-The model is inspired by 3D_SLN's scene-graph-to-scene VAE. The main difference
-is that our model has both a scene-level latent variable and object-level latent
-variables, while 3D_SLN mainly uses per-object latent variables.
+The model is inspired by 3D_SLN's scene-graph-to-scene VAE. The active
+3D_SLN-aligned version uses per-object latent variables and omits the earlier
+scene-level latent path.
 
 ## Inputs
 
@@ -288,130 +288,9 @@ graph and the true training layout.
 
 ## Scene-Level Latent Variable
 
-The scene-level latent variable captures global layout variation shared by all
-objects.
-
-We first summarize the posterior graph.
-
-Node readout:
-
-```text
-posterior_node_readout = attention_readout({posterior_node_i})
-```
-
-`posterior_node_readout` means one vector summarizing all final posterior object
-states.
-
-`attention_readout` is a learned pooling operation. It does not average all
-object nodes equally. Instead, it learns one scalar score for each node:
-
-```text
-node_score_i = node_readout_score(posterior_node_i)
-```
-
-`node_score_i` means the learned importance score for object `i` when building
-the global scene summary.
-
-The scores are normalized with softmax:
-
-```text
-node_weight_i = softmax(node_score_i over all valid objects)
-```
-
-`node_weight_i` means how much object `i` contributes to the final node
-summary.
-
-The weighted node summary is:
-
-```text
-posterior_node_readout = sum_i(node_weight_i * posterior_node_i)
-```
-
-This lets the model learn that some objects may be more important for global
-layout than others.
-
-Edge readout:
-
-```text
-posterior_edge_readout = attention_readout({posterior_edge_ij})
-```
-
-`posterior_edge_readout` means one vector summarizing all final posterior
-relation states.
-
-The edge readout uses the same idea:
-
-```text
-edge_score_ij = edge_readout_score(posterior_edge_ij)
-edge_weight_ij = softmax(edge_score_ij over all valid edges)
-posterior_edge_readout = sum_ij(edge_weight_ij * posterior_edge_ij)
-```
-
-`edge_score_ij` means the learned importance score for relation `i -> j`.
-
-`edge_weight_ij` means how much relation `i -> j` contributes to the global
-relation summary.
-
-The two readouts are fused:
-
-```text
-posterior_graph_state = graph_fuse(concat(posterior_node_readout, posterior_edge_readout))
-```
-
-`posterior_graph_state` means one vector representing the full posterior graph.
-
-`graph_fuse` is an MLP. It combines the object summary and relation summary into
-one scene-level graph vector.
-
-More explicitly:
-
-```text
-combined_graph_readout = concat(posterior_node_readout, posterior_edge_readout)
-posterior_graph_state = graph_fuse(combined_graph_readout)
-```
-
-`combined_graph_readout` means the vector made by placing the node summary and
-edge summary side by side.
-
-`graph_fuse` means a small neural network that maps this combined vector into
-the final graph state. In code, it is:
-
-```text
-LayerNorm -> Linear -> SiLU -> Linear
-```
-
-So conceptually:
-
-```text
-posterior_graph_state = MLP(summary of objects, summary of relations)
-```
-
-This graph state is mapped to a Gaussian distribution:
-
-```text
-scene_posterior_mu, scene_posterior_logvar = scene_posterior_head(posterior_graph_state)
-```
-
-`scene_posterior_mu` is the mean of the scene-level posterior distribution.
-
-`scene_posterior_logvar` is the log variance of the scene-level posterior
-distribution.
-
-The scene latent is sampled with the reparameterization trick:
-
-```text
-epsilon_scene ~ N(0, I)
-z_scene = scene_posterior_mu + exp(0.5 * scene_posterior_logvar) * epsilon_scene
-```
-
-`z_scene` means the sampled scene-level latent vector used by the decoder.
-
-During training, `z_scene` comes from the posterior. During inference, we sample
-it from the standard normal prior:
-
-```text
-z_scene ~ N(0, I)
-```
+The current 3D_SLN-aligned config disables the scene-level latent variable.
+Older checkpoints may still contain this path for compatibility, but new
+`triple_cvae` training runs use only per-object latents.
 
 ## Object-Level Latent Variables
 
@@ -475,8 +354,7 @@ z_obj_i ~ N(0, I)
 ```
 
 This is the main probabilistic part of the model. Two runs with the same scene
-graph can produce different boxes because `z_scene` and `z_obj_i` can be sampled
-differently.
+graph can produce different boxes because `z_obj_i` can be sampled differently.
 
 ## Decoder Triple-GNN
 
@@ -486,13 +364,11 @@ variables.
 For each object `i`, the decoder input is:
 
 ```text
-decoder_input_i = concat(prior_node_i, z_scene, z_obj_i)
+decoder_input_i = concat(prior_node_i, z_obj_i)
 ```
 
 `prior_node_i` means the final prior node state for object `i`, computed from
 only object labels and relations.
-
-`z_scene` means the sampled scene-level latent vector shared by all objects.
 
 `z_obj_i` means the sampled object-level latent vector for object `i`.
 
@@ -608,7 +484,7 @@ The training loss is still computed on `pred_box_i`, not on
 The current 3D_SLN-style training loss is:
 
 ```text
-total_loss = box_l1_loss + kl_weight * (kl_scene + kl_object)
+total_loss = box_l1_loss + kl_weight * kl_object
 ```
 
 `box_l1_loss` compares predicted boxes to ground-truth boxes:
@@ -620,20 +496,6 @@ box_l1_loss = mean(abs(pred_box_i - gt_box_i))
 `pred_box_i` is the predicted normalized min/max box for object `i`.
 
 `gt_box_i` is the ground-truth normalized min/max box for object `i`.
-
-`kl_scene` regularizes the scene-level posterior toward a standard normal:
-
-```text
-kl_scene = mean_over_batch(
-  sum_over_latent_dims KL(q(z_scene | graph, gt_boxes) || N(0, I))
-)
-```
-
-`q(z_scene | graph, gt_boxes)` means the scene-level posterior distribution
-computed from the posterior graph.
-
-`N(0, I)` means a standard normal distribution with zero mean and identity
-variance.
 
 `kl_object` regularizes each object-level posterior toward a standard normal:
 
@@ -654,7 +516,7 @@ The full training objective is:
 ```text
 total_loss =
   mean(abs(pred_box_i - gt_box_i))
-  + kl_weight * (kl_scene + kl_object)
+  + kl_weight * kl_object
 ```
 
 In the current triple-CVAE config:
@@ -676,7 +538,6 @@ During training:
 
 ```text
 posterior sees graph + ground-truth boxes
-z_scene is sampled from q(z_scene | graph, gt_boxes)
 z_obj_i is sampled from q(z_obj_i | graph, gt_box_i)
 decoder predicts boxes
 loss compares predicted boxes to ground-truth boxes
@@ -688,7 +549,6 @@ During inference:
 ```text
 only the prompt and scene graph are available
 ground-truth boxes are not available
-z_scene is sampled from N(0, I)
 z_obj_i is sampled from N(0, I)
 decoder predicts boxes from graph + sampled latents
 predicted boxes are rendered into OSCR
@@ -696,4 +556,4 @@ SeeThrough3D/FLUX uses the OSCR to generate the final image
 ```
 
 This gives us a probabilistic layout generator: the same prompt can produce
-multiple plausible layouts by sampling different scene and object latents.
+multiple plausible layouts by sampling different object latents.

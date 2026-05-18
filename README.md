@@ -48,8 +48,8 @@ python3 -m training.pretrain_graph_encoder \
 ```
 
 This config uses FLUX T5 object-label embeddings, 5 triple-GNN layers,
-scene-level and object-level CVAE latents, normalized min/max 3D box L1 loss,
-and 3D_SLN-style KL regularization.
+3D_SLN-style per-object CVAE latents, normalized min/max 3D box L1 loss,
+and KL regularization. Rotation/yaw is not modeled yet.
 
 Example generation/debug:
 

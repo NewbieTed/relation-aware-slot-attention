@@ -11,9 +11,10 @@ time to predict object cuboids, which are rendered into OSCR conditions for the
 released SeeThrough3D FLUX LoRA.
 
 The active graph encoder uses `layout_mode: triple_cvae`, a 3D_SLN-style variant
-that updates contextual subject-relation-object edge states, samples both
-scene-level and object-level latents, and runs a decoder triple-GNN before
-predicting normalized 3D min/max boxes.
+that updates contextual subject-relation-object edge states, samples per-object
+latents, and runs a decoder triple-GNN before predicting normalized 3D min/max
+boxes. The active loss mirrors 3D_SLN's layout VAE objective as closely as this
+pipeline currently can: normalized 3D box L1 plus KL, without rotation/yaw.
 
 The graph trainer creates deterministic train/eval/test splits, saves
 `data_split.json`, writes losses to `metrics.jsonl` and `metrics.csv`, and saves

@@ -147,6 +147,7 @@ class GraphSlotEncoder(nn.Module):
         decoder_mode: str = "triple_gnn",
         decoder_box_residual: bool = False,
         decoder_box_residual_scale: float = 0.25,
+        use_scene_latent: bool = False,
     ) -> None:
         super().__init__()
         if layout_mode not in {"deterministic", "cvae", "triple_cvae"}:
@@ -159,6 +160,7 @@ class GraphSlotEncoder(nn.Module):
         self.decoder_mode = decoder_mode
         self.decoder_box_residual = bool(decoder_box_residual)
         self.decoder_box_residual_scale = float(decoder_box_residual_scale)
+        self.use_scene_latent = bool(use_scene_latent)
         self.node_proj = nn.Linear(text_hidden_dim, slot_dim)
         self.relation_embedding = nn.Embedding(len(RELATION_VOCAB), relation_dim)
         self.layers = nn.ModuleList(
@@ -301,15 +303,16 @@ class GraphSlotEncoder(nn.Module):
                 nn.SiLU(),
                 nn.Linear(slot_dim, latent_dim * 2),
             )
+            decoder_latent_dim = latent_dim * (2 if self.use_scene_latent else 1)
             self.triple_decoder_node_in = nn.Sequential(
-                nn.LayerNorm(slot_dim + latent_dim * 2),
-                nn.Linear(slot_dim + latent_dim * 2, slot_dim),
+                nn.LayerNorm(slot_dim + decoder_latent_dim),
+                nn.Linear(slot_dim + decoder_latent_dim, slot_dim),
                 nn.SiLU(),
                 nn.Linear(slot_dim, slot_dim),
             )
             self.triple_decoder_film = nn.Sequential(
-                nn.LayerNorm(latent_dim * 2),
-                nn.Linear(latent_dim * 2, slot_dim),
+                nn.LayerNorm(decoder_latent_dim),
+                nn.Linear(decoder_latent_dim, slot_dim),
                 nn.SiLU(),
                 nn.Linear(slot_dim, slot_dim * 2),
             )
@@ -334,8 +337,8 @@ class GraphSlotEncoder(nn.Module):
             )
             if self.decoder_box_residual:
                 self.triple_box_3d_delta_head = nn.Sequential(
-                    nn.LayerNorm(slot_dim + latent_dim * 2),
-                    nn.Linear(slot_dim + latent_dim * 2, slot_dim),
+                    nn.LayerNorm(slot_dim + decoder_latent_dim),
+                    nn.Linear(slot_dim + decoder_latent_dim, slot_dim),
                     nn.SiLU(),
                     nn.Linear(slot_dim, 6),
                     nn.Tanh(),
@@ -566,13 +569,19 @@ class GraphSlotEncoder(nn.Module):
                 sample_edges,
                 self.triple_prior_layers,
             )
-            prior_graph_state = self._triple_graph_readout(prior_nodes, prior_edges)
-            scene_prior_mu, scene_prior_logvar = self._split_stats(
-                self.triple_prior_scene_head(prior_graph_state)
-            )
-            obj_prior_mu, obj_prior_logvar = self._split_stats(
-                self.triple_prior_object_head(prior_nodes)
-            )
+            if self.use_scene_latent:
+                prior_graph_state = self._triple_graph_readout(prior_nodes, prior_edges)
+                scene_prior_mu, scene_prior_logvar = self._split_stats(
+                    self.triple_prior_scene_head(prior_graph_state)
+                )
+                obj_prior_mu, obj_prior_logvar = self._split_stats(
+                    self.triple_prior_object_head(prior_nodes)
+                )
+            else:
+                scene_prior_mu = torch.zeros(self.latent_dim, device=device, dtype=dtype)
+                scene_prior_logvar = torch.zeros_like(scene_prior_mu)
+                obj_prior_mu = torch.zeros(valid_node_count, self.latent_dim, device=device, dtype=dtype)
+                obj_prior_logvar = torch.zeros_like(obj_prior_mu)
 
             if scene_graph_batch.box_targets is not None:
                 posterior_layout = scene_graph_batch.box_targets[batch_index, :valid_node_count].to(
@@ -591,30 +600,43 @@ class GraphSlotEncoder(nn.Module):
                 sample_edges,
                 self.triple_posterior_layers,
             )
-            posterior_graph_state = self._triple_graph_readout(posterior_nodes, posterior_edges)
-            scene_posterior_mu, scene_posterior_logvar = self._split_stats(
-                self.triple_posterior_scene_head(posterior_graph_state)
-            )
+            if self.use_scene_latent:
+                posterior_graph_state = self._triple_graph_readout(posterior_nodes, posterior_edges)
+                scene_posterior_mu, scene_posterior_logvar = self._split_stats(
+                    self.triple_posterior_scene_head(posterior_graph_state)
+                )
+            else:
+                scene_posterior_mu = torch.zeros_like(scene_prior_mu)
+                scene_posterior_logvar = torch.zeros_like(scene_prior_logvar)
             obj_posterior_mu, obj_posterior_logvar = self._split_stats(
                 self.triple_posterior_object_head(posterior_nodes)
             )
 
             if layout_sample_mode == "posterior" or (layout_sample_mode == "auto" and self.training):
-                scene_z = self._reparameterize(scene_posterior_mu, scene_posterior_logvar)
                 object_z = self._reparameterize(obj_posterior_mu, obj_posterior_logvar)
-                scene_z = scene_posterior_mu + layout_z_scale * (scene_z - scene_posterior_mu)
                 object_z = obj_posterior_mu + layout_z_scale * (object_z - obj_posterior_mu)
+                if self.use_scene_latent:
+                    scene_z = self._reparameterize(scene_posterior_mu, scene_posterior_logvar)
+                    scene_z = scene_posterior_mu + layout_z_scale * (scene_z - scene_posterior_mu)
+                else:
+                    scene_z = scene_posterior_mu
             elif layout_sample_mode == "prior_sample":
-                scene_z = self._reparameterize(scene_prior_mu, scene_prior_logvar)
                 object_z = self._reparameterize(obj_prior_mu, obj_prior_logvar)
-                scene_z = scene_prior_mu + layout_z_scale * (scene_z - scene_prior_mu)
                 object_z = obj_prior_mu + layout_z_scale * (object_z - obj_prior_mu)
+                if self.use_scene_latent:
+                    scene_z = self._reparameterize(scene_prior_mu, scene_prior_logvar)
+                    scene_z = scene_prior_mu + layout_z_scale * (scene_z - scene_prior_mu)
+                else:
+                    scene_z = scene_prior_mu
             else:
                 scene_z = scene_prior_mu
                 object_z = obj_prior_mu
 
-            scene_z_nodes = scene_z.unsqueeze(0).expand(valid_node_count, -1)
-            z_context = torch.cat([scene_z_nodes, object_z], dim=-1)
+            if self.use_scene_latent:
+                scene_z_nodes = scene_z.unsqueeze(0).expand(valid_node_count, -1)
+                z_context = torch.cat([scene_z_nodes, object_z], dim=-1)
+            else:
+                z_context = object_z
             film = self.triple_decoder_film(z_context)
             gamma, beta = film.chunk(2, dim=-1)
             decoder_prior_nodes = F.dropout(
@@ -995,7 +1017,7 @@ def _diagonal_gaussian_kl(
 
 
 def cvae_kl_loss(output: GraphConditioningOutput) -> torch.Tensor:
-    """Conditional CVAE KL between posterior and graph-conditioned prior."""
+    """CVAE KL between posterior latents and the configured prior."""
 
     if (
         output.prior_mu is None

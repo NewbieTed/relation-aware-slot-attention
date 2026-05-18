@@ -38,10 +38,10 @@ training:
 
 losses:
   position_loss_weight: 0.0
-  relation_loss_weight: 1.0
+  relation_loss_weight: 0.0
   embedding_loss_weight: 0.0
   inverse_relation_loss_weight: 0.0
   box_loss_weight: 0.0
-  box3d_loss_weight: 0.05
+  box3d_loss_weight: 1.0
   cvae_kl_weight: 0.1
   cvae_kl_warmup_steps: 500
