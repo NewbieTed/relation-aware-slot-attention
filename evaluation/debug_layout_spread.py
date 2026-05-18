@@ -69,12 +69,20 @@ def normalize_prompt(prompt: str) -> str:
     return " ".join(prompt.split()).lower()
 
 
+def prompt_match_candidates(prompt: str) -> set[str]:
+    normalized = normalize_prompt(prompt)
+    candidates = {normalized}
+    if not normalized.startswith("a photo of "):
+        candidates.add(normalize_prompt(f"a photo of {prompt}"))
+    return candidates
+
+
 def rows_for_prompt(dataset_dir: Path, prompt: str, *, limit: int | None) -> list[dict[str, Any]]:
-    expected = normalize_prompt(prompt)
+    expected = prompt_match_candidates(prompt)
     rows = [
         row
         for row in load_metadata_rows(dataset_dir)
-        if normalize_prompt(prompt_from_scop_depth_row(row)) == expected
+        if normalize_prompt(prompt_from_scop_depth_row(row)) in expected
     ]
     if limit is not None:
         rows = rows[:limit]
