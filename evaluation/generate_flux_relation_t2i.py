@@ -453,15 +453,10 @@ def _predict_condition(
     )
     if prompt_additions.scene_prefix:
         subject_list = binding_prompt.prompt[: binding_prompt.subject_spans[-1][1]]
-        generation_prompt_for_binding = build_binding_prompt(
-            original_prompt=f"{prompt_additions.scene_prefix}, {prompt}",
-            scene_graph=scene_graph,
-            prefix=prompt_prefix,
+        binding_prompt = type(binding_prompt)(
+            prompt=f"{subject_list} {prompt_additions.scene_prefix}, with {prompt.strip()}",
+            subject_spans=binding_prompt.subject_spans,
         )
-        # Keep the same subject-anchor prefix, but let the relation phrase carry
-        # the richer scene text. This preserves the object token offsets.
-        if generation_prompt_for_binding.prompt.startswith(subject_list):
-            binding_prompt = generation_prompt_for_binding
     call_ids = [
         call_ids_from_binding_prompt(
             tokenizer=pipeline.tokenizer_2,

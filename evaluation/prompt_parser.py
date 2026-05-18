@@ -109,6 +109,12 @@ def _normalize_addition(text: str | None) -> str:
     return " ".join(str(text).strip(" ,;").split())
 
 
+def _contains_normalized(text: str, phrase: str) -> bool:
+    if not phrase:
+        return True
+    return _normalize_addition(phrase).lower() in _normalize_addition(text).lower()
+
+
 def prompt_additions_from_args(args: object) -> PromptAdditions:
     """Read optional generation add-ons from an argparse namespace."""
 
@@ -122,11 +128,19 @@ def prompt_additions_from_args(args: object) -> PromptAdditions:
 
 
 def compose_generation_prompt(base_prompt: str, additions: PromptAdditions | None = None) -> str:
-    """Append optional generation-only prompt text to an already-bound prompt."""
+    """Compose the final text prompt with scene context front-loaded.
+
+    ``scene_prefix`` is meant to be part of the main prompt rather than a weak
+    tail add-on. Some callers already bake it into ``base_prompt`` to preserve
+    token-binding offsets, so avoid duplicating it in that case.
+    """
 
     additions = additions or PromptAdditions()
+    base_prompt = _normalize_addition(base_prompt)
+    leading_scene = "" if _contains_normalized(base_prompt, additions.scene_prefix) else additions.scene_prefix
     parts = [
-        _normalize_addition(base_prompt),
+        leading_scene,
+        base_prompt,
         additions.background,
         additions.style,
         additions.quality,
