@@ -74,6 +74,24 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--slot-dim", type=int, default=512)
     parser.add_argument("--gnn-layers", type=int, default=2)
+<<<<<<< Updated upstream
+=======
+    parser.add_argument(
+        "--gnn-layout-sample-mode",
+        choices=("auto", "prior_mean", "prior_sample"),
+        default="auto",
+        help="For CVAE graph checkpoints, use prior_mean for deterministic boxes or prior_sample for stochastic boxes.",
+    )
+    parser.add_argument(
+        "--decoder-film-scale",
+        type=float,
+        default=None,
+        help=(
+            "Optional evaluation-time override for GraphSlotEncoder.decoder_film_scale. "
+            "Useful for older checkpoints that do not save this buffer."
+        ),
+    )
+>>>>>>> Stashed changes
     parser.add_argument("--lora-rank", type=int, default=32)
     parser.add_argument("--lora-alpha", type=float, default=32.0)
     parser.add_argument(
@@ -451,9 +469,21 @@ def main() -> int:
         raise FileNotFoundError(f"Missing graph encoder checkpoint: {graph_path}")
     graph_encoder = _load_graph_encoder(
         path=graph_path,
+<<<<<<< Updated upstream
         text_hidden_dim=pipeline.text_encoder.config.hidden_size,
         slot_dim=args.slot_dim,
         gnn_layers=args.gnn_layers,
+=======
+        device=graph_device,
+    )
+    if args.decoder_film_scale is not None:
+        graph_encoder.decoder_film_scale.fill_(float(args.decoder_film_scale))
+        print(f"Overrode graph encoder decoder_film_scale to {float(graph_encoder.decoder_film_scale.item()):.6g}.")
+    graph_tokenizer, graph_text_encoder, _encoder_hidden_dim = load_graph_label_encoder(
+        model_id=args.model_id,
+        text_encoder_type=graph_text_encoder_type,
+        torch_dtype=dtype,
+>>>>>>> Stashed changes
         device=graph_device,
     )
 
@@ -461,6 +491,7 @@ def main() -> int:
     sample_index = 0
     for prompt_index, prompt in enumerate(tqdm(prompts, desc="RelationFluxGeneration")):
         prompt_name = _safe_prompt_for_filename(prompt)
+<<<<<<< Updated upstream
         oscr_image, oscr_viz_image, binding_prompt, call_ids, cuboids_segmasks, layout = _predict_condition(
             prompt=prompt,
             pipeline=pipeline,
@@ -491,8 +522,46 @@ def main() -> int:
         )
         prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
         pooled_prompt_embeds = pooled_prompt_embeds.to(device=device, dtype=dtype)
+=======
+        condition_dir = args.output_dir / "conditions"
+        condition_dir.mkdir(parents=True, exist_ok=True)
+>>>>>>> Stashed changes
         for repeat_index in range(args.samples_per_prompt):
             seed = args.seed + prompt_index * args.samples_per_prompt + repeat_index
+            set_seed(seed)
+            oscr_image, oscr_viz_image, binding_prompt, call_ids, cuboids_segmasks, layout = _predict_condition(
+                prompt=prompt,
+                pipeline=pipeline,
+                graph_encoder=graph_encoder,
+                graph_tokenizer=graph_tokenizer,
+                graph_text_encoder=graph_text_encoder,
+                device=device,
+                oscr_size=args.oscr_size,
+                oscr_render_size=args.oscr_render_size,
+                max_sequence_length=args.max_sequence_length,
+                condition_renderer=args.condition_renderer,
+                oscr_face_alpha=args.oscr_face_alpha,
+                oscr_azimuth_degrees=args.oscr_azimuth_degrees,
+                blender_bin=args.blender_bin,
+                blender_cache_dir=args.blender_cache_dir or (args.output_dir / "blender_condition_cache"),
+                prompt_prefix=args.prompt_prefix,
+                gnn_layout_sample_mode=args.gnn_layout_sample_mode,
+                prompt_additions=prompt_additions,
+            )
+            oscr_viz_name = f"{prompt_name}_{sample_index:06d}_oscr_viz.png"
+            oscr_viz_image.save(condition_dir / oscr_viz_name)
+            layout["oscr_viz_file"] = str(Path("conditions") / oscr_viz_name)
+            generation_prompt = compose_generation_prompt(binding_prompt, prompt_additions)
+            encoder_device = text_encoder_device(pipeline)
+            prompt_embeds, pooled_prompt_embeds, _text_ids = pipeline.encode_prompt(
+                prompt=generation_prompt,
+                prompt_2=generation_prompt,
+                device=encoder_device,
+                num_images_per_prompt=1,
+                max_sequence_length=args.max_sequence_length,
+            )
+            prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
+            pooled_prompt_embeds = pooled_prompt_embeds.to(device=device, dtype=dtype)
             generator_device = pipeline_execution_device(pipeline, device)
             generator = (
                 torch.Generator(device=generator_device).manual_seed(seed)
@@ -556,6 +625,16 @@ def main() -> int:
         "blender_bin": args.blender_bin,
         "blender_cache_dir": str(args.blender_cache_dir or (args.output_dir / "blender_condition_cache")),
         "prompt_prefix": args.prompt_prefix,
+<<<<<<< Updated upstream
+=======
+        "generation_prompt_suffix": prompt_additions.suffix,
+        "generation_scene_prefix": prompt_additions.scene_prefix,
+        "background_prompt": prompt_additions.background,
+        "style_prompt": prompt_additions.style,
+        "quality_prompt": prompt_additions.quality,
+        "gnn_layout_sample_mode": args.gnn_layout_sample_mode,
+        "decoder_film_scale": float(graph_encoder.decoder_film_scale.item()),
+>>>>>>> Stashed changes
         "seed": args.seed,
     }
     (args.output_dir / "run_config.json").write_text(json.dumps(run_config, indent=2))
