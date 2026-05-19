@@ -15,7 +15,14 @@ def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Summarize target bbox spread in a SCOP-style metadata folder.")
     parser.add_argument("--dataset-dir", type=Path, required=True)
     parser.add_argument("--prompt-filter", type=str, default=None)
+    parser.add_argument("--prompt", type=str, default=None, help="Alias for --prompt-filter.")
     parser.add_argument("--limit-rows", type=int, default=None)
+    parser.add_argument(
+        "--coordinate-space",
+        choices=("model", "unit"),
+        default="model",
+        help="Report centers in model space [-1,1] or raw unit cube [0,1]. Sizes stay in normalized box units.",
+    )
     parser.add_argument("--list-samples", action="store_true")
     return parser
 
@@ -51,6 +58,15 @@ def labels_from_row(row: dict[str, Any]) -> list[str]:
     return labels
 
 
+def normalize_prompt(prompt: str) -> str:
+    normalized = " ".join(prompt.split()).lower()
+    for prefix in ("a photo of ", "an image of ", "a picture of "):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix) :]
+            break
+    return normalized
+
+
 def print_object_summary(label: str, centers: torch.Tensor, sizes: torch.Tensor, *, list_samples: bool) -> None:
     center_stats = summarize_tensor(centers)
     size_stats = summarize_tensor(sizes)
@@ -74,12 +90,13 @@ def print_object_summary(label: str, centers: torch.Tensor, sizes: torch.Tensor,
 def main() -> int:
     args = make_parser().parse_args()
     rows = load_rows(args.dataset_dir)
-    if args.prompt_filter:
-        expected = " ".join(args.prompt_filter.split()).lower()
+    prompt_filter = args.prompt_filter or args.prompt
+    if prompt_filter:
+        expected = normalize_prompt(prompt_filter)
         rows = [
             row
             for row in rows
-            if " ".join(prompt_from_scop_depth_row(row).split()).lower() == expected
+            if normalize_prompt(prompt_from_scop_depth_row(row)) == expected
         ]
     if args.limit_rows is not None:
         rows = rows[: args.limit_rows]
@@ -90,13 +107,18 @@ def main() -> int:
     boxes, mask = bbox_minmax_3d_after_crop(rows, image_sizes, max_nodes=2, device=torch.device("cpu"))
     centers = (boxes[..., :3] + boxes[..., 3:]) * 0.5
     sizes = boxes[..., 3:] - boxes[..., :3]
+    if args.coordinate_space == "model":
+        centers = centers.mul(2.0).sub(1.0)
     labels = labels_from_row(rows[0])
 
     print(f"Dataset: {args.dataset_dir}")
     print(f"Rows: {len(rows)}")
-    print("Coordinate space: unit cube [0, 1], derived from box3d [x0,y0,z0,x1,y1,z1]")
-    if args.prompt_filter:
-        print(f"Prompt filter: {args.prompt_filter}")
+    if args.coordinate_space == "model":
+        print("Coordinate space: model centers [-1, 1], sizes in normalized box units")
+    else:
+        print("Coordinate space: unit cube centers [0, 1], sizes in normalized box units")
+    if prompt_filter:
+        print(f"Prompt filter: {prompt_filter}")
     for object_index, label in enumerate(labels[:2]):
         valid = mask[:, object_index]
         print_object_summary(
