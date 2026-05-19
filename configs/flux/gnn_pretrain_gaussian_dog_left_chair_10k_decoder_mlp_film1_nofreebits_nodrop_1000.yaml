@@ -1,0 +1,52 @@
+paths:
+  dataset_dir: /local1/cse_481_m_l/relation-aware-slot-attention/data/scop_depth_crops_depth_gaussian_dog_left_chair_10k
+  output_dir: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/train/graph_pretrain_gaussian_dog_left_chair_10k_decoder_mlp_film1_nofreebits_nodrop_1000
+  label_embedding_cache: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/cache/gnn_label_embeddings_flux1dev_t5.pt
+
+model:
+  model_id: black-forest-labs/FLUX.1-dev
+  text_encoder_type: t5
+  text_hidden_dim: 4096
+  slot_dim: 512
+  gnn_layers: 5
+  layout_mode: triple_cvae
+  latent_dim: 32
+  decoder_node_dropout: 0.0
+  decoder_mode: mlp
+  decoder_box_residual: false
+  decoder_box_residual_scale: 0.25
+  decoder_film_scale: 1.0
+  use_scene_latent: true
+
+runtime:
+  device: cuda
+  mixed_precision: bf16
+  num_workers: 0
+  seed: 42
+  disable_tqdm: false
+
+data:
+  batch_size: 128
+  limit_rows:
+  prompt_prefix: a photo of
+  eval_fraction: 0.05
+  test_fraction: 0.05
+
+training:
+  graph_learning_rate: 1.0e-4
+  max_train_steps: 1000
+  save_every: 250
+  log_every: 25
+  eval_every: 250
+
+losses:
+  position_loss_weight: 0.0
+  relation_loss_weight: 0.0
+  embedding_loss_weight: 0.0
+  inverse_relation_loss_weight: 0.0
+  box_loss_weight: 0.0
+  box3d_loss_weight: 1.0
+  cvae_kl_weight: 0.1
+  cvae_kl_warmup_steps: 0
+  cvae_best_of_k: 1
+  cvae_free_bits: 0.0
