@@ -70,6 +70,7 @@ def _save_state(output_dir: Path, *, step: int, args: argparse.Namespace) -> Non
         "cvae_kl_weight": args.cvae_kl_weight,
         "cvae_kl_warmup_steps": args.cvae_kl_warmup_steps,
         "cvae_best_of_k": args.cvae_best_of_k,
+        "cvae_free_bits": args.cvae_free_bits,
     }
     (output_dir / "training_state.json").write_text(json.dumps(payload, indent=2))
 
@@ -218,6 +219,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cvae-kl-weight", type=float, default=0.0)
     parser.add_argument("--cvae-kl-warmup-steps", type=int, default=1000)
     parser.add_argument("--cvae-best-of-k", type=int, default=1)
+    parser.add_argument("--cvae-free-bits", type=float, default=0.0)
     parser.add_argument("--disable-tqdm", action="store_true")
     return parser
 
@@ -238,6 +240,7 @@ def _compute_graph_batch_losses(
     cvae_kl_weight: float = 0.0,
     cvae_kl_warmup_steps: int = 1000,
     cvae_best_of_k: int = 1,
+    cvae_free_bits: float = 0.0,
     step: int | None = None,
     label_embedding_cache: dict[str, torch.Tensor] | None = None,
 ) -> dict[str, torch.Tensor]:
@@ -350,7 +353,7 @@ def _compute_graph_batch_losses(
             conditioning.slot_mask,
         )
     inverse_loss = inverse_relation_regularizer(graph_encoder)
-    kl_loss = cvae_kl_loss(conditioning)
+    kl_loss = cvae_kl_loss(conditioning, free_bits=cvae_free_bits)
     if cvae_kl_warmup_steps > 0 and step is not None:
         kl_scale = min(1.0, max(0.0, float(step) / float(cvae_kl_warmup_steps)))
     else:
@@ -395,6 +398,7 @@ def _evaluate_graph_encoder(
     cvae_kl_weight: float,
     cvae_kl_warmup_steps: int,
     cvae_best_of_k: int = 1,
+    cvae_free_bits: float = 0.0,
     label_embedding_cache: dict[str, torch.Tensor] | None = None,
 ) -> dict[str, float]:
     graph_encoder.eval()
@@ -417,6 +421,7 @@ def _evaluate_graph_encoder(
             cvae_kl_weight=cvae_kl_weight,
             cvae_kl_warmup_steps=cvae_kl_warmup_steps,
             cvae_best_of_k=1,
+            cvae_free_bits=cvae_free_bits,
             step=cvae_kl_warmup_steps,
             label_embedding_cache=label_embedding_cache,
         )
@@ -566,6 +571,7 @@ def main() -> int:
                 cvae_kl_weight=args.cvae_kl_weight,
                 cvae_kl_warmup_steps=args.cvae_kl_warmup_steps,
                 cvae_best_of_k=args.cvae_best_of_k,
+                cvae_free_bits=args.cvae_free_bits,
                 step=global_step,
                 label_embedding_cache=label_embedding_cache,
             )
@@ -634,6 +640,7 @@ def main() -> int:
                         cvae_kl_weight=args.cvae_kl_weight,
                         cvae_kl_warmup_steps=args.cvae_kl_warmup_steps,
                         cvae_best_of_k=1,
+                        cvae_free_bits=args.cvae_free_bits,
                         label_embedding_cache=label_embedding_cache,
                     ),
                 }
@@ -694,6 +701,7 @@ def main() -> int:
                 cvae_kl_weight=args.cvae_kl_weight,
                 cvae_kl_warmup_steps=args.cvae_kl_warmup_steps,
                 cvae_best_of_k=1,
+                cvae_free_bits=args.cvae_free_bits,
                 label_embedding_cache=label_embedding_cache,
             ),
         }

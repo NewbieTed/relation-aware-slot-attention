@@ -575,19 +575,13 @@ class GraphSlotEncoder(nn.Module):
                 sample_edges,
                 self.triple_prior_layers,
             )
-            if self.use_scene_latent:
-                prior_graph_state = self._triple_graph_readout(prior_nodes, prior_edges)
-                scene_prior_mu, scene_prior_logvar = self._split_stats(
-                    self.triple_prior_scene_head(prior_graph_state)
-                )
-                obj_prior_mu, obj_prior_logvar = self._split_stats(
-                    self.triple_prior_object_head(prior_nodes)
-                )
-            else:
-                scene_prior_mu = torch.zeros(self.latent_dim, device=device, dtype=dtype)
-                scene_prior_logvar = torch.zeros_like(scene_prior_mu)
-                obj_prior_mu = torch.zeros(valid_node_count, self.latent_dim, device=device, dtype=dtype)
-                obj_prior_logvar = torch.zeros_like(obj_prior_mu)
+            # Match the 3D_SLN VAE objective: z is regularized against and
+            # sampled from a standard normal, while the graph still conditions
+            # the decoder through prior_nodes / prior_edges.
+            scene_prior_mu = torch.zeros(self.latent_dim, device=device, dtype=dtype)
+            scene_prior_logvar = torch.zeros_like(scene_prior_mu)
+            obj_prior_mu = torch.zeros(valid_node_count, self.latent_dim, device=device, dtype=dtype)
+            obj_prior_logvar = torch.zeros_like(obj_prior_mu)
 
             if scene_graph_batch.box_targets is not None:
                 posterior_layout = scene_graph_batch.box_targets[batch_index, :valid_node_count].to(
@@ -779,9 +773,16 @@ class GraphSlotEncoder(nn.Module):
             slot_mask,
             self.graph_readout_score,
         )
-        prior_stats = self.prior_head(graph_state)
-        prior_mu, prior_logvar = prior_stats.chunk(2, dim=-1)
-        prior_logvar = prior_logvar.clamp(min=-8.0, max=4.0)
+        # The non-triple CVAE path follows the same 3D_SLN-style latent prior:
+        # posterior q(z | graph, boxes) is regularized to N(0, I), not to a
+        # learned graph-conditioned prior.
+        prior_mu = torch.zeros(
+            node_states.shape[0],
+            self.latent_dim,
+            device=node_states.device,
+            dtype=node_states.dtype,
+        )
+        prior_logvar = torch.zeros_like(prior_mu)
 
         gt_layout = torch.cat(
             [
@@ -1025,35 +1026,33 @@ def _diagonal_gaussian_kl(
     return kl.clamp_min(0.0)
 
 
-def cvae_kl_loss(output: GraphConditioningOutput) -> torch.Tensor:
-    """CVAE KL between posterior latents and the configured prior."""
+def _free_bits_kl(kl: torch.Tensor, free_bits: float) -> torch.Tensor:
+    if free_bits <= 0.0:
+        return kl
+    return (kl - float(free_bits)).clamp_min(0.0)
 
-    if (
-        output.prior_mu is None
-        or output.prior_logvar is None
-        or output.posterior_mu is None
-        or output.posterior_logvar is None
-    ):
+
+def cvae_kl_loss(output: GraphConditioningOutput, *, free_bits: float = 0.0) -> torch.Tensor:
+    """CVAE KL between posterior latents and a standard normal prior."""
+
+    if output.posterior_mu is None or output.posterior_logvar is None:
         return output.slot_positions.new_tensor(0.0)
     scene_kl = _diagonal_gaussian_kl(
         output.posterior_mu,
         output.posterior_logvar,
-        output.prior_mu,
-        output.prior_logvar,
-    ).sum(dim=-1).mean()
-    if (
-        output.object_prior_mu is None
-        or output.object_prior_logvar is None
-        or output.object_posterior_mu is None
-        or output.object_posterior_logvar is None
-    ):
+        torch.zeros_like(output.posterior_mu),
+        torch.zeros_like(output.posterior_logvar),
+    )
+    scene_kl = _free_bits_kl(scene_kl, free_bits).sum(dim=-1).mean()
+    if output.object_posterior_mu is None or output.object_posterior_logvar is None:
         return scene_kl.to(output.slot_positions.dtype)
     object_kl = _diagonal_gaussian_kl(
         output.object_posterior_mu,
         output.object_posterior_logvar,
-        output.object_prior_mu,
-        output.object_prior_logvar,
-    ).sum(dim=-1)
+        torch.zeros_like(output.object_posterior_mu),
+        torch.zeros_like(output.object_posterior_logvar),
+    )
+    object_kl = _free_bits_kl(object_kl, free_bits).sum(dim=-1)
     if not output.slot_mask.any():
         return scene_kl.to(output.slot_positions.dtype)
     object_kl = object_kl[output.slot_mask].mean()
