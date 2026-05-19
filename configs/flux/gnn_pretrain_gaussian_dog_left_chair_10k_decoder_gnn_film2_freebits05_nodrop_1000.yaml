@@ -1,6 +1,6 @@
 paths:
   dataset_dir: /local1/cse_481_m_l/relation-aware-slot-attention/data/scop_depth_crops_depth_gaussian_dog_left_chair_10k
-  output_dir: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/train/graph_pretrain_gaussian_dog_left_chair_10k_decoder_gnn_film1_freebits05_nodrop_1000
+  output_dir: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/train/graph_pretrain_gaussian_dog_left_chair_10k_decoder_gnn_film2_freebits05_nodrop_1000
   label_embedding_cache: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/cache/gnn_label_embeddings_flux1dev_t5.pt
 
 model:
@@ -15,7 +15,7 @@ model:
   decoder_mode: triple_gnn
   decoder_box_residual: false
   decoder_box_residual_scale: 0.25
-  decoder_film_scale: 1.0
+  decoder_film_scale: 2.0
   use_scene_latent: true
 
 runtime:
