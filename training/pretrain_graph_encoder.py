@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from .config import parse_args_with_config
-from .dataset import build_dataset_splits, collate_training_items
+from .dataset import build_dataset_splits, collate_training_items, load_metadata_rows
 from .graph_modules import (
     GraphSlotEncoder,
     box_3d_l1_loss,
@@ -32,6 +32,7 @@ from .graph_targets import (
     bbox_log_sizes_3d_after_crop,
 )
 from .metrics import MetricsLogger, write_split_manifest
+from .prompts import prompt_from_scop_depth_row, scene_graph_payload_from_row
 from .runtime import (
     DEFAULT_FLUX_MODEL_ID,
     is_tqdm_disabled,
@@ -71,6 +72,11 @@ def _save_state(output_dir: Path, *, step: int, args: argparse.Namespace) -> Non
         "cvae_kl_warmup_steps": args.cvae_kl_warmup_steps,
         "cvae_best_of_k": args.cvae_best_of_k,
         "cvae_free_bits": args.cvae_free_bits,
+        "debug_spread_after_training": args.debug_spread_after_training,
+        "debug_spread_prompt": args.debug_spread_prompt,
+        "debug_spread_samples": args.debug_spread_samples,
+        "debug_spread_posterior_rows": args.debug_spread_posterior_rows,
+        "debug_spread_z_scale": args.debug_spread_z_scale,
     }
     (output_dir / "training_state.json").write_text(json.dumps(payload, indent=2))
 
@@ -118,6 +124,59 @@ def _metric_keys(layout_mode: str) -> list[str]:
     if layout_mode in {"cvae", "triple_cvae"}:
         keys.extend(["cvae_kl_loss", "cvae_kl_weighted"])
     return keys
+
+
+def _short_vec(values: torch.Tensor) -> str:
+    return "[" + ", ".join(f"{float(value):+.4f}" for value in values.detach().cpu()) + "]"
+
+
+def _summarize_tensor(values: torch.Tensor) -> dict[str, torch.Tensor]:
+    values = values.detach().cpu().to(torch.float32)
+    return {
+        "mean": values.mean(dim=0),
+        "std": values.std(dim=0, unbiased=False),
+        "min": values.min(dim=0).values,
+        "max": values.max(dim=0).values,
+        "range": values.max(dim=0).values - values.min(dim=0).values,
+    }
+
+
+def _normalize_debug_prompt(prompt: str) -> str:
+    normalized = " ".join(prompt.split()).lower()
+    for prefix in ("a photo of ", "an image of ", "a picture of "):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix) :]
+            break
+    return normalized
+
+
+def _print_layout_summary(label: str, centers: torch.Tensor, sizes: torch.Tensor) -> None:
+    center_stats = _summarize_tensor(centers)
+    size_stats = _summarize_tensor(sizes)
+    print(f"  {label}")
+    print(f"    center mean:  {_short_vec(center_stats['mean'])}")
+    print(f"    center std:   {_short_vec(center_stats['std'])}")
+    print(f"    center min:   {_short_vec(center_stats['min'])}")
+    print(f"    center max:   {_short_vec(center_stats['max'])}")
+    print(f"    center range: {_short_vec(center_stats['range'])}")
+    print(f"    size mean:    {_short_vec(size_stats['mean'])}")
+    print(f"    size std:     {_short_vec(size_stats['std'])}")
+    print(f"    size min:     {_short_vec(size_stats['min'])}")
+    print(f"    size max:     {_short_vec(size_stats['max'])}")
+    print(f"    size range:   {_short_vec(size_stats['range'])}")
+
+
+def _print_delta_summary(centers: torch.Tensor) -> None:
+    if centers.shape[1] < 2:
+        return
+    delta = centers[:, 1, :] - centers[:, 0, :]
+    delta_stats = _summarize_tensor(delta)
+    print("  object1 - object0 center delta")
+    print(f"    mean:  {_short_vec(delta_stats['mean'])}")
+    print(f"    std:   {_short_vec(delta_stats['std'])}")
+    print(f"    min:   {_short_vec(delta_stats['min'])}")
+    print(f"    max:   {_short_vec(delta_stats['max'])}")
+    print(f"    range: {_short_vec(delta_stats['range'])}")
 
 
 def _load_label_embedding_cache(
@@ -175,6 +234,223 @@ def _save_label_embedding_cache(
     )
 
 
+def _rows_matching_prompt(rows: list[dict[str, object]], prompt: str, *, limit: int | None = None) -> list[dict[str, object]]:
+    expected = _normalize_debug_prompt(prompt)
+    matched = [
+        row
+        for row in rows
+        if _normalize_debug_prompt(prompt_from_scop_depth_row(row)) == expected
+    ]
+    return matched[:limit] if limit is not None else matched
+
+
+@torch.no_grad()
+def _print_training_data_spread(
+    *,
+    rows: list[dict[str, object]],
+    prompt: str,
+) -> None:
+    matched_rows = _rows_matching_prompt(rows, prompt)
+    if not matched_rows:
+        print(f"No training rows matched debug prompt: {prompt}")
+        return
+    image_sizes = [tuple(row.get("image_size") or (512, 512)) for row in matched_rows]
+    boxes, mask = bbox_minmax_3d_after_crop(
+        matched_rows,
+        image_sizes,
+        max_nodes=2,
+        device=torch.device("cpu"),
+    )
+    centers = (boxes[..., :3] + boxes[..., 3:]) * 0.5
+    centers = centers.mul(2.0).sub(1.0)
+    sizes = boxes[..., 3:] - boxes[..., :3]
+    labels = [
+        str(annot.get("category_name") or annot.get("category_id") or f"obj{index}")
+        for index, annot in enumerate(matched_rows[0].get("annots", []))
+    ]
+
+    print("")
+    print("===== DEBUG: TRAINING DATA DISTRIBUTION =====")
+    print(f"Prompt filter: {prompt}")
+    print(f"Rows: {len(matched_rows)}")
+    print("Coordinate space: model centers [-1, 1], sizes in normalized box units")
+    for object_index, label in enumerate(labels[:2]):
+        valid = mask[:, object_index]
+        _print_layout_summary(
+            label,
+            centers[valid, object_index, :],
+            sizes[valid, object_index, :],
+        )
+    valid_pair = mask[:, 0] & mask[:, 1]
+    _print_delta_summary(centers[valid_pair])
+
+
+@torch.no_grad()
+def _predict_debug_prior_sample(
+    *,
+    prompt: str,
+    tokenizer: object,
+    text_encoder: object,
+    graph_encoder: GraphSlotEncoder,
+    device: str,
+    layout_z_scale: float,
+    label_embedding_cache: dict[str, torch.Tensor] | None,
+) -> tuple[list[str], torch.Tensor, torch.Tensor]:
+    from evaluation.prompt_parser import parse_prompt_to_scene_graph
+
+    scene_graph = parse_prompt_to_scene_graph(prompt)
+    node_count = len(scene_graph["nodes"])
+    slot_targets = torch.zeros(1, node_count, 3, device=torch.device(device))
+    slot_mask = torch.ones(1, node_count, device=torch.device(device), dtype=torch.bool)
+    scene_graph_batch = build_batched_scene_graphs(
+        [scene_graph],
+        slot_targets=slot_targets,
+        slot_mask=slot_mask,
+    )
+    conditioning = build_slot_conditioning(
+        tokenizer=tokenizer,
+        text_encoder=text_encoder,
+        scene_graph_batch=scene_graph_batch,
+        graph_encoder=graph_encoder,
+        device=device,
+        layout_sample_mode="prior_sample",
+        layout_z_scale=layout_z_scale,
+        label_embedding_cache=label_embedding_cache,
+    )
+    labels = [str(node["label"]) for node in scene_graph["nodes"]]
+    centers = conditioning.slot_positions[0, :node_count].detach().cpu().to(torch.float32)
+    sizes = conditioning.slot_log_sizes_3d[0, :node_count].detach().cpu().to(torch.float32).exp()
+    return labels, centers, sizes
+
+
+@torch.no_grad()
+def _predict_debug_posterior_row(
+    *,
+    row: dict[str, object],
+    tokenizer: object,
+    text_encoder: object,
+    graph_encoder: GraphSlotEncoder,
+    device: str,
+    layout_z_scale: float,
+    label_embedding_cache: dict[str, torch.Tensor] | None,
+) -> tuple[list[str], torch.Tensor, torch.Tensor]:
+    scene_graph = scene_graph_payload_from_row(row)
+    node_count = len(scene_graph["nodes"])
+    image_size = tuple(row.get("image_size") or (512, 512))
+    box_targets, slot_mask = bbox_minmax_3d_after_crop(
+        [row],
+        [image_size],
+        max_nodes=node_count,
+        device=torch.device(device),
+    )
+    centers_01 = (box_targets[..., :3] + box_targets[..., 3:]) * 0.5
+    sizes_01 = (box_targets[..., 3:] - box_targets[..., :3]).clamp_min(0.03)
+    slot_targets = centers_01.mul(2.0).sub(1.0)
+    log_size_targets = sizes_01.log()
+    scene_graph_batch = build_batched_scene_graphs(
+        [scene_graph],
+        slot_targets=slot_targets,
+        slot_mask=slot_mask,
+        log_size_targets=log_size_targets,
+        box_targets=box_targets,
+    )
+    conditioning = build_slot_conditioning(
+        tokenizer=tokenizer,
+        text_encoder=text_encoder,
+        scene_graph_batch=scene_graph_batch,
+        graph_encoder=graph_encoder,
+        device=device,
+        layout_sample_mode="posterior",
+        layout_z_scale=layout_z_scale,
+        label_embedding_cache=label_embedding_cache,
+    )
+    labels = [str(node["label"]) for node in scene_graph["nodes"]]
+    centers = conditioning.slot_positions[0, :node_count].detach().cpu().to(torch.float32)
+    sizes = conditioning.slot_log_sizes_3d[0, :node_count].detach().cpu().to(torch.float32).exp()
+    return labels, centers, sizes
+
+
+@torch.no_grad()
+def _print_model_spread(
+    *,
+    prompt: str,
+    rows: list[dict[str, object]],
+    tokenizer: object,
+    text_encoder: object,
+    graph_encoder: GraphSlotEncoder,
+    device: str,
+    sample_count: int,
+    posterior_rows: int,
+    seed: int,
+    layout_z_scale: float,
+    label_embedding_cache: dict[str, torch.Tensor] | None,
+) -> None:
+    graph_encoder.eval()
+    all_centers: list[torch.Tensor] = []
+    all_sizes: list[torch.Tensor] = []
+    labels: list[str] | None = None
+    print("")
+    print("===== DEBUG: MODEL PRIOR SAMPLE SPREAD =====")
+    print(f"Prompt: {prompt}")
+    print(f"mode=prior_sample, samples={sample_count}, seed={seed}, z_scale={layout_z_scale}")
+    for sample_index in range(max(1, sample_count)):
+        sample_seed = int(seed) + sample_index
+        torch.manual_seed(sample_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(sample_seed)
+        labels, centers, sizes = _predict_debug_prior_sample(
+            prompt=prompt,
+            tokenizer=tokenizer,
+            text_encoder=text_encoder,
+            graph_encoder=graph_encoder,
+            device=device,
+            layout_z_scale=layout_z_scale,
+            label_embedding_cache=label_embedding_cache,
+        )
+        all_centers.append(centers)
+        all_sizes.append(sizes)
+    if labels is not None:
+        centers_tensor = torch.stack(all_centers, dim=0)
+        sizes_tensor = torch.stack(all_sizes, dim=0)
+        for object_index, label in enumerate(labels):
+            _print_layout_summary(label, centers_tensor[:, object_index, :], sizes_tensor[:, object_index, :])
+        _print_delta_summary(centers_tensor)
+
+    matched_rows = _rows_matching_prompt(rows, prompt, limit=posterior_rows)
+    if not matched_rows:
+        print(f"No posterior rows matched debug prompt: {prompt}")
+        return
+    all_centers = []
+    all_sizes = []
+    labels = None
+    print("")
+    print("===== DEBUG: MODEL POSTERIOR SPREAD =====")
+    print(f"Prompt: {prompt}")
+    print(f"mode=posterior, rows={len(matched_rows)}, seed={seed}, z_scale={layout_z_scale}")
+    for row_index, row in enumerate(matched_rows):
+        sample_seed = int(seed) + row_index * 1000
+        torch.manual_seed(sample_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(sample_seed)
+        labels, centers, sizes = _predict_debug_posterior_row(
+            row=row,
+            tokenizer=tokenizer,
+            text_encoder=text_encoder,
+            graph_encoder=graph_encoder,
+            device=device,
+            layout_z_scale=layout_z_scale,
+            label_embedding_cache=label_embedding_cache,
+        )
+        all_centers.append(centers)
+        all_sizes.append(sizes)
+    if labels is not None:
+        centers_tensor = torch.stack(all_centers, dim=0)
+        sizes_tensor = torch.stack(all_sizes, dim=0)
+        for object_index, label in enumerate(labels):
+            _print_layout_summary(label, centers_tensor[:, object_index, :], sizes_tensor[:, object_index, :])
+        _print_delta_summary(centers_tensor)
+
+
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Pretrain the SCOP-Depth graph encoder before full relation-aware diffusion training."
@@ -220,6 +496,11 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cvae-kl-warmup-steps", type=int, default=1000)
     parser.add_argument("--cvae-best-of-k", type=int, default=1)
     parser.add_argument("--cvae-free-bits", type=float, default=0.0)
+    parser.add_argument("--debug-spread-after-training", action="store_true")
+    parser.add_argument("--debug-spread-prompt", type=str, default=None)
+    parser.add_argument("--debug-spread-samples", type=int, default=256)
+    parser.add_argument("--debug-spread-posterior-rows", type=int, default=64)
+    parser.add_argument("--debug-spread-z-scale", type=float, default=1.0)
     parser.add_argument("--disable-tqdm", action="store_true")
     return parser
 
@@ -718,6 +999,31 @@ def main() -> int:
         summary += ")"
         print(summary)
     if accelerator.is_main_process:
+        if args.debug_spread_after_training:
+            debug_prompt = args.debug_spread_prompt or args.prompt_filter
+            if debug_prompt is None:
+                print("Skipping layout spread debug: set debug_spread_prompt or prompt_filter.")
+            else:
+                print("")
+                print("===== POST-TRAINING LAYOUT SPREAD DEBUG =====")
+                metadata_rows = load_metadata_rows(args.dataset_dir)
+                _print_training_data_spread(
+                    rows=metadata_rows,
+                    prompt=debug_prompt,
+                )
+                _print_model_spread(
+                    prompt=debug_prompt,
+                    rows=metadata_rows,
+                    tokenizer=tokenizer,
+                    text_encoder=text_encoder,
+                    graph_encoder=_unwrap_graph_encoder(graph_encoder, accelerator),
+                    device=device,
+                    sample_count=args.debug_spread_samples,
+                    posterior_rows=args.debug_spread_posterior_rows,
+                    seed=args.seed,
+                    layout_z_scale=args.debug_spread_z_scale,
+                    label_embedding_cache=label_embedding_cache,
+                )
         _save_state(args.output_dir, step=global_step, args=args)
         _save_label_embedding_cache(
             args.label_embedding_cache,

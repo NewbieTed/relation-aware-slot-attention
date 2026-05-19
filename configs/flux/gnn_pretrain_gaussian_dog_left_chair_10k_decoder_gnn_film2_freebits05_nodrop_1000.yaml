@@ -50,3 +50,10 @@ losses:
   cvae_kl_warmup_steps: 0
   cvae_best_of_k: 1
   cvae_free_bits: 0.5
+
+debug:
+  debug_spread_after_training: true
+  debug_spread_prompt: a dog to the left of a chair
+  debug_spread_samples: 256
+  debug_spread_posterior_rows: 64
+  debug_spread_z_scale: 1.0
