@@ -64,8 +64,11 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--empirical-weight", type=float, default=0.50)
     parser.add_argument("--original-jitter-weight", type=float, default=0.30)
     parser.add_argument("--synthetic-weight", type=float, default=0.20)
+    parser.add_argument("--gaussian-weight", type=float, default=0.0)
     parser.add_argument("--empirical-jitter", type=float, default=0.06)
     parser.add_argument("--original-center-jitter", type=float, default=0.08)
+    parser.add_argument("--gaussian-std-scale", type=float, default=1.0)
+    parser.add_argument("--gaussian-min-std", type=float, default=0.03)
     parser.add_argument("--copy-images", action="store_true")
     parser.add_argument("--num-samples", type=int, default=24)
     parser.add_argument("--max-overlap-boxes", type=int, default=200)
@@ -168,6 +171,10 @@ def category_key(row: dict[str, Any], node_index: int) -> str:
     return str(annot.get("category_id", annot.get("category_name", f"node{node_index}")))
 
 
+def category_relation_role_key(row: dict[str, Any], node_index: int, relation: str, role: str) -> str:
+    return f"{category_key(row, node_index)}|{relation}|{role}"
+
+
 def category_label(row: dict[str, Any], node_index: int) -> str:
     annot = row["annots"][node_index]
     if annot.get("category_name"):
@@ -178,9 +185,11 @@ def category_label(row: dict[str, Any], node_index: int) -> str:
 
 def collect_empirical_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
     category_stats: dict[str, dict[str, list[list[float]]]] = defaultdict(lambda: {"centers": [], "sizes": []})
+    category_relation_role_stats: dict[str, dict[str, list[list[float]]]] = defaultdict(lambda: {"centers": [], "sizes": []})
     relation_stats: dict[str, dict[str, list[list[float]]]] = defaultdict(lambda: {"deltas": []})
     relation_counts: dict[str, int] = defaultdict(int)
     category_counts: dict[str, int] = defaultdict(int)
+    category_relation_role_counts: dict[str, int] = defaultdict(int)
 
     for row in rows:
         relation_info = relation_from_row(row)
@@ -193,6 +202,11 @@ def collect_empirical_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
             category_stats[key]["centers"].append(list(box[:3]))
             category_stats[key]["sizes"].append(list(box[3:]))
             category_counts[key] += 1
+        for node_index, role in ((source_index, "source"), (target_index, "target")):
+            key = category_relation_role_key(row, node_index, relation, role)
+            category_relation_role_stats[key]["centers"].append(list(boxes[node_index][:3]))
+            category_relation_role_stats[key]["sizes"].append(list(boxes[node_index][3:]))
+            category_relation_role_counts[key] += 1
         source_center = boxes[source_index][:3]
         target_center = boxes[target_index][:3]
         relation_stats[relation]["deltas"].append([target_center[i] - source_center[i] for i in range(3)])
@@ -200,8 +214,10 @@ def collect_empirical_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
     return {
         "category_stats": category_stats,
+        "category_relation_role_stats": category_relation_role_stats,
         "relation_stats": relation_stats,
         "category_counts": dict(category_counts),
+        "category_relation_role_counts": dict(category_relation_role_counts),
         "relation_counts": dict(relation_counts),
     }
 
@@ -303,6 +319,28 @@ def sample_vector(values: list[list[float]], fallback: list[float], rng: random.
     if not values:
         return list(fallback)
     return list(rng.choice(values))
+
+
+def sample_gaussian_vector(
+    values: list[list[float]],
+    fallback: list[float],
+    rng: random.Random,
+    args: argparse.Namespace,
+    *,
+    low: float,
+    high: float,
+) -> list[float]:
+    if len(values) < 2:
+        return list(fallback)
+    dims = len(fallback)
+    sampled: list[float] = []
+    for dim in range(dims):
+        column = [float(row[dim]) for row in values]
+        mean = sum(column) / len(column)
+        variance = sum((value - mean) ** 2 for value in column) / max(1, len(column) - 1)
+        std = max(args.gaussian_min_std, math.sqrt(variance) * args.gaussian_std_scale)
+        sampled.append(max(low, min(high, rng.gauss(mean, std))))
+    return sampled
 
 
 def sample_sizes(row: dict[str, Any], stats: dict[str, Any], rng: random.Random, args: argparse.Namespace) -> list[list[float]]:
@@ -409,6 +447,60 @@ def sample_empirical_layout(
     return centers, sample_sizes(row, stats, rng, args), "empirical"
 
 
+def sample_gaussian_layout(
+    row: dict[str, Any],
+    source_index: int,
+    target_index: int,
+    relation: str,
+    rng: random.Random,
+    args: argparse.Namespace,
+    stats: dict[str, Any],
+) -> tuple[list[list[float]], list[list[float]], str]:
+    role_stats = stats["category_relation_role_stats"]
+    original = [original_box_01(row, 0), original_box_01(row, 1)]
+    centers = [list(original[0][:3]), list(original[1][:3])]
+    sizes: list[list[float]] = [list(original[0][3:]), list(original[1][3:])]
+    for node_index, role in ((source_index, "source"), (target_index, "target")):
+        key = category_relation_role_key(row, node_index, relation, role)
+        fallback = list(original[node_index][:3])
+        centers[node_index] = sample_gaussian_vector(
+            role_stats.get(key, {}).get("centers", []),
+            fallback,
+            rng,
+            args,
+            low=args.center_low,
+            high=args.center_high,
+        )
+        size_fallback = list(original[node_index][3:])
+        size_base = sample_gaussian_vector(
+            role_stats.get(key, {}).get("sizes", []),
+            size_fallback,
+            rng,
+            args,
+            low=args.min_size,
+            high=args.max_size,
+        )
+        original_aspect = max(size_fallback[0], args.min_size) / max(size_fallback[1], args.min_size)
+        sampled_aspect = max(size_base[0], args.min_size) / max(size_base[1], args.min_size)
+        if sampled_aspect / original_aspect > args.max_aspect_ratio_change:
+            size_base[1] = max(args.min_size, size_base[0] / (original_aspect * args.max_aspect_ratio_change))
+        elif original_aspect / sampled_aspect > args.max_aspect_ratio_change:
+            size_base[0] = max(args.min_size, size_base[1] * original_aspect / args.max_aspect_ratio_change)
+        sizes[node_index] = size_base
+
+    axis, _sign = relation_axis_and_sign(relation)
+    sampled_gap = abs(centers[target_index][axis] - centers[source_index][axis])
+    centers[source_index], centers[target_index] = enforce_relation_gap(
+        centers[source_index],
+        centers[target_index],
+        relation,
+        rng,
+        args,
+        preferred_gap=sampled_gap,
+    )
+    return centers, sizes, "gaussian_category_relation_role"
+
+
 def choose_layout(
     row: dict[str, Any],
     source_index: int,
@@ -419,6 +511,7 @@ def choose_layout(
     stats: dict[str, Any],
 ) -> tuple[list[list[float]], list[list[float]], str]:
     weights = [
+        ("gaussian", max(0.0, args.gaussian_weight)),
         ("empirical", max(0.0, args.empirical_weight)),
         ("original_jitter", max(0.0, args.original_jitter_weight)),
         ("synthetic", max(0.0, args.synthetic_weight)),
@@ -433,6 +526,8 @@ def choose_layout(
             mode = candidate
             break
 
+    if mode == "gaussian":
+        return sample_gaussian_layout(row, source_index, target_index, relation, rng, args, stats)
     if mode == "empirical":
         return sample_empirical_layout(row, source_index, target_index, relation, rng, args, stats)
     if mode == "original_jitter":
@@ -755,12 +850,16 @@ def main() -> int:
         "prompt_filter": args.prompt_filter,
         "augmented_rows": len(augmented_rows),
         "sampling_weights": {
+            "gaussian": args.gaussian_weight,
             "empirical": args.empirical_weight,
             "original_jitter": args.original_jitter_weight,
             "synthetic": args.synthetic_weight,
         },
         "relation_counts": stats["relation_counts"],
         "category_count": len(stats["category_counts"]),
+        "category_relation_role_count": len(stats["category_relation_role_counts"]),
+        "gaussian_std_scale": args.gaussian_std_scale,
+        "gaussian_min_std": args.gaussian_min_std,
         "failed_generation_attempts": len(failures),
         "checked_rows": checked,
         "failed_checks": failed_checks[:100],
