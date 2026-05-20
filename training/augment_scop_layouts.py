@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
+from collections import Counter, defaultdict
 import copy
 import json
 import math
@@ -69,6 +69,11 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--original-center-jitter", type=float, default=0.08)
     parser.add_argument("--gaussian-std-scale", type=float, default=1.0)
     parser.add_argument("--gaussian-min-std", type=float, default=0.03)
+    parser.add_argument("--min-prompt-count", type=int, default=5)
+    parser.add_argument("--min-pair-relation-count", type=int, default=5)
+    parser.add_argument("--min-category-relation-role-count", type=int, default=10)
+    parser.add_argument("--min-relation-role-count", type=int, default=25)
+    parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--copy-images", action="store_true")
     parser.add_argument("--num-samples", type=int, default=24)
     parser.add_argument("--max-overlap-boxes", type=int, default=200)
@@ -175,6 +180,14 @@ def category_relation_role_key(row: dict[str, Any], node_index: int, relation: s
     return f"{category_key(row, node_index)}|{relation}|{role}"
 
 
+def pair_relation_key(row: dict[str, Any], source_index: int, target_index: int, relation: str) -> str:
+    return f"{category_key(row, source_index)}|{relation}|{category_key(row, target_index)}"
+
+
+def relation_role_key(relation: str, role: str) -> str:
+    return f"{relation}|{role}"
+
+
 def category_label(row: dict[str, Any], node_index: int) -> str:
     annot = row["annots"][node_index]
     if annot.get("category_name"):
@@ -185,11 +198,17 @@ def category_label(row: dict[str, Any], node_index: int) -> str:
 
 def collect_empirical_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
     category_stats: dict[str, dict[str, list[list[float]]]] = defaultdict(lambda: {"centers": [], "sizes": []})
+    prompt_stats: dict[str, dict[str, list[list[float]]]] = defaultdict(lambda: {"node0_centers": [], "node0_sizes": [], "node1_centers": [], "node1_sizes": []})
+    pair_relation_stats: dict[str, dict[str, list[list[float]]]] = defaultdict(lambda: {"source_centers": [], "source_sizes": [], "target_centers": [], "target_sizes": []})
     category_relation_role_stats: dict[str, dict[str, list[list[float]]]] = defaultdict(lambda: {"centers": [], "sizes": []})
+    relation_role_stats: dict[str, dict[str, list[list[float]]]] = defaultdict(lambda: {"centers": [], "sizes": []})
     relation_stats: dict[str, dict[str, list[list[float]]]] = defaultdict(lambda: {"deltas": []})
+    prompt_counts: dict[str, int] = defaultdict(int)
+    pair_relation_counts: dict[str, int] = defaultdict(int)
     relation_counts: dict[str, int] = defaultdict(int)
     category_counts: dict[str, int] = defaultdict(int)
     category_relation_role_counts: dict[str, int] = defaultdict(int)
+    relation_role_counts: dict[str, int] = defaultdict(int)
 
     for row in rows:
         relation_info = relation_from_row(row)
@@ -197,16 +216,32 @@ def collect_empirical_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
             continue
         source_index, target_index, relation = relation_info
         boxes = [original_box_01(row, 0), original_box_01(row, 1)]
+        prompt_key = prompt_from_scop_depth_row(row)
+        prompt_stats[prompt_key]["node0_centers"].append(list(boxes[0][:3]))
+        prompt_stats[prompt_key]["node0_sizes"].append(list(boxes[0][3:]))
+        prompt_stats[prompt_key]["node1_centers"].append(list(boxes[1][:3]))
+        prompt_stats[prompt_key]["node1_sizes"].append(list(boxes[1][3:]))
+        prompt_counts[prompt_key] += 1
         for node_index, box in enumerate(boxes):
             key = category_key(row, node_index)
             category_stats[key]["centers"].append(list(box[:3]))
             category_stats[key]["sizes"].append(list(box[3:]))
             category_counts[key] += 1
+        pair_key = pair_relation_key(row, source_index, target_index, relation)
+        pair_relation_stats[pair_key]["source_centers"].append(list(boxes[source_index][:3]))
+        pair_relation_stats[pair_key]["source_sizes"].append(list(boxes[source_index][3:]))
+        pair_relation_stats[pair_key]["target_centers"].append(list(boxes[target_index][:3]))
+        pair_relation_stats[pair_key]["target_sizes"].append(list(boxes[target_index][3:]))
+        pair_relation_counts[pair_key] += 1
         for node_index, role in ((source_index, "source"), (target_index, "target")):
             key = category_relation_role_key(row, node_index, relation, role)
             category_relation_role_stats[key]["centers"].append(list(boxes[node_index][:3]))
             category_relation_role_stats[key]["sizes"].append(list(boxes[node_index][3:]))
             category_relation_role_counts[key] += 1
+            rel_role_key = relation_role_key(relation, role)
+            relation_role_stats[rel_role_key]["centers"].append(list(boxes[node_index][:3]))
+            relation_role_stats[rel_role_key]["sizes"].append(list(boxes[node_index][3:]))
+            relation_role_counts[rel_role_key] += 1
         source_center = boxes[source_index][:3]
         target_center = boxes[target_index][:3]
         relation_stats[relation]["deltas"].append([target_center[i] - source_center[i] for i in range(3)])
@@ -214,10 +249,16 @@ def collect_empirical_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
     return {
         "category_stats": category_stats,
+        "prompt_stats": prompt_stats,
+        "pair_relation_stats": pair_relation_stats,
         "category_relation_role_stats": category_relation_role_stats,
+        "relation_role_stats": relation_role_stats,
         "relation_stats": relation_stats,
+        "prompt_counts": dict(prompt_counts),
+        "pair_relation_counts": dict(pair_relation_counts),
         "category_counts": dict(category_counts),
         "category_relation_role_counts": dict(category_relation_role_counts),
+        "relation_role_counts": dict(relation_role_counts),
         "relation_counts": dict(relation_counts),
     }
 
@@ -456,24 +497,14 @@ def sample_gaussian_layout(
     args: argparse.Namespace,
     stats: dict[str, Any],
 ) -> tuple[list[list[float]], list[list[float]], str]:
-    role_stats = stats["category_relation_role_stats"]
     original = [original_box_01(row, 0), original_box_01(row, 1)]
     centers = [list(original[0][:3]), list(original[1][:3])]
     sizes: list[list[float]] = [list(original[0][3:]), list(original[1][3:])]
-    for node_index, role in ((source_index, "source"), (target_index, "target")):
-        key = category_relation_role_key(row, node_index, relation, role)
-        fallback = list(original[node_index][:3])
-        centers[node_index] = sample_gaussian_vector(
-            role_stats.get(key, {}).get("centers", []),
-            fallback,
-            rng,
-            args,
-            low=args.center_low,
-            high=args.center_high,
-        )
+
+    def normalized_size(node_index: int, values: list[list[float]]) -> list[float]:
         size_fallback = list(original[node_index][3:])
         size_base = sample_gaussian_vector(
-            role_stats.get(key, {}).get("sizes", []),
+            values,
             size_fallback,
             rng,
             args,
@@ -486,7 +517,64 @@ def sample_gaussian_layout(
             size_base[1] = max(args.min_size, size_base[0] / (original_aspect * args.max_aspect_ratio_change))
         elif original_aspect / sampled_aspect > args.max_aspect_ratio_change:
             size_base[0] = max(args.min_size, size_base[1] * original_aspect / args.max_aspect_ratio_change)
-        sizes[node_index] = size_base
+        return size_base
+
+    prompt_key = prompt_from_scop_depth_row(row)
+    pair_key = pair_relation_key(row, source_index, target_index, relation)
+    sample_mode = "gaussian_original_fallback"
+
+    if stats["prompt_counts"].get(prompt_key, 0) >= args.min_prompt_count:
+        prompt_bucket = stats["prompt_stats"][prompt_key]
+        for node_index in range(2):
+            centers[node_index] = sample_gaussian_vector(
+                prompt_bucket[f"node{node_index}_centers"],
+                list(original[node_index][:3]),
+                rng,
+                args,
+                low=args.center_low,
+                high=args.center_high,
+            )
+            sizes[node_index] = normalized_size(node_index, prompt_bucket[f"node{node_index}_sizes"])
+        sample_mode = "gaussian_prompt"
+    elif stats["pair_relation_counts"].get(pair_key, 0) >= args.min_pair_relation_count:
+        pair_bucket = stats["pair_relation_stats"][pair_key]
+        for node_index, role in ((source_index, "source"), (target_index, "target")):
+            centers[node_index] = sample_gaussian_vector(
+                pair_bucket[f"{role}_centers"],
+                list(original[node_index][:3]),
+                rng,
+                args,
+                low=args.center_low,
+                high=args.center_high,
+            )
+            sizes[node_index] = normalized_size(node_index, pair_bucket[f"{role}_sizes"])
+        sample_mode = "gaussian_pair_relation"
+    else:
+        for node_index, role in ((source_index, "source"), (target_index, "target")):
+            role_key = category_relation_role_key(row, node_index, relation, role)
+            relation_key = relation_role_key(relation, role)
+            if stats["category_relation_role_counts"].get(role_key, 0) >= args.min_category_relation_role_count:
+                bucket = stats["category_relation_role_stats"][role_key]
+                sample_mode = "gaussian_category_relation_role"
+            elif stats["relation_role_counts"].get(relation_key, 0) >= args.min_relation_role_count:
+                bucket = stats["relation_role_stats"][relation_key]
+                sample_mode = "gaussian_relation_role" if sample_mode == "gaussian_original_fallback" else f"{sample_mode}+relation_role"
+            else:
+                category_bucket = stats["category_stats"].get(category_key(row, node_index), {})
+                bucket = {
+                    "centers": category_bucket.get("centers", []),
+                    "sizes": category_bucket.get("sizes", []),
+                }
+                sample_mode = "gaussian_category" if sample_mode == "gaussian_original_fallback" else f"{sample_mode}+category"
+            centers[node_index] = sample_gaussian_vector(
+                bucket.get("centers", []),
+                list(original[node_index][:3]),
+                rng,
+                args,
+                low=args.center_low,
+                high=args.center_high,
+            )
+            sizes[node_index] = normalized_size(node_index, bucket.get("sizes", []))
 
     axis, _sign = relation_axis_and_sign(relation)
     sampled_gap = abs(centers[target_index][axis] - centers[source_index][axis])
@@ -498,7 +586,7 @@ def sample_gaussian_layout(
         args,
         preferred_gap=sampled_gap,
     )
-    return centers, sizes, "gaussian_category_relation_role"
+    return centers, sizes, sample_mode
 
 
 def choose_layout(
@@ -680,6 +768,45 @@ def prompt_matches(row: dict[str, Any], *, prompt_filter: str | None) -> bool:
     return actual == expected
 
 
+def gaussian_backoff_mode(row: dict[str, Any], args: argparse.Namespace, stats: dict[str, Any]) -> str:
+    relation_info = relation_from_row(row)
+    if relation_info is None:
+        return "missing_relation"
+    source_index, target_index, relation = relation_info
+    prompt_key = prompt_from_scop_depth_row(row)
+    pair_key = pair_relation_key(row, source_index, target_index, relation)
+    if stats["prompt_counts"].get(prompt_key, 0) >= args.min_prompt_count:
+        return "gaussian_prompt"
+    if stats["pair_relation_counts"].get(pair_key, 0) >= args.min_pair_relation_count:
+        return "gaussian_pair_relation"
+    role_modes = []
+    for node_index, role in ((source_index, "source"), (target_index, "target")):
+        role_key = category_relation_role_key(row, node_index, relation, role)
+        relation_key = relation_role_key(relation, role)
+        if stats["category_relation_role_counts"].get(role_key, 0) >= args.min_category_relation_role_count:
+            role_modes.append("category_relation_role")
+        elif stats["relation_role_counts"].get(relation_key, 0) >= args.min_relation_role_count:
+            role_modes.append("relation_role")
+        elif len(stats["category_stats"].get(category_key(row, node_index), {}).get("centers", [])) >= 2:
+            role_modes.append("category")
+        else:
+            role_modes.append("original")
+    if role_modes[0] == role_modes[1]:
+        return f"gaussian_{role_modes[0]}"
+    return "gaussian_mixed_" + "_".join(role_modes)
+
+
+def prompt_frequency_report(rows: list[dict[str, Any]]) -> dict[str, int]:
+    counts = Counter(prompt_from_scop_depth_row(row) for row in rows)
+    return {
+        "unique_prompts": len(counts),
+        "singleton_prompts": sum(1 for count in counts.values() if count == 1),
+        "singleton_rows": sum(count for count in counts.values() if count == 1),
+        "multirow_prompts": sum(1 for count in counts.values() if count >= 2),
+        "multirow_rows": sum(count for count in counts.values() if count >= 2),
+    }
+
+
 def link_or_copy_image(input_dir: Path, output_dir: Path, file_name: str, *, copy_images: bool) -> None:
     source = input_dir / file_name
     target = output_dir / file_name
@@ -770,6 +897,9 @@ def main() -> int:
             stats_rows.append(canonical_row)
         maybe_print_progress("Collecting stats rows", raw_index, len(all_rows), args.progress_every)
     stats = collect_empirical_stats(stats_rows)
+    usable_prompt_report = prompt_frequency_report(rows)
+    stats_prompt_report = prompt_frequency_report(stats_rows)
+    gaussian_backoff_counts = Counter(gaussian_backoff_mode(row, args, stats) for row in rows)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     augmented_rows: list[dict[str, Any]] = []
@@ -781,20 +911,36 @@ def main() -> int:
             attempts += 1
             row_index = rng.randrange(len(rows))
             row = rows[row_index]
-            link_or_copy_image(args.input_dir, args.output_dir, row["file_name"], copy_images=args.copy_images)
+            if not args.dry_run:
+                link_or_copy_image(args.input_dir, args.output_dir, row["file_name"], copy_images=args.copy_images)
             new_row = augment_row(row, rng, args, len(augmented_rows), stats)
             if new_row is None:
-                failures.append({"row_index": row_index, "seq": row.get("seq")})
+                failures.append(
+                    {
+                        "row_index": row_index,
+                        "seq": row.get("seq"),
+                        "prompt": prompt_from_scop_depth_row(row),
+                        "gaussian_backoff_mode": gaussian_backoff_mode(row, args, stats),
+                    }
+                )
                 continue
             augmented_rows.append(new_row)
             maybe_print_progress("Augmenting target rows", len(augmented_rows), args.target_augmented_rows, args.progress_every)
     else:
         for row_index, row in enumerate(rows):
-            link_or_copy_image(args.input_dir, args.output_dir, row["file_name"], copy_images=args.copy_images)
+            if not args.dry_run:
+                link_or_copy_image(args.input_dir, args.output_dir, row["file_name"], copy_images=args.copy_images)
             for variant_index in range(args.variants_per_row):
                 new_row = augment_row(row, rng, args, variant_index, stats)
                 if new_row is None:
-                    failures.append({"row_index": row_index, "seq": row.get("seq")})
+                    failures.append(
+                        {
+                            "row_index": row_index,
+                            "seq": row.get("seq"),
+                            "prompt": prompt_from_scop_depth_row(row),
+                            "gaussian_backoff_mode": gaussian_backoff_mode(row, args, stats),
+                        }
+                    )
                     continue
                 augmented_rows.append(new_row)
             maybe_print_progress("Augmenting usable rows", row_index + 1, len(rows), args.progress_every)
@@ -807,7 +953,8 @@ def main() -> int:
             f"created={len(augmented_rows)}, target={args.target_augmented_rows}, "
             f"failures={len(failures)}"
         )
-    dump_rows(args.output_dir / "metadata.jsonl", augmented_rows)
+    if not args.dry_run:
+        dump_rows(args.output_dir / "metadata.jsonl", augmented_rows)
 
     checked = 0
     failed_checks = []
@@ -822,29 +969,38 @@ def main() -> int:
         checked += 1
         maybe_print_progress("Checking augmented rows", row_index + 1, len(augmented_rows), args.progress_every)
 
-    sample_dir = args.output_dir / "samples"
-    for sample_index, row in enumerate(rng.sample(augmented_rows, min(args.num_samples, len(augmented_rows)))):
-        draw_sample(row, args.output_dir, sample_dir / f"sample_{sample_index:03d}.jpg")
+    if not args.dry_run:
+        sample_dir = args.output_dir / "samples"
+        for sample_index, row in enumerate(rng.sample(augmented_rows, min(args.num_samples, len(augmented_rows)))):
+            draw_sample(row, args.output_dir, sample_dir / f"sample_{sample_index:03d}.jpg")
 
     rows_by_file: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in augmented_rows:
         rows_by_file[row["file_name"]].append(row)
-    overlap_dir = args.output_dir / "samples_overlap"
-    overlap_items = list(rows_by_file.items())
-    for sample_index, (_, rows_for_file) in enumerate(rng.sample(overlap_items, min(args.num_samples, len(overlap_items)))):
-        draw_overlap_sample(
-            rows_for_file,
-            args.output_dir,
-            overlap_dir / f"overlap_{sample_index:03d}.jpg",
-            max_boxes=args.max_overlap_boxes,
-        )
+    if not args.dry_run:
+        overlap_dir = args.output_dir / "samples_overlap"
+        overlap_items = list(rows_by_file.items())
+        for sample_index, (_, rows_for_file) in enumerate(rng.sample(overlap_items, min(args.num_samples, len(overlap_items)))):
+            draw_overlap_sample(
+                rows_for_file,
+                args.output_dir,
+                overlap_dir / f"overlap_{sample_index:03d}.jpg",
+                max_boxes=args.max_overlap_boxes,
+            )
+
+    sample_mode_counts = Counter(
+        row.get("augmented_layout", {}).get("sample_mode", "unknown") for row in augmented_rows
+    )
 
     report = {
         "input_dir": str(args.input_dir),
         "output_dir": str(args.output_dir),
+        "dry_run": args.dry_run,
         "source_rows_total": len(all_rows),
         "usable_input_rows": len(rows),
+        "usable_prompt_report": usable_prompt_report,
         "stats_rows": len(stats_rows),
+        "stats_prompt_report": stats_prompt_report,
         "variants_per_row": args.variants_per_row,
         "target_augmented_rows": args.target_augmented_rows,
         "prompt_filter": args.prompt_filter,
@@ -857,16 +1013,30 @@ def main() -> int:
         },
         "relation_counts": stats["relation_counts"],
         "category_count": len(stats["category_counts"]),
+        "prompt_count": len(stats["prompt_counts"]),
+        "pair_relation_count": len(stats["pair_relation_counts"]),
         "category_relation_role_count": len(stats["category_relation_role_counts"]),
+        "relation_role_count": len(stats["relation_role_counts"]),
+        "gaussian_backoff_counts_for_usable_rows": dict(gaussian_backoff_counts),
+        "sample_mode_counts": dict(sample_mode_counts),
+        "min_bucket_counts": {
+            "prompt": args.min_prompt_count,
+            "pair_relation": args.min_pair_relation_count,
+            "category_relation_role": args.min_category_relation_role_count,
+            "relation_role": args.min_relation_role_count,
+        },
         "gaussian_std_scale": args.gaussian_std_scale,
         "gaussian_min_std": args.gaussian_min_std,
         "failed_generation_attempts": len(failures),
+        "failure_mode_counts": dict(Counter(failure.get("gaussian_backoff_mode", "unknown") for failure in failures)),
+        "failures": failures[:100],
         "checked_rows": checked,
         "failed_checks": failed_checks[:100],
         "failed_check_count": len(failed_checks),
         "copy_images": args.copy_images,
     }
-    (args.output_dir / "augmentation_report.json").write_text(json.dumps(report, indent=2))
+    report_name = "augmentation_dry_run_report.json" if args.dry_run else "augmentation_report.json"
+    (args.output_dir / report_name).write_text(json.dumps(report, indent=2))
     print(json.dumps(report, indent=2))
     return 0 if not failed_checks else 1
 
