@@ -13,6 +13,9 @@ architecture:
   summaries across many stochastic layout samples.
 - `evaluation.debug_dataset_layout_spread`: print the same compact spread
   summary for target boxes stored in a SCOP-style `metadata.jsonl` folder.
+- `evaluation.evaluate_layout_models`: compare layout predictors directly on
+  held-out SCOP-Depth metadata with relation accuracy, box L1, 2D/3D IoU,
+  out-of-bounds/overlap rates, best-of-K reference metrics, and valid diversity.
 - `evaluation.visualize_gnn_layout`: visualize predicted GNN centers and box regions.
 - `evaluation.t2i_compbench`: score an existing generated samples directory with
   a prepared T2I-CompBench checkout.
@@ -54,6 +57,23 @@ python3 -m evaluation.debug_gnn_prompt \
   --layout-sample-mode prior_sample \
   --seed 42
 ```
+
+Example layout-module evaluation:
+
+```bash
+python3 -m evaluation.evaluate_layout_models \
+  --config configs/flux/eval/layout/layout_eval_base_cvae_ablation.yaml
+```
+
+The layout evaluator intentionally treats GT box L1/IoU as reference metrics,
+not as the whole definition of success. For stochastic CVAE methods, it also
+reports best-of-K and nearest same-prompt reference scores, plus diversity only
+among samples that still satisfy the requested relation.
+
+For depth/occlusion relations (`in_front_of`, `behind`, `hidden_by`), `rel_acc`
+requires both the correct z-order and projected 2D box overlap. The legacy
+order-only check is still written as `rel_order_acc`, which helps diagnose
+models that learn depth ordering without learning visual occlusion.
 
 Example scoring of an already generated T2I-CompBench directory:
 
