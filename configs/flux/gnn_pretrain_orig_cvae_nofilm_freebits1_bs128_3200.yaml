@@ -1,6 +1,6 @@
 paths:
-  dataset_dir: /local1/cse_481_m_l/relation-aware-slot-attention/data/scop_depth_crops_depth_gaussian_dog_left_chair_10k
-  output_dir: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/train/graph_pretrain_gaussian_dog_left_chair_10k_decoder_mlp_film1_freebits2_nodrop_1000
+  dataset_dir: /local1/cse_481_m_l/relation-aware-slot-attention/data/scop_depth_crops_depth
+  output_dir: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/train/graph_pretrain_orig_cvae_nofilm_freebits1_bs128_3200
   label_embedding_cache: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/cache/gnn_label_embeddings_flux1dev_t5.pt
 
 model:
@@ -12,17 +12,17 @@ model:
   layout_mode: triple_cvae
   latent_dim: 32
   decoder_node_dropout: 0.0
-  decoder_mode: mlp
+  decoder_mode: triple_gnn
   decoder_box_residual: false
   decoder_box_residual_scale: 0.25
-  decoder_film_scale: 1.0
+  decoder_film_scale: 0.0
   use_scene_latent: true
 
 runtime:
   device: cuda
   mixed_precision: bf16
   num_workers: 0
-  seed: 42
+  seed: 44
   disable_tqdm: false
 
 data:
@@ -34,10 +34,10 @@ data:
 
 training:
   graph_learning_rate: 1.0e-4
-  max_train_steps: 1000
-  save_every: 250
-  log_every: 25
-  eval_every: 250
+  max_train_steps: 3200
+  save_every: 800
+  log_every: 50
+  eval_every: 800
 
 losses:
   position_loss_weight: 0.0
@@ -49,7 +49,7 @@ losses:
   cvae_kl_weight: 0.1
   cvae_kl_warmup_steps: 0
   cvae_best_of_k: 1
-  cvae_free_bits: 2.0
+  cvae_free_bits: 1.0
 
 debug:
   debug_spread_after_training: true

@@ -1,6 +1,6 @@
 paths:
-  dataset_dir: /local1/cse_481_m_l/relation-aware-slot-attention/data/scop_depth_crops_depth_gaussian_dog_left_chair_10k
-  output_dir: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/train/graph_pretrain_gaussian_dog_left_chair_10k_decoder_gnn_film0_freebits05_nodrop_1000
+  dataset_dir: /local1/cse_481_m_l/relation-aware-slot-attention/data/scop_depth_crops_depth
+  output_dir: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/train/graph_pretrain_orig_cvae_nofilm_nofreebits_bs128_3200
   label_embedding_cache: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/cache/gnn_label_embeddings_flux1dev_t5.pt
 
 model:
@@ -34,10 +34,10 @@ data:
 
 training:
   graph_learning_rate: 1.0e-4
-  max_train_steps: 1000
-  save_every: 250
-  log_every: 25
-  eval_every: 250
+  max_train_steps: 3200
+  save_every: 800
+  log_every: 50
+  eval_every: 800
 
 losses:
   position_loss_weight: 0.0
@@ -49,7 +49,7 @@ losses:
   cvae_kl_weight: 0.1
   cvae_kl_warmup_steps: 0
   cvae_best_of_k: 1
-  cvae_free_bits: 0.5
+  cvae_free_bits: 0.0
 
 debug:
   debug_spread_after_training: true
