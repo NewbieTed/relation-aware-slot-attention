@@ -30,7 +30,7 @@ methods:
 
   - name: deterministic_gnn_t5
     type: graph_checkpoint
-    checkpoint: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/train/graph_pretrain_flux_3dbox_deterministic_t5_b128_600/final/graph_encoder.pt
+    checkpoint: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/train/final_models/graph_pretrain_flux_3dbox_deterministic_t5_b128_600/final/graph_encoder.pt
     layout_sample_mode: prior_mean
     num_samples: 1
 
