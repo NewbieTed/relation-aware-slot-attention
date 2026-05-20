@@ -47,6 +47,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--variants-per-row", type=int, default=4)
+    parser.add_argument("--variants-per-prompt", type=int, default=None)
     parser.add_argument("--target-augmented-rows", type=int, default=None)
     parser.add_argument("--limit-rows", type=int, default=None)
     parser.add_argument("--prompt-filter", type=str, default=None)
@@ -807,6 +808,20 @@ def prompt_frequency_report(rows: list[dict[str, Any]]) -> dict[str, int]:
     }
 
 
+def rows_grouped_by_prompt(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[prompt_from_scop_depth_row(row)].append(row)
+    return dict(grouped)
+
+
+def indexed_rows_grouped_by_prompt(rows: list[dict[str, Any]]) -> dict[str, list[tuple[int, dict[str, Any]]]]:
+    grouped: dict[str, list[tuple[int, dict[str, Any]]]] = defaultdict(list)
+    for row_index, row in enumerate(rows):
+        grouped[prompt_from_scop_depth_row(row)].append((row_index, row))
+    return dict(grouped)
+
+
 def link_or_copy_image(input_dir: Path, output_dir: Path, file_name: str, *, copy_images: bool) -> None:
     source = input_dir / file_name
     target = output_dir / file_name
@@ -878,6 +893,12 @@ def draw_overlap_sample(rows: list[dict[str, Any]], dataset_dir: Path, output_pa
 
 def main() -> int:
     args = make_parser().parse_args()
+    active_generation_modes = sum(
+        value is not None
+        for value in (args.target_augmented_rows, args.variants_per_prompt)
+    )
+    if active_generation_modes > 1:
+        raise ValueError("Use only one of --target-augmented-rows or --variants-per-prompt.")
     rng = random.Random(args.seed)
     all_rows = load_rows(args.input_dir / "metadata.jsonl")
     rows: list[dict[str, Any]] = []
@@ -904,7 +925,47 @@ def main() -> int:
 
     augmented_rows: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
-    if args.target_augmented_rows is not None:
+    if args.variants_per_prompt is not None:
+        rows_by_prompt = indexed_rows_grouped_by_prompt(rows)
+        prompt_items = sorted(rows_by_prompt.items())
+        total_target = len(prompt_items) * args.variants_per_prompt
+        for prompt_index, (prompt, prompt_rows) in enumerate(prompt_items):
+            created_for_prompt = 0
+            attempts_for_prompt = 0
+            max_attempts = max(args.variants_per_prompt * 20, args.variants_per_prompt + 100)
+            while created_for_prompt < args.variants_per_prompt and attempts_for_prompt < max_attempts:
+                attempts_for_prompt += 1
+                row_index, row = rng.choice(prompt_rows)
+                if not args.dry_run:
+                    link_or_copy_image(args.input_dir, args.output_dir, row["file_name"], copy_images=args.copy_images)
+                new_row = augment_row(row, rng, args, created_for_prompt, stats)
+                if new_row is None:
+                    failures.append(
+                        {
+                            "row_index": row_index,
+                            "seq": row.get("seq"),
+                            "prompt": prompt,
+                            "gaussian_backoff_mode": gaussian_backoff_mode(row, args, stats),
+                        }
+                    )
+                    continue
+                new_row["augmented_layout"]["prompt_variant_index"] = created_for_prompt
+                new_row["augmented_layout"]["prompt_source_row_count"] = len(prompt_rows)
+                augmented_rows.append(new_row)
+                created_for_prompt += 1
+                maybe_print_progress("Augmenting prompt-balanced rows", len(augmented_rows), total_target, args.progress_every)
+            if created_for_prompt < args.variants_per_prompt:
+                failures.append(
+                    {
+                        "prompt": prompt,
+                        "reason": "prompt_target_not_met",
+                        "created": created_for_prompt,
+                        "target": args.variants_per_prompt,
+                        "source_row_count": len(prompt_rows),
+                    }
+                )
+            maybe_print_progress("Augmenting unique prompts", prompt_index + 1, len(prompt_items), args.progress_every)
+    elif args.target_augmented_rows is not None:
         attempts = 0
         max_attempts = max(args.target_augmented_rows * 20, args.target_augmented_rows + 1000)
         while len(augmented_rows) < args.target_augmented_rows and attempts < max_attempts:
@@ -1002,6 +1063,7 @@ def main() -> int:
         "stats_rows": len(stats_rows),
         "stats_prompt_report": stats_prompt_report,
         "variants_per_row": args.variants_per_row,
+        "variants_per_prompt": args.variants_per_prompt,
         "target_augmented_rows": args.target_augmented_rows,
         "prompt_filter": args.prompt_filter,
         "augmented_rows": len(augmented_rows),
