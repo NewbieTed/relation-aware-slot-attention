@@ -68,10 +68,12 @@ class SCOPDepthTextToImageDataset(Dataset[TrainingItem]):
         shuffle_rows: bool = False,
         seed: int = 42,
         rows: list[dict[str, Any]] | None = None,
+        load_images: bool = True,
     ) -> None:
         self.dataset_dir = Path(dataset_dir)
         self.image_size = image_size
         self.prompt_prefix = prompt_prefix
+        self.load_images = load_images
 
         if rows is None:
             rows = load_metadata_rows(self.dataset_dir)
@@ -90,22 +92,27 @@ class SCOPDepthTextToImageDataset(Dataset[TrainingItem]):
 
     def __getitem__(self, index: int) -> TrainingItem:
         row = self.rows[index]
-        image_path = self.dataset_dir / row["file_name"]
-        if not image_path.exists():
-            raise FileNotFoundError(
-                "Missing SCOP-Depth image file: "
-                f"{image_path}. "
-                "If metadata.jsonl exists but images were deleted or never materialized, "
-                "rebuild the subset with "
-                "`python -m training.materialize_images --dataset-dir <scop_depth_dir> "
-                "--coco-root <coco_root>`."
-            )
-        image = Image.open(image_path).convert("RGB")
-        original_image_size = image.size
-        image = _center_crop_to_square(image, self.image_size)
+        if self.load_images:
+            image_path = self.dataset_dir / row["file_name"]
+            if not image_path.exists():
+                raise FileNotFoundError(
+                    "Missing SCOP-Depth image file: "
+                    f"{image_path}. "
+                    "If metadata.jsonl exists but images were deleted or never materialized, "
+                    "rebuild the subset with "
+                    "`python -m training.materialize_images --dataset-dir <scop_depth_dir> "
+                    "--coco-root <coco_root>`."
+                )
+            image = Image.open(image_path).convert("RGB")
+            original_image_size = image.size
+            image = _center_crop_to_square(image, self.image_size)
+            pixel_values = _image_to_tensor(image)
+        else:
+            original_image_size = tuple(row.get("image_size") or (self.image_size, self.image_size))
+            pixel_values = torch.empty(0)
 
         return TrainingItem(
-            pixel_values=_image_to_tensor(image),
+            pixel_values=pixel_values,
             prompt=prompt_from_scop_depth_row(row, prefix=self.prompt_prefix),
             scene_graph=scene_graph_payload_from_row(row),
             metadata=row,
@@ -114,8 +121,12 @@ class SCOPDepthTextToImageDataset(Dataset[TrainingItem]):
 
 
 def collate_training_items(items: list[TrainingItem]) -> dict[str, Any]:
+    if all(item.pixel_values.numel() == 0 for item in items):
+        pixel_values = torch.empty(0)
+    else:
+        pixel_values = torch.stack([item.pixel_values for item in items]).contiguous()
     return {
-        "pixel_values": torch.stack([item.pixel_values for item in items]).contiguous(),
+        "pixel_values": pixel_values,
         "prompts": [item.prompt for item in items],
         "scene_graphs": [item.scene_graph for item in items],
         "metadata": [item.metadata for item in items],
@@ -166,9 +177,19 @@ def build_dataset_splits(
     seed: int = 42,
     eval_fraction: float = 0.1,
     test_fraction: float = 0.1,
+    load_images: bool = True,
+    prompt_filter: str | None = None,
 ) -> dict[str, SCOPDepthTextToImageDataset]:
     dataset_path = Path(dataset_dir)
     rows = load_metadata_rows(dataset_path)
+    if prompt_filter:
+        normalized_filter = " ".join(prompt_filter.split()).lower()
+        rows = [
+            row
+            for row in rows
+            if " ".join(prompt_from_scop_depth_row(row, prefix=prompt_prefix).split()).lower()
+            == normalized_filter
+        ]
     rng = random.Random(seed)
     rng.shuffle(rows)
     if limit_rows is not None:
@@ -192,17 +213,20 @@ def build_dataset_splits(
             image_size=image_size,
             prompt_prefix=prompt_prefix,
             rows=train_rows,
+            load_images=load_images,
         ),
         "eval": SCOPDepthTextToImageDataset(
             dataset_path,
             image_size=image_size,
             prompt_prefix=prompt_prefix,
             rows=eval_rows,
+            load_images=load_images,
         ),
         "test": SCOPDepthTextToImageDataset(
             dataset_path,
             image_size=image_size,
             prompt_prefix=prompt_prefix,
             rows=test_rows,
+            load_images=load_images,
         ),
     }

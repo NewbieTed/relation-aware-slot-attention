@@ -6,24 +6,71 @@ run inference with the released SeeThrough3D FLUX LoRA.
 
 ## Files
 
-- `gnn_pretrain_3dbox.yaml`: trains the GNN on SCOP-Depth 3D layout targets.
-- `eval_official_seethrough3d_spatial_1p_bf16_512.yaml`: one-prompt smoke eval.
-- `eval_official_seethrough3d_spatial_20p_bf16_512.yaml`: short benchmark sanity check.
-- `eval_official_seethrough3d_spatial_full_bf16_8bit_512.yaml`: full spatial benchmark run.
+Training configs live directly in `configs/flux/`. Evaluation configs are split
+by purpose:
+
+- `eval/smoke/`: tiny 3-prompt, 1-image runs for checking that generation and
+  scoring still work before starting expensive jobs.
+- `eval/full/`: final 512px, 5-images-per-prompt benchmark configs for the
+  paper comparison.
+- `eval/official/`: longer SeeThrough3D/FLUX benchmark configs used for actual
+  reporting.
+
+- `gnn_pretrain_3dbox_triple_cvae_3dsln.yaml`: active GNN training config. It
+  uses FLUX T5 object-label embeddings, 5 graph layers, L1 min/max box
+  reconstruction, scene/object CVAE latents, KL weight `0.1`, and a persistent
+  label-embedding cache under `outputs/cache`.
+- `gnn_pretrain_3dbox_triple_cvae_3dsln_dropout02_rel1_box02.yaml`: CVAE
+  follow-up config for layout diversity. It keeps decoder node dropout at
+  `0.2`, lowers exact 3D box reconstruction to `0.2`, and adds relation loss
+  weight `1.0` so sampled boxes can move while preserving spatial relations.
+- `gnn_pretrain_3dbox_triple_cvae_3dsln_residual_dropout02_rel1_box02_1500.yaml`:
+  short architecture-search run that adds a latent-conditioned residual box
+  delta on top of the decoder's base box prediction. It uses the same loss
+  balance as `dropout02_rel1_box02`, but only trains for `1500` steps.
+- `gnn_pretrain_3dbox_deterministic_clip.yaml`: deterministic 3D box GNN
+  recovery config using FLUX CLIP label embeddings. This is the closest config
+  to the earlier deterministic GNN path: 2 graph layers, 600 steps, center loss,
+  relation loss, and 3D size loss.
+- `gnn_pretrain_3dbox_deterministic_t5.yaml`: deterministic 3D box GNN with the
+  same losses and schedule as the CLIP version, but using FLUX T5 label
+  embeddings so we can compare the text encoder effect directly.
+- `eval/official/eval_official_seethrough3d_spatial_1p_bf16_512.yaml`: one-prompt smoke eval.
+- `eval/official/eval_official_seethrough3d_spatial_20p_bf16_512.yaml`: short benchmark sanity check.
+- `eval/official/eval_official_seethrough3d_spatial_full_bf16_8bit_512.yaml`: full spatial benchmark run.
 
 ## Examples
 
-Train the GNN:
+Train the active 3D_SLN-aligned triple-GNN CVAE:
 
 ```bash
+python3 -m training.precompute_graph_label_cache \
+  --config configs/flux/gnn_pretrain_3dbox_triple_cvae_3dsln.yaml
+
 python3 -m training.pretrain_graph_encoder \
-  --config configs/flux/gnn_pretrain_3dbox.yaml
+  --config configs/flux/gnn_pretrain_3dbox_triple_cvae_3dsln.yaml
+```
+
+Train deterministic CLIP/T5 comparison models:
+
+```bash
+python3 -m training.precompute_graph_label_cache \
+  --config configs/flux/gnn_pretrain_3dbox_deterministic_clip.yaml
+
+python3 -m training.precompute_graph_label_cache \
+  --config configs/flux/gnn_pretrain_3dbox_deterministic_t5.yaml
+
+python3 -m training.pretrain_graph_encoder \
+  --config configs/flux/gnn_pretrain_3dbox_deterministic_clip.yaml
+
+python3 -m training.pretrain_graph_encoder \
+  --config configs/flux/gnn_pretrain_3dbox_deterministic_t5.yaml
 ```
 
 Run the one-prompt SeeThrough3D smoke benchmark:
 
 ```bash
-CONFIG_FILE=configs/flux/eval_official_seethrough3d_spatial_1p_bf16_512.yaml \
+CONFIG_FILE=configs/flux/eval/official/eval_official_seethrough3d_spatial_1p_bf16_512.yaml \
 bash scripts/benchmark/run_flux_relation_t2icompbench.sh
 ```
 
