@@ -74,6 +74,8 @@ For depth/occlusion relations (`in_front_of`, `behind`, `hidden_by`), `rel_acc`
 requires both the correct z-order and projected 2D box overlap. The legacy
 order-only check is still written as `rel_order_acc`, which helps diagnose
 models that learn depth ordering without learning visual occlusion.
+The compact paper table also splits relation accuracy into `2D Rel Acc` for
+left/right/above/below/on/next-to and `3D Rel Acc` for front/behind/hidden-by.
 
 Example scoring of an already generated T2I-CompBench directory:
 

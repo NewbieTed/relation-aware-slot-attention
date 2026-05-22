@@ -43,6 +43,8 @@ RELATION_NAMES = (
 )
 
 OCCLUSION_RELATIONS = {"in_front_of", "behind", "hidden_by"}
+RELATION_2D = {"left_of", "right_of", "above", "below", "on", "next_to"}
+RELATION_3D = OCCLUSION_RELATIONS
 DEFAULT_OCCLUSION_OVERLAP_THRESHOLD = 0.2
 
 
@@ -230,8 +232,12 @@ def relation_metrics(
     if not triplets:
         return {
             "rel_acc": math.nan,
+            "rel_2d_acc": math.nan,
+            "rel_3d_acc": math.nan,
             "rel_margin_acc": math.nan,
             "rel_order_acc": math.nan,
+            "rel_2d_order_acc": math.nan,
+            "rel_3d_order_acc": math.nan,
             "rel_order_margin_acc": math.nan,
             "rel_violation": 0.0,
             "rel_margin_violation": 0.0,
@@ -239,8 +245,12 @@ def relation_metrics(
             "occlusion_overlap_iomin": math.nan,
         }
     sign_ok = []
+    sign_2d_ok = []
+    sign_3d_ok = []
     margin_ok = []
     order_ok = []
+    order_2d_ok = []
+    order_3d_ok = []
     order_margin_ok = []
     violations = []
     margin_violations = []
@@ -260,14 +270,26 @@ def relation_metrics(
             occlusion_overlaps.append(overlap)
         order_ok.append(pair_order_ok)
         order_margin_ok.append(pair_order_margin_ok)
-        sign_ok.append(float(pair_order_ok and pair_overlap_ok))
-        margin_ok.append(float(pair_order_margin_ok and pair_overlap_ok))
+        pair_sign_ok = float(pair_order_ok and pair_overlap_ok)
+        pair_margin_ok = float(pair_order_margin_ok and pair_overlap_ok)
+        sign_ok.append(pair_sign_ok)
+        margin_ok.append(pair_margin_ok)
+        if relation in RELATION_2D:
+            sign_2d_ok.append(pair_sign_ok)
+            order_2d_ok.append(pair_order_ok)
+        elif relation in RELATION_3D:
+            sign_3d_ok.append(pair_sign_ok)
+            order_3d_ok.append(pair_order_ok)
         violations.append(float(violation))
         margin_violations.append(float(margin_violation))
     return {
         "rel_acc": sum(sign_ok) / len(sign_ok),
+        "rel_2d_acc": aggregate(sign_2d_ok),
+        "rel_3d_acc": aggregate(sign_3d_ok),
         "rel_margin_acc": sum(margin_ok) / len(margin_ok),
         "rel_order_acc": sum(order_ok) / len(order_ok),
+        "rel_2d_order_acc": aggregate(order_2d_ok),
+        "rel_3d_order_acc": aggregate(order_3d_ok),
         "rel_order_margin_acc": sum(order_margin_ok) / len(order_margin_ok),
         "rel_violation": sum(violations) / len(violations),
         "rel_margin_violation": sum(margin_violations) / len(margin_violations),
@@ -672,15 +694,23 @@ def evaluate_method(
         triplets = relation_triplets(row)
         for src, dst, relation in triplets:
             relation_accs = []
+            relation_2d_accs = []
+            relation_3d_accs = []
             relation_margin_accs = []
             relation_order_accs = []
+            relation_2d_order_accs = []
+            relation_3d_order_accs = []
             occlusion_overlap_accs = []
             occlusion_overlap_iomins = []
             for pred in predictions:
                 single_metrics = relation_metrics(pred.centers, [(src, dst, relation)], boxes=pred.boxes)
                 relation_accs.append(single_metrics["rel_acc"])
+                relation_2d_accs.append(single_metrics["rel_2d_acc"])
+                relation_3d_accs.append(single_metrics["rel_3d_acc"])
                 relation_margin_accs.append(single_metrics["rel_margin_acc"])
                 relation_order_accs.append(single_metrics["rel_order_acc"])
+                relation_2d_order_accs.append(single_metrics["rel_2d_order_acc"])
+                relation_3d_order_accs.append(single_metrics["rel_3d_order_acc"])
                 occlusion_overlap_accs.append(single_metrics["occlusion_overlap_acc"])
                 occlusion_overlap_iomins.append(single_metrics["occlusion_overlap_iomin"])
             per_relation_rows.append(
@@ -689,8 +719,12 @@ def evaluate_method(
                     "relation": relation,
                     "row_index": row_index,
                     "rel_acc": aggregate(relation_accs),
+                    "rel_2d_acc": aggregate(relation_2d_accs),
+                    "rel_3d_acc": aggregate(relation_3d_accs),
                     "rel_margin_acc": aggregate(relation_margin_accs),
                     "rel_order_acc": aggregate(relation_order_accs),
+                    "rel_2d_order_acc": aggregate(relation_2d_order_accs),
+                    "rel_3d_order_acc": aggregate(relation_3d_order_accs),
                     "occlusion_overlap_acc": aggregate(occlusion_overlap_accs),
                     "occlusion_overlap_iomin": aggregate(occlusion_overlap_iomins),
                 }
@@ -720,8 +754,16 @@ def evaluate_method(
         row_summaries.append(
             {
                 "sample_rel_acc": aggregate([item["rel_acc"] for item in sample_metrics]),
+                "sample_rel_2d_acc": aggregate([item["rel_2d_acc"] for item in sample_metrics]),
+                "sample_rel_3d_acc": aggregate([item["rel_3d_acc"] for item in sample_metrics]),
                 "sample_rel_margin_acc": aggregate([item["rel_margin_acc"] for item in sample_metrics]),
                 "sample_rel_order_acc": aggregate([item["rel_order_acc"] for item in sample_metrics]),
+                "sample_rel_2d_order_acc": aggregate(
+                    [item["rel_2d_order_acc"] for item in sample_metrics]
+                ),
+                "sample_rel_3d_order_acc": aggregate(
+                    [item["rel_3d_order_acc"] for item in sample_metrics]
+                ),
                 "sample_rel_order_margin_acc": aggregate(
                     [item["rel_order_margin_acc"] for item in sample_metrics]
                 ),
@@ -800,7 +842,10 @@ def build_paper_table_rows(summaries: list[dict[str, Any]]) -> list[dict[str, An
             {
                 "Method": row.get("method"),
                 "Rel Acc ↑": row.get("sample_rel_acc"),
+                "2D Rel Acc ↑": row.get("sample_rel_2d_acc"),
+                "3D Rel Acc ↑": row.get("sample_rel_3d_acc"),
                 "Order Acc ↑": row.get("sample_rel_order_acc"),
+                "3D Order Acc ↑": row.get("sample_rel_3d_order_acc"),
                 "Occ. Overlap ↑": row.get("sample_occlusion_overlap_iomin"),
                 "Box L1 ↓": row.get("sample_box_l1"),
                 "Nearest L1 ↓": row.get("sample_nearest_prompt_box_l1"),
@@ -952,8 +997,12 @@ def main() -> int:
                 "relation": relation,
                 "count": len(rows),
                 "rel_acc": aggregate([float(row["rel_acc"]) for row in rows]),
+                "rel_2d_acc": aggregate([float(row["rel_2d_acc"]) for row in rows]),
+                "rel_3d_acc": aggregate([float(row["rel_3d_acc"]) for row in rows]),
                 "rel_margin_acc": aggregate([float(row["rel_margin_acc"]) for row in rows]),
                 "rel_order_acc": aggregate([float(row["rel_order_acc"]) for row in rows]),
+                "rel_2d_order_acc": aggregate([float(row["rel_2d_order_acc"]) for row in rows]),
+                "rel_3d_order_acc": aggregate([float(row["rel_3d_order_acc"]) for row in rows]),
                 "occlusion_overlap_acc": aggregate(
                     [float(row["occlusion_overlap_acc"]) for row in rows]
                 ),

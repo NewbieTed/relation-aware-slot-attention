@@ -1,0 +1,48 @@
+dataset:
+  dataset_dir: /local1/cse_481_m_l/relation-aware-slot-attention/data/scop_depth_crops_depth
+  image_size: 512
+  prompt_prefix: a photo of
+  split_seed: 42
+  eval_fraction: 0.05
+  test_fraction: 0.05
+  prior_split: train
+  eval_split: test
+  max_eval_rows:
+
+runtime:
+  device: cuda
+  mixed_precision: bf16
+  model_id: black-forest-labs/FLUX.1-dev
+  seed: 42
+
+output:
+  output_dir: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/eval/layout_eval_prompt_balanced_checkpoints
+
+methods:
+  - name: cvae_prompt250_film1_freebits1_ckpt050000
+    type: graph_checkpoint
+    checkpoint: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/train/graph_pretrain_aug_prompt250_gnn_film1_freebits1_nowarmup_bs128_96000/checkpoint-050000/graph_encoder.pt
+    layout_sample_mode: prior_sample
+    num_samples: 32
+    layout_z_scale: 1.0
+
+  - name: cvae_prompt250_nofilm_freebits1_ckpt045000
+    type: graph_checkpoint
+    checkpoint: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/train/graph_pretrain_aug_prompt250_gnn_nofilm_freebits1_nowarmup_bs128_96000/checkpoint-045000/graph_encoder.pt
+    layout_sample_mode: prior_sample
+    num_samples: 32
+    layout_z_scale: 1.0
+
+  - name: cvae_prompt400_film1_freebits1_ckpt045000
+    type: graph_checkpoint
+    checkpoint: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/train/graph_pretrain_aug_prompt400_gnn_film1_freebits1_nowarmup_bs128_154000/checkpoint-045000/graph_encoder.pt
+    layout_sample_mode: prior_sample
+    num_samples: 32
+    layout_z_scale: 1.0
+
+  - name: cvae_prompt400_nofilm_freebits1_ckpt045000
+    type: graph_checkpoint
+    checkpoint: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/train/graph_pretrain_aug_prompt400_gnn_nofilm_freebits1_nowarmup_bs128_154000/checkpoint-045000/graph_encoder.pt
+    layout_sample_mode: prior_sample
+    num_samples: 32
+    layout_z_scale: 1.0
