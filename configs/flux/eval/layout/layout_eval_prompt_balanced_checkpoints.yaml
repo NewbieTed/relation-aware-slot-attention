@@ -19,16 +19,16 @@ output:
   output_dir: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/eval/layout_eval_prompt_balanced_checkpoints
 
 methods:
-  - name: cvae_prompt250_film1_freebits1_ckpt050000
+  - name: cvae_prompt250_film1_freebits1_final
     type: graph_checkpoint
-    checkpoint: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/train/graph_pretrain_aug_prompt250_gnn_film1_freebits1_nowarmup_bs128_96000/checkpoint-050000/graph_encoder.pt
+    checkpoint: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/train/graph_pretrain_aug_prompt250_gnn_film1_freebits1_nowarmup_bs128_96000/final/graph_encoder.pt
     layout_sample_mode: prior_sample
     num_samples: 32
     layout_z_scale: 1.0
 
-  - name: cvae_prompt250_nofilm_freebits1_ckpt045000
+  - name: cvae_prompt250_nofilm_freebits1_final
     type: graph_checkpoint
-    checkpoint: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/train/graph_pretrain_aug_prompt250_gnn_nofilm_freebits1_nowarmup_bs128_96000/checkpoint-045000/graph_encoder.pt
+    checkpoint: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/train/graph_pretrain_aug_prompt250_gnn_nofilm_freebits1_nowarmup_bs128_96000/final/graph_encoder.pt
     layout_sample_mode: prior_sample
     num_samples: 32
     layout_z_scale: 1.0
