@@ -1,16 +1,32 @@
 # relation-aware-slot-attention
 
 This branch is the FLUX.1-dev version of the project. It keeps the SCOP-Depth
-data pipeline and relation-aware GNN, then uses the GNN to predict 3D object
-centers and box sizes. Those predictions are rendered into SeeThrough3D-style
+data pipeline and relation-aware GNN, then uses the GNN to predict normalized
+3D object cuboids. Those predictions can be rendered into SeeThrough3D-style
 OSCR condition images, VAE-encoded as FLUX condition latents, and consumed by
 the released SeeThrough3D FLUX LoRA during inference.
 
-The current research focus is no longer FLUX fine-tuning. We train and debug the
-GNN/layout side, then evaluate whether GNN-generated OSCR conditions improve a
-strong pretrained FLUX+SeeThrough3D generator. This direction produced the first
-clear benchmark gain: T2I-CompBench spatial improved from the FLUX baseline
-around `0.24` to the GNN-generated OSCR + SeeThrough3D path around `0.37`.
+The current research focus is no longer FLUX fine-tuning. We train and evaluate
+the GNN/layout side directly, then use GNN-generated OSCR conditions with the
+official SeeThrough3D FLUX LoRA for qualitative/downstream image generation.
+The image-generation direction produced the first clear benchmark gain:
+T2I-CompBench spatial improved from the FLUX baseline around `0.24` to the
+GNN-generated OSCR + SeeThrough3D path around `0.37`.
+
+The latest quantitative focus is layout-module evaluation rather than
+T2I-CompBench. See `docs/paper_table.md` for the current paper table. The main
+takeaways as of 2026-05-25 are:
+
+- Hand-coded relation heuristics can trivially reach `1.0` relation accuracy,
+  so relation accuracy alone is not sufficient.
+- Deterministic GNNs trained on prompt-balanced augmented data improve relation
+  validity over the original deterministic GNN, especially 3D relation validity,
+  but still have zero stochastic diversity.
+- CVAE models with freebits avoid collapse and produce meaningful valid
+  diversity; no-freebits CVAEs have much lower spread.
+- Prompt-balanced augmented CVAEs produce the largest valid diversity, but trade
+  off reference-box L1/IoU and some relation accuracy. This is the main current
+  analysis point for the paper/future-work section.
 
 ## Setup
 
@@ -34,22 +50,37 @@ If you only need the SeeThrough3D checkout:
 ## Current Workflow
 
 1. Build SCOP-Depth cropped/depth data.
-2. Pretrain the GNN with the active 3D_SLN-aligned triple-CVAE config.
-3. Use the frozen GNN to predict 3D boxes for new prompts.
-4. Render GNN-predicted 3D boxes into OSCR condition images.
-5. Run FLUX.1-dev inference with the official SeeThrough3D LoRA.
-6. Benchmark/debug generated images and OSCR conditions.
+2. Optionally build prompt-balanced augmented layout metadata.
+3. Train deterministic GNN and triple-CVAE GNN layout models.
+4. Evaluate predicted 3D boxes directly with relation, L1/IoU, validity, and
+   diversity metrics.
+5. Use the frozen GNN to predict 3D boxes for new prompts.
+6. Render GNN-predicted 3D boxes into OSCR condition images.
+7. Run FLUX.1-dev inference with the official SeeThrough3D LoRA for downstream
+   qualitative checks.
 
 Example GNN training:
 
 ```bash
 python3 -m training.pretrain_graph_encoder \
-  --config configs/flux/gnn_pretrain_3dbox_triple_cvae_3dsln.yaml
+  --config configs/flux/gnn_pretrain_orig_cvae_nofilm_freebits1_bs128_3200.yaml
 ```
 
-This config uses FLUX T5 object-label embeddings, 5 triple-GNN layers,
-3D_SLN-style per-object CVAE latents, normalized min/max 3D box L1 loss,
-and KL regularization. Rotation/yaw is not modeled yet.
+The active CVAE configs use FLUX T5 object-label embeddings, 5 triple-GNN
+layers, 3D_SLN-style per-object CVAE latents, normalized min/max 3D box L1 loss,
+and KL regularization with optional freebits. Rotation/yaw is not modeled yet.
+
+Example layout evaluation:
+
+```bash
+python3 -m evaluation.evaluate_layout_models \
+  --config configs/flux/eval/layout/layout_eval_ready_now.yaml
+```
+
+The evaluator writes `paper_table.md`, `paper_table.csv`,
+`metrics_summary.csv`, `per_sample_metrics.csv`, and `per_relation_metrics.csv`
+under `outputs/eval/...`. The current downloaded paper table is checked in as
+`docs/paper_table.md`.
 
 Example generation/debug:
 

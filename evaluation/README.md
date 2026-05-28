@@ -62,7 +62,7 @@ Example layout-module evaluation:
 
 ```bash
 python3 -m evaluation.evaluate_layout_models \
-  --config configs/flux/eval/layout/layout_eval_base_cvae_ablation.yaml
+  --config configs/flux/eval/layout/layout_eval_ready_now.yaml
 ```
 
 The layout evaluator intentionally treats GT box L1/IoU as reference metrics,
@@ -76,6 +76,29 @@ order-only check is still written as `rel_order_acc`, which helps diagnose
 models that learn depth ordering without learning visual occlusion.
 The compact paper table also splits relation accuracy into `2D Rel Acc` for
 left/right/above/below/on/next-to and `3D Rel Acc` for front/behind/hidden-by.
+
+The current paper-facing result table is checked in at `docs/paper_table.md`.
+That table compares class/relation priors, hand-coded relation heuristics,
+original deterministic GNN, deterministic GNNs trained on prompt-balanced
+augmentation, base-data CVAE ablations, prompt-balanced augmented CVAEs, and a
+random-jitter baseline.
+
+The most useful columns for the current paper story are:
+
+- `Rel Acc`: all relation types, with 3D relations requiring both z-order and
+  projected overlap.
+- `2D Rel Acc`: left/right/above/below/on/next-to only.
+- `3D Rel Acc`: front/behind/hidden-by with z-order and projected overlap.
+- `3D Order Acc`: front/behind/hidden-by depth order only.
+- `Occ. Overlap`: projected overlap for front/behind/hidden-by.
+- `Box L1`, `2D IoU`, `3D IoU`: reference-box fidelity diagnostics.
+- `Center STD`, `Size STD`, `Valid Diversity`: stochastic spread diagnostics.
+- `Valid Rate`, `OOB`, `Overlap`: validity/collision diagnostics.
+
+Read the table with one caveat: `relation_heuristic` is designed to satisfy
+relations, so its `Rel Acc = 1.0` is a sanity baseline rather than a learned
+result. The learned models should be interpreted through the combined tradeoff
+between relation validity, reference-box quality, and valid diversity.
 
 Example scoring of an already generated T2I-CompBench directory:
 

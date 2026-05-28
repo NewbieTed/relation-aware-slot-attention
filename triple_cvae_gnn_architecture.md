@@ -6,8 +6,15 @@ boxes. The goal of this module is to predict object layouts that can later be
 rendered into OSCR images for SeeThrough3D/FLUX inference.
 
 The model is inspired by 3D_SLN's scene-graph-to-scene VAE. The active
-3D_SLN-aligned version uses per-object latent variables and omits the earlier
-scene-level latent path.
+3D_SLN-aligned CVAE configs use both a scene-level latent and per-object latent
+variables, while deterministic GNN baselines use the same scene graph input but
+skip latent sampling entirely.
+
+As of the latest experiments, this architecture is evaluated directly as a
+layout predictor. The current paper-facing table is `docs/paper_table.md`.
+Image generation through SeeThrough3D/FLUX remains useful qualitatively, but the
+main quantitative comparison is now relation accuracy, reference-box quality,
+layout validity, and stochastic diversity on held-out SCOP-Depth metadata.
 
 ## Inputs
 
@@ -288,9 +295,48 @@ graph and the true training layout.
 
 ## Scene-Level Latent Variable
 
-The current 3D_SLN-aligned config disables the scene-level latent variable.
-Older checkpoints may still contain this path for compatibility, but new
-`triple_cvae` training runs use only per-object latents.
+The active CVAE configs set `use_scene_latent: true`, so the model has one
+scene-level latent for the whole graph in addition to one object-level latent
+per object.
+
+The scene-level latent is intended to capture global layout variation that is
+shared by all objects in the prompt. For example, in:
+
+```text
+a dog to the left of a chair
+```
+
+the scene latent can affect the overall composition, while each object latent
+can affect the dog or chair individually.
+
+The scene posterior is produced from a graph-level readout of posterior nodes
+and posterior edges:
+
+```text
+posterior_graph_state = attention_readout(posterior_nodes, posterior_edges)
+scene_posterior_mu, scene_posterior_logvar =
+  scene_posterior_head(posterior_graph_state)
+```
+
+`posterior_graph_state` means a single vector summarizing the whole posterior
+scene graph after it has seen the ground-truth layout.
+
+`scene_posterior_mu` and `scene_posterior_logvar` parameterize the scene-level
+posterior distribution.
+
+During training, the scene latent is sampled from this posterior:
+
+```text
+epsilon_scene ~ N(0, I)
+z_scene = scene_posterior_mu + exp(0.5 * scene_posterior_logvar) * epsilon_scene
+```
+
+During inference, no ground-truth boxes are available, so the scene latent is
+sampled from the standard normal prior:
+
+```text
+z_scene ~ N(0, I)
+```
 
 ## Object-Level Latent Variables
 
@@ -318,17 +364,18 @@ object_posterior_stats_i = object_posterior_head(posterior_node_i)
 `object_posterior_stats_i` means the full vector of latent distribution
 parameters for object `i`.
 
-If `latent_dim = 64`, then:
+In the current paper-facing configs, `latent_dim = 32`. If `latent_dim = 32`,
+then:
 
 ```text
-object_posterior_stats_i has 128 values
+object_posterior_stats_i has 64 values
 ```
 
 The first half becomes the mean, and the second half becomes the log variance:
 
 ```text
-object_posterior_mu_i = object_posterior_stats_i[0:64]
-object_posterior_logvar_i = object_posterior_stats_i[64:128]
+object_posterior_mu_i = object_posterior_stats_i[0:32]
+object_posterior_logvar_i = object_posterior_stats_i[32:64]
 ```
 
 `object_posterior_mu_i` is the mean of object `i`'s posterior latent
@@ -346,8 +393,9 @@ z_obj_i = object_posterior_mu_i + exp(0.5 * object_posterior_logvar_i) * epsilon
 
 `z_obj_i` means the sampled latent vector for object `i`.
 
-During training, `z_obj_i` comes from the posterior. During inference, we sample
-each object latent from the standard normal prior:
+During training, `z_obj_i` comes from the posterior. During inference, no
+ground-truth boxes are available, so each object latent is sampled from the
+standard normal prior:
 
 ```text
 z_obj_i ~ N(0, I)
@@ -361,16 +409,39 @@ graph can produce different boxes because `z_obj_i` can be sampled differently.
 The decoder predicts boxes from the prior graph states and sampled latent
 variables.
 
-For each object `i`, the decoder input is:
+For each object `i`, the decoder latent context is:
 
 ```text
-decoder_input_i = concat(prior_node_i, z_obj_i)
+z_context_i = concat(z_scene, z_obj_i)
 ```
 
-`prior_node_i` means the final prior node state for object `i`, computed from
-only object labels and relations.
+`z_scene` means the sampled scene-level latent vector.
 
 `z_obj_i` means the sampled object-level latent vector for object `i`.
+
+`z_context_i` means the latent context for object `i`.
+
+Before the decoder node projection, the model uses FiLM-style modulation to let
+the latent context scale and shift the prior node state:
+
+```text
+gamma_i, beta_i = decoder_film(z_context_i)
+modulated_prior_node_i =
+  prior_node_i * (1 + decoder_film_scale * tanh(gamma_i))
+  + decoder_film_scale * beta_i
+```
+
+`gamma_i` and `beta_i` are the FiLM scale and shift vectors for object `i`.
+
+`decoder_film_scale` controls how strongly the sampled latent can modulate the
+graph-conditioned prior node state. Some experiments set this to `0.0`, which
+removes FiLM modulation, and others set it to `1.0`.
+
+The decoder input is:
+
+```text
+decoder_input_i = concat(modulated_prior_node_i, z_context_i)
+```
 
 `decoder_input_i` means the full input used to initialize decoder object `i`.
 
@@ -484,7 +555,7 @@ The training loss is still computed on `pred_box_i`, not on
 The current 3D_SLN-style training loss is:
 
 ```text
-total_loss = box_l1_loss + kl_weight * kl_object
+total_loss = box_l1_loss + kl_weight * (kl_scene + kl_object)
 ```
 
 `box_l1_loss` compares predicted boxes to ground-truth boxes:
@@ -496,6 +567,16 @@ box_l1_loss = mean(abs(pred_box_i - gt_box_i))
 `pred_box_i` is the predicted normalized min/max box for object `i`.
 
 `gt_box_i` is the ground-truth normalized min/max box for object `i`.
+
+`kl_scene` regularizes the scene-level posterior toward a standard normal:
+
+```text
+kl_scene =
+  sum_over_latent_dims KL(q(z_scene | graph, gt_boxes) || N(0, I))
+```
+
+`q(z_scene | graph, gt_boxes)` means the posterior distribution for the whole
+scene-level latent.
 
 `kl_object` regularizes each object-level posterior toward a standard normal:
 
@@ -516,14 +597,33 @@ The full training objective is:
 ```text
 total_loss =
   mean(abs(pred_box_i - gt_box_i))
-  + kl_weight * kl_object
+  + kl_weight * (kl_scene + kl_object)
 ```
 
-In the current triple-CVAE config:
+In the current triple-CVAE configs:
 
 ```text
 kl_weight = 0.1
 ```
+
+Several runs use freebits to avoid KL collapse:
+
+```text
+kl_dim_effective = max(kl_dim - free_bits, 0)
+```
+
+`free_bits` means the KL threshold per latent dimension before the KL term starts
+contributing to the loss. In the current experiment set, the important values
+are:
+
+```text
+free_bits = 0.0
+free_bits = 0.5
+free_bits = 1.0
+```
+
+Empirically, no-freebits CVAE runs show very low spread, while freebits runs
+produce much larger valid diversity.
 
 We are currently not using orientation loss, because our data and OSCR pipeline
 do not yet predict object yaw/azimuth.
@@ -538,10 +638,11 @@ During training:
 
 ```text
 posterior sees graph + ground-truth boxes
+z_scene is sampled from q(z_scene | graph, gt_boxes)
 z_obj_i is sampled from q(z_obj_i | graph, gt_box_i)
 decoder predicts boxes
 loss compares predicted boxes to ground-truth boxes
-KL pushes posterior distributions toward N(0, I)
+KL pushes scene and object posterior distributions toward N(0, I)
 ```
 
 During inference:
@@ -549,6 +650,7 @@ During inference:
 ```text
 only the prompt and scene graph are available
 ground-truth boxes are not available
+z_scene is sampled from N(0, I)
 z_obj_i is sampled from N(0, I)
 decoder predicts boxes from graph + sampled latents
 predicted boxes are rendered into OSCR
@@ -557,3 +659,67 @@ SeeThrough3D/FLUX uses the OSCR to generate the final image
 
 This gives us a probabilistic layout generator: the same prompt can produce
 multiple plausible layouts by sampling different object latents.
+
+## Deterministic GNN Baseline
+
+The deterministic baseline uses the same object labels, relation labels, and
+message-passing graph structure, but it does not use posterior encoders,
+scene/object latents, KL, freebits, or stochastic sampling.
+
+The deterministic model predicts one box per object:
+
+```text
+pred_box_i = deterministic_box_head(graph_node_i)
+```
+
+This baseline is important because it isolates the contribution of stochastic
+CVAE sampling. In the latest experiments, deterministic GNNs trained on
+prompt-balanced augmented data improve relation validity compared with the
+original deterministic GNN, but their `Center STD`, `Size STD`, and
+`Valid Diversity` remain zero by construction.
+
+## Prompt-Balanced Augmentation
+
+The latest augmented datasets are prompt-balanced: each unique prompt gets a
+fixed number of synthetic relation-valid 3D box layouts.
+
+The active prompt-balanced datasets are:
+
+```text
+scop_depth_crops_depth_aug_prompt250
+scop_depth_crops_depth_aug_prompt400
+```
+
+These are used to test whether the model can learn a broader conditional layout
+distribution than the original SCOP-Depth rows provide.
+
+## Evaluation Summary
+
+The current paper-facing evaluation is direct layout evaluation, not
+T2I-CompBench image scoring. The evaluator compares predicted 3D boxes against
+held-out SCOP-Depth metadata and writes `paper_table.md`.
+
+The important metrics are:
+
+```text
+Rel Acc          relation correctness across all relations
+2D Rel Acc       left/right/above/below/on/next-to only
+3D Rel Acc       front/behind/hidden-by with depth order and projected overlap
+3D Order Acc     front/behind/hidden-by depth order only
+Occ. Overlap     projected overlap for 3D/occlusion relations
+Box L1           reference-box coordinate error
+2D/3D IoU        reference-box overlap
+Center/Size STD  stochastic spread over CVAE samples
+Valid Diversity  spread among samples that satisfy relations and stay in bounds
+OOB              out-of-bounds or invalid box rate
+Overlap          object-object 3D collision/overlap
+```
+
+The current interpretation is:
+
+```text
+relation_heuristic: sanity baseline; relation accuracy is perfect by design
+deterministic augmented GNN: better relation validity, zero diversity
+freebits CVAE: avoids collapse and gives meaningful valid diversity
+prompt-balanced CVAE: largest valid diversity, but trades off some reference-box fidelity and relation accuracy
+```
