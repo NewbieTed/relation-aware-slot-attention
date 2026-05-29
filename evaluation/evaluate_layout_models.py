@@ -298,6 +298,10 @@ def relation_metrics(
     }
 
 
+def has_relation_type(triplets: list[tuple[int, int, str]], relation_names: set[str]) -> bool:
+    return any(relation in relation_names for _src, _dst, relation in triplets)
+
+
 def box_quality_metrics(pred: LayoutPrediction, target: LayoutPrediction) -> dict[str, float]:
     pred_boxes = pred.boxes.to(torch.float32)
     target_boxes = target.boxes.to(torch.float32)
@@ -749,6 +753,29 @@ def evaluate_method(
             ],
             dtype=torch.bool,
         )
+        triplets = relation_triplets(row)
+        has_2d_relations = has_relation_type(triplets, RELATION_2D)
+        has_3d_relations = has_relation_type(triplets, RELATION_3D)
+        valid_2d_sample_rate = (
+            aggregate(
+                [
+                    float(item["rel_2d_acc"] == 1.0 and item["oob_rate"] == 0.0)
+                    for item in sample_metrics
+                ]
+            )
+            if has_2d_relations
+            else math.nan
+        )
+        valid_3d_sample_rate = (
+            aggregate(
+                [
+                    float(item["rel_3d_acc"] == 1.0 and item["oob_rate"] == 0.0)
+                    for item in sample_metrics
+                ]
+            )
+            if has_3d_relations
+            else math.nan
+        )
         valid_centers = centers[valid_mask]
         valid_sizes = sizes[valid_mask]
         row_summaries.append(
@@ -793,6 +820,8 @@ def evaluate_method(
                     [item["nearest_prompt_iou_3d"] for item in sample_metrics]
                 ),
                 "valid_sample_rate": float(valid_mask.to(torch.float32).mean()),
+                "valid_2d_sample_rate": valid_2d_sample_rate,
+                "valid_3d_sample_rate": valid_3d_sample_rate,
                 "center_std": float(centers.std(dim=0, unbiased=False).mean()),
                 "size_std": float(sizes.std(dim=0, unbiased=False).mean()),
                 "all_diversity_center_l2": mean_pairwise_flat_l2(centers),
@@ -856,6 +885,8 @@ def build_paper_table_rows(summaries: list[dict[str, Any]]) -> list[dict[str, An
                 "Center STD ↑": row.get("center_std"),
                 "Size STD ↑": row.get("size_std"),
                 "Valid Rate ↑": row.get("valid_sample_rate"),
+                "2D Valid Rate ↑": row.get("valid_2d_sample_rate"),
+                "3D Valid Rate ↑": row.get("valid_3d_sample_rate"),
                 "Valid Diversity ↑": row.get("valid_diversity_center_l2"),
                 "OOB ↓": row.get("sample_oob_rate"),
                 "Overlap ↓": row.get("sample_pair_iou_3d"),

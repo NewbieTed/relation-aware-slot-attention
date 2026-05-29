@@ -93,7 +93,12 @@ The most useful columns for the current paper story are:
 - `Occ. Overlap`: projected overlap for front/behind/hidden-by.
 - `Box L1`, `2D IoU`, `3D IoU`: reference-box fidelity diagnostics.
 - `Center STD`, `Size STD`, `Valid Diversity`: stochastic spread diagnostics.
-- `Valid Rate`, `OOB`, `Overlap`: validity/collision diagnostics.
+- `Valid Rate`: all requested relations correct and no out-of-bounds boxes.
+- `2D Valid Rate`: all requested 2D relations correct and no out-of-bounds
+  boxes, averaged only over rows with at least one 2D relation.
+- `3D Valid Rate`: all requested 3D relations correct and no out-of-bounds
+  boxes, averaged only over rows with at least one 3D relation.
+- `OOB`, `Overlap`: validity/collision diagnostics.
 
 Read the table with one caveat: `relation_heuristic` is designed to satisfy
 relations, so its `Rel Acc = 1.0` is a sanity baseline rather than a learned
