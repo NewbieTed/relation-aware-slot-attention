@@ -50,60 +50,60 @@ methods:
     type: graph_checkpoint
     checkpoint: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/train/graph_pretrain_orig_cvae_nofilm_nofreebits_bs128_3200/final/graph_encoder.pt
     layout_sample_mode: prior_sample
-    num_samples: 32
+    num_samples: 128
     layout_z_scale: 1.0
 
   - name: cvae_nofilm_freebits05
     type: graph_checkpoint
     checkpoint: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/train/graph_pretrain_orig_cvae_nofilm_freebits05_bs128_3200/final/graph_encoder.pt
     layout_sample_mode: prior_sample
-    num_samples: 32
+    num_samples: 128
     layout_z_scale: 1.0
 
   - name: cvae_nofilm_freebits1
     type: graph_checkpoint
     checkpoint: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/train/graph_pretrain_orig_cvae_nofilm_freebits1_bs128_3200/final/graph_encoder.pt
     layout_sample_mode: prior_sample
-    num_samples: 32
+    num_samples: 128
     layout_z_scale: 1.0
 
   - name: cvae_film1_nofreebits
     type: graph_checkpoint
     checkpoint: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/train/graph_pretrain_orig_cvae_film1_nofreebits_bs128_3200/final/graph_encoder.pt
     layout_sample_mode: prior_sample
-    num_samples: 32
+    num_samples: 128
     layout_z_scale: 1.0
 
   - name: cvae_prompt250_film1_freebits1_final
     type: graph_checkpoint
     checkpoint: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/train/graph_pretrain_aug_prompt250_gnn_film1_freebits1_nowarmup_bs128_96000/final/graph_encoder.pt
     layout_sample_mode: prior_sample
-    num_samples: 32
+    num_samples: 128
     layout_z_scale: 1.0
 
   - name: cvae_prompt250_nofilm_freebits1_final
     type: graph_checkpoint
     checkpoint: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/train/graph_pretrain_aug_prompt250_gnn_nofilm_freebits1_nowarmup_bs128_96000/final/graph_encoder.pt
     layout_sample_mode: prior_sample
-    num_samples: 32
+    num_samples: 128
     layout_z_scale: 1.0
 
-  - name: cvae_prompt400_film1_freebits1_ckpt045000
+  - name: cvae_prompt400_film1_freebits1_final
     type: graph_checkpoint
-    checkpoint: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/train/graph_pretrain_aug_prompt400_gnn_film1_freebits1_nowarmup_bs128_154000/checkpoint-045000/graph_encoder.pt
+    checkpoint: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/train/graph_pretrain_aug_prompt400_gnn_film1_freebits1_nowarmup_bs128_154000/final/graph_encoder.pt
     layout_sample_mode: prior_sample
-    num_samples: 32
+    num_samples: 128
     layout_z_scale: 1.0
 
-  - name: cvae_prompt400_nofilm_freebits1_ckpt045000
+  - name: cvae_prompt400_nofilm_freebits1_final
     type: graph_checkpoint
-    checkpoint: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/train/graph_pretrain_aug_prompt400_gnn_nofilm_freebits1_nowarmup_bs128_154000/checkpoint-045000/graph_encoder.pt
+    checkpoint: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/train/graph_pretrain_aug_prompt400_gnn_nofilm_freebits1_nowarmup_bs128_154000/final/graph_encoder.pt
     layout_sample_mode: prior_sample
-    num_samples: 32
+    num_samples: 128
     layout_z_scale: 1.0
 
   - name: random_jitter_heuristic
     type: random_jitter
-    num_samples: 32
+    num_samples: 128
     center_std: 0.25
     size_std: 0.35
