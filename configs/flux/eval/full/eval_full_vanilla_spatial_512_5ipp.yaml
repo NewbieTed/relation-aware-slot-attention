@@ -1,0 +1,22 @@
+generate:
+  prompt_file: /local1/cse_481_m_l/relation-aware-slot-attention/external/T2I-CompBench/examples/dataset/spatial_val.txt
+  output_dir: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/eval/final_flux_vanilla_spatial_512_5ipp
+  model_id: black-forest-labs/FLUX.1-dev
+  device: cuda
+  mixed_precision: bf16
+  flux_quantization: 8bit
+  low_vram: true
+  image_size: 512
+  num_inference_steps: 28
+  guidance_scale: 3.5
+  max_sequence_length: 128
+  samples_per_prompt: 5
+  limit_prompts:
+  seed: 42
+
+benchmark:
+  benchmark: spatial
+  t2i_root: /local1/cse_481_m_l/relation-aware-slot-attention/external/T2I-CompBench
+  t2i_python: /local1/cse_481_m_l/relation-aware-slot-attention/.venv-t2i/bin/python
+  output_dir: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/eval/final_flux_vanilla_spatial_512_5ipp
+  prompt_file: /local1/cse_481_m_l/relation-aware-slot-attention/external/T2I-CompBench/examples/dataset/spatial_val.txt

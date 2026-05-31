@@ -1,0 +1,59 @@
+dataset:
+  dataset_dir: /local1/cse_481_m_l/relation-aware-slot-attention/data/scop_depth_crops_depth
+  image_size: 512
+  prompt_prefix: a photo of
+  split_seed: 42
+  eval_fraction: 0.05
+  test_fraction: 0.05
+  split: all
+
+runtime:
+  device: cuda
+  mixed_precision: bf16
+  model_id: black-forest-labs/FLUX.1-dev
+
+output:
+  output_dir: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/figures/appendix_oscr
+
+rendering:
+  image_size: 512
+  face_alpha: 0.10
+  azimuth_degrees: 0.0
+
+checkpoints:
+  deterministic_original: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/train/final_models/graph_pretrain_flux_3dbox_deterministic_t5_b128_600/final/graph_encoder.pt
+  deterministic_prompt400: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/train/graph_pretrain_aug_prompt400_deterministic_t5_bs128_154000/final/graph_encoder.pt
+  relay_prompt400: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/train/graph_pretrain_aug_prompt400_gnn_film1_freebits1_nowarmup_bs128_154000/final/graph_encoder.pt
+
+figures:
+  - name: fig1_deterministic_vs_relay
+    type: deterministic_vs_relay
+    title: Deterministic vs. RELAY-3D sampled OSCR layouts
+    prompt: a suitcase in front of an apple
+    deterministic_checkpoint: deterministic_prompt400
+    relay_checkpoint: relay_prompt400
+    relay_samples: 6
+    layout_z_scale: 1.0
+    seed: 42
+    columns: 4
+
+  - name: fig2_prompt_balanced_augmentation
+    type: augmentation_comparison
+    title: Prompt-balanced augmentation and 3D relation placement
+    prompt: a dog in front of a bicycle
+    original_checkpoint: deterministic_original
+    augmented_checkpoint: deterministic_prompt400
+    seed: 42
+    columns: 3
+
+  - name: fig3_success_failure_cases
+    type: success_failure
+    title: Representative RELAY-3D success and failure OSCR layouts
+    relay_checkpoint: relay_prompt400
+    success_count: 2
+    failure_count: 2
+    samples_per_row: 8
+    max_scan_rows: 512
+    layout_z_scale: 1.0
+    seed: 123
+    columns: 4

@@ -195,6 +195,20 @@ def clear_label_output(t2i_root: Path, relative_path: str) -> None:
         label_file.unlink()
 
 
+def clear_3d_spatial_depth_cache(t2i_root: Path) -> None:
+    """Remove stale 3D depth maps before T2I-CompBench 3D spatial scoring.
+
+    The upstream 3D evaluator skips depth generation whenever
+    ``examples/labels/depth`` exists. If a previous scoring attempt failed
+    halfway through, that directory can be incomplete while still causing the
+    next run to skip depth regeneration.
+    """
+
+    depth_dir = t2i_root / "examples" / "labels" / "depth"
+    if depth_dir.exists():
+        shutil.rmtree(depth_dir)
+
+
 def read_label_output(t2i_root: Path, relative_path: str) -> list[dict] | None:
     label_file = t2i_root / relative_path
     if not label_file.exists():
@@ -356,6 +370,8 @@ def main() -> int:
 
     spec = BENCHMARK_SPECS[args.benchmark]
     clear_label_output(t2i_root, spec["label_output"])
+    if args.benchmark == "3d_spatial":
+        clear_3d_spatial_depth_cache(t2i_root)
     completions = run_benchmark(t2i_root, args.benchmark, args.python_bin)
     label_results = read_label_output(t2i_root, spec["label_output"])
     average_score = compute_average_score(label_results)

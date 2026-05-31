@@ -16,6 +16,7 @@ BENCHMARK="${BENCHMARK:-spatial}"
 T2I_ROOT="${T2I_ROOT:-$ROOT_DIR/external/T2I-CompBench}"
 FLUX_PYTHON="${FLUX_PYTHON:-$DEFAULT_FLUX_PYTHON}"
 T2I_PYTHON="${T2I_PYTHON:-$ROOT_DIR/.venv-t2i/bin/python}"
+CONFIG_FILE="${CONFIG_FILE:-}"
 MODEL_ID="${MODEL_ID:-black-forest-labs/FLUX.1-dev}"
 DEVICE="${DEVICE:-cuda}"
 MIXED_PRECISION="${MIXED_PRECISION:-bf16}"
@@ -34,6 +35,42 @@ COPY_INSTEAD_OF_SYMLINK="${COPY_INSTEAD_OF_SYMLINK:-0}"
 PRUNE_SAMPLES_KEEP="${PRUNE_SAMPLES_KEEP:-}"
 PRUNE_SAMPLES_SEED="${PRUNE_SAMPLES_SEED:-42}"
 
+if [[ -n "$CONFIG_FILE" ]]; then
+  readarray -t CONFIG_EXPORTS < <("$FLUX_PYTHON" - "$CONFIG_FILE" <<'PY'
+from pathlib import Path
+from training.config import _load_raw_config, _section_config
+
+config = _section_config(_load_raw_config(Path(__import__("sys").argv[1])), "benchmark")
+keys = {
+    "benchmark": "BENCHMARK",
+    "t2i_root": "T2I_ROOT",
+    "t2i_python": "T2I_PYTHON",
+    "output_dir": "OUTPUT_DIR",
+    "prompt_file": "PROMPT_FILE",
+    "copy_instead_of_symlink": "COPY_INSTEAD_OF_SYMLINK",
+    "prune_samples_keep": "PRUNE_SAMPLES_KEEP",
+    "prune_samples_seed": "PRUNE_SAMPLES_SEED",
+}
+for key, env_key in keys.items():
+    value = config.get(key)
+    if value is None:
+        continue
+    print(f"{env_key}={value}")
+PY
+  )
+  for item in "${CONFIG_EXPORTS[@]}"; do
+    export "$item"
+  done
+  BENCHMARK="${BENCHMARK:-spatial}"
+  T2I_ROOT="${T2I_ROOT:-$ROOT_DIR/external/T2I-CompBench}"
+  T2I_PYTHON="${T2I_PYTHON:-$ROOT_DIR/.venv-t2i/bin/python}"
+  OUTPUT_DIR="${OUTPUT_DIR:-$ROOT_DIR/outputs/eval/flux_vanilla_${BENCHMARK}}"
+  PROMPT_FILE="${PROMPT_FILE:-}"
+  COPY_INSTEAD_OF_SYMLINK="${COPY_INSTEAD_OF_SYMLINK:-0}"
+  PRUNE_SAMPLES_KEEP="${PRUNE_SAMPLES_KEEP:-}"
+  PRUNE_SAMPLES_SEED="${PRUNE_SAMPLES_SEED:-42}"
+fi
+
 if [[ -z "$PROMPT_FILE" ]]; then
   case "$BENCHMARK" in
     spatial)
@@ -49,27 +86,31 @@ if [[ -z "$PROMPT_FILE" ]]; then
   esac
 fi
 
-GEN_CMD=(
-  "$FLUX_PYTHON" -m evaluation.generate_flux_vanilla
-  --prompt-file "$PROMPT_FILE"
-  --output-dir "$OUTPUT_DIR"
-  --model-id "$MODEL_ID"
-  --device "$DEVICE"
-  --mixed-precision "$MIXED_PRECISION"
-  --flux-quantization "$FLUX_QUANTIZATION"
-  --image-size "$IMAGE_SIZE"
-  --num-inference-steps "$NUM_INFERENCE_STEPS"
-  --guidance-scale "$GUIDANCE_SCALE"
-  --max-sequence-length "$MAX_SEQUENCE_LENGTH"
-  --samples-per-prompt "$SAMPLES_PER_PROMPT"
-  --seed "$SEED"
-)
+if [[ -n "$CONFIG_FILE" ]]; then
+  GEN_CMD=("$FLUX_PYTHON" -m evaluation.generate_flux_vanilla --config "$CONFIG_FILE")
+else
+  GEN_CMD=(
+    "$FLUX_PYTHON" -m evaluation.generate_flux_vanilla
+    --prompt-file "$PROMPT_FILE"
+    --output-dir "$OUTPUT_DIR"
+    --model-id "$MODEL_ID"
+    --device "$DEVICE"
+    --mixed-precision "$MIXED_PRECISION"
+    --flux-quantization "$FLUX_QUANTIZATION"
+    --image-size "$IMAGE_SIZE"
+    --num-inference-steps "$NUM_INFERENCE_STEPS"
+    --guidance-scale "$GUIDANCE_SCALE"
+    --max-sequence-length "$MAX_SEQUENCE_LENGTH"
+    --samples-per-prompt "$SAMPLES_PER_PROMPT"
+    --seed "$SEED"
+  )
 
-if [[ "$LOW_VRAM" == "1" ]]; then
-  GEN_CMD+=(--low-vram)
-fi
-if [[ -n "$LIMIT_PROMPTS" ]]; then
-  GEN_CMD+=(--limit-prompts "$LIMIT_PROMPTS")
+  if [[ "$LOW_VRAM" == "1" ]]; then
+    GEN_CMD+=(--low-vram)
+  fi
+  if [[ -n "$LIMIT_PROMPTS" ]]; then
+    GEN_CMD+=(--limit-prompts "$LIMIT_PROMPTS")
+  fi
 fi
 
 "${GEN_CMD[@]}"

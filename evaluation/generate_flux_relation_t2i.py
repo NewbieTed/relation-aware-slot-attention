@@ -12,7 +12,12 @@ import torch
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 
-from evaluation.prompt_parser import parse_prompt_to_scene_graph
+from evaluation.prompt_parser import (
+    PromptAdditions,
+    compose_generation_prompt,
+    parse_prompt_to_scene_graph,
+    prompt_additions_from_args,
+)
 from training.config import parse_args_with_config
 from training.flux_inference_runtime import (
     build_flux_quantization_config,
@@ -27,6 +32,10 @@ from training.oscr_renderer import render_oscr_boxes
 from training.runtime import (
     DEFAULT_FLUX_MODEL_ID,
     choose_weight_dtype,
+    infer_graph_encoder_config,
+    infer_text_encoder_type,
+    load_graph_encoder,
+    load_graph_label_encoder,
     normalize_graph_encoder_state_dict,
     resolve_torch_device,
     set_seed,
@@ -74,6 +83,12 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--slot-dim", type=int, default=512)
     parser.add_argument("--gnn-layers", type=int, default=2)
+    parser.add_argument(
+        "--gnn-layout-sample-mode",
+        choices=("auto", "prior_mean", "prior_sample"),
+        default="auto",
+        help="For CVAE graph checkpoints, use prior_mean for deterministic boxes or prior_sample for stochastic boxes.",
+    )
     parser.add_argument("--lora-rank", type=int, default=32)
     parser.add_argument("--lora-alpha", type=float, default=32.0)
     parser.add_argument(
@@ -102,6 +117,42 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--blender-bin", type=str, default="blender")
     parser.add_argument("--blender-cache-dir", type=Path, default=None)
     parser.add_argument("--prompt-prefix", type=str, default="a photo of")
+    parser.add_argument(
+        "--generation-prompt-suffix",
+        type=str,
+        default="",
+        help=(
+            "Optional qualitative-only text appended after the binding prompt. "
+            "The GNN/OSCR layout still uses the original prompt."
+        ),
+    )
+    parser.add_argument(
+        "--generation-scene-prefix",
+        type=str,
+        default="",
+        help=(
+            "Optional qualitative-only scene text inserted after the subject anchors "
+            "and before the relation prompt, while preserving token binding offsets."
+        ),
+    )
+    parser.add_argument(
+        "--background-prompt",
+        type=str,
+        default="",
+        help="Optional generation-only background/setting text appended after the bound relation prompt.",
+    )
+    parser.add_argument(
+        "--style-prompt",
+        type=str,
+        default="",
+        help="Optional generation-only visual style text appended after the bound relation prompt.",
+    )
+    parser.add_argument(
+        "--quality-prompt",
+        type=str,
+        default="",
+        help="Optional generation-only quality/detail text appended after the bound relation prompt.",
+    )
     return parser
 
 
@@ -130,23 +181,29 @@ def _tensor_to_pil(image: torch.Tensor) -> Any:
 def _load_graph_encoder(
     *,
     path: Path,
-    text_hidden_dim: int,
-    slot_dim: int,
-    gnn_layers: int,
     device: str,
-) -> GraphSlotEncoder:
-    encoder = GraphSlotEncoder(
+) -> tuple[GraphSlotEncoder, str, int]:
+    state_dict = normalize_graph_encoder_state_dict(torch.load(path, map_location="cpu"))
+    (
+        _slot_dim,
+        text_hidden_dim,
+        _gnn_layers,
+        _layout_mode,
+        _latent_dim,
+        _decoder_mode,
+        _decoder_box_residual,
+        _decoder_film_scale,
+        _use_scene_latent,
+    ) = infer_graph_encoder_config(state_dict)
+    text_encoder_type = infer_text_encoder_type(text_hidden_dim)
+    encoder = load_graph_encoder(
+        path=path,
         text_hidden_dim=text_hidden_dim,
-        slot_dim=slot_dim,
-        num_layers=gnn_layers,
-    ).to(device)
-    encoder.load_state_dict(
-        normalize_graph_encoder_state_dict(torch.load(path, map_location=device)),
-        strict=False,
+        device=device,
+        dtype=torch.float32,
     )
     encoder.requires_grad_(False)
-    encoder.eval()
-    return encoder
+    return encoder, text_encoder_type, text_hidden_dim
 
 
 def _download_official_lora(args: argparse.Namespace) -> Path:
@@ -286,6 +343,8 @@ def _predict_condition(
     prompt: str,
     pipeline: Any,
     graph_encoder: GraphSlotEncoder,
+    graph_tokenizer: object,
+    graph_text_encoder: object,
     device: str,
     oscr_size: int,
     oscr_render_size: int | None,
@@ -296,7 +355,10 @@ def _predict_condition(
     blender_bin: str,
     blender_cache_dir: Path,
     prompt_prefix: str,
+    gnn_layout_sample_mode: str,
+    prompt_additions: PromptAdditions | None = None,
 ) -> tuple[Any, Any, str, list[list[torch.Tensor]], torch.Tensor, dict[str, Any]]:
+    prompt_additions = prompt_additions or PromptAdditions()
     scene_graph = parse_prompt_to_scene_graph(prompt)
     node_count = len(scene_graph["nodes"])
     targets = torch.zeros(1, node_count, 3, device=device)
@@ -304,11 +366,12 @@ def _predict_condition(
     batched_graph = build_batched_scene_graphs([scene_graph], slot_targets=targets, slot_mask=slot_mask)
     graph_device = "cpu" if next(graph_encoder.parameters()).device.type == "cpu" else device
     conditioning = build_slot_conditioning(
-        tokenizer=pipeline.tokenizer,
-        text_encoder=pipeline.text_encoder,
+        tokenizer=graph_tokenizer,
+        text_encoder=graph_text_encoder,
         scene_graph_batch=batched_graph,
         graph_encoder=graph_encoder,
         device=graph_device,
+        layout_sample_mode=gnn_layout_sample_mode,
     )
     centers = conditioning.slot_positions.to(device)
     log_sizes = conditioning.slot_log_sizes_3d.to(device)
@@ -398,6 +461,12 @@ def _predict_condition(
         scene_graph=scene_graph,
         prefix=prompt_prefix,
     )
+    if prompt_additions.scene_prefix:
+        subject_list = binding_prompt.prompt[: binding_prompt.subject_spans[-1][1]]
+        binding_prompt = type(binding_prompt)(
+            prompt=f"{subject_list} {prompt_additions.scene_prefix}, with {prompt.strip()}",
+            subject_spans=binding_prompt.subject_spans,
+        )
     call_ids = [
         call_ids_from_binding_prompt(
             tokenizer=pipeline.tokenizer_2,
@@ -418,6 +487,14 @@ def _predict_condition(
     layout = {
         "prompt": prompt,
         "binding_prompt": binding_prompt.prompt,
+        "generation_prompt": compose_generation_prompt(binding_prompt.prompt, prompt_additions),
+        "generation_scene_prefix": prompt_additions.scene_prefix,
+        "background_prompt": prompt_additions.background,
+        "style_prompt": prompt_additions.style,
+        "quality_prompt": prompt_additions.quality,
+        "generation_prompt_suffix": prompt_additions.suffix,
+        "graph_layout_mode": getattr(graph_encoder, "layout_mode", "deterministic"),
+        "gnn_layout_sample_mode": gnn_layout_sample_mode,
         "nodes": scene_graph["nodes"],
         "edges": scene_graph["edges"],
         "predicted_centers": centers[0].detach().cpu().tolist(),
@@ -438,6 +515,7 @@ def main() -> int:
     dtype = choose_weight_dtype(device, args.mixed_precision)
     set_seed(args.seed)
     prompts = _read_prompts(args.prompt_file, args.limit_prompts)
+    prompt_additions = prompt_additions_from_args(args)
     pipeline, _quantization_config = _load_pipeline(args, device=device, dtype=dtype)
 
     graph_device = "cpu" if args.low_vram else device
@@ -449,11 +527,14 @@ def main() -> int:
         raise ValueError("Pass --graph-encoder-path when using an external/official SeeThrough3D LoRA.")
     if not graph_path.exists():
         raise FileNotFoundError(f"Missing graph encoder checkpoint: {graph_path}")
-    graph_encoder = _load_graph_encoder(
+    graph_encoder, graph_text_encoder_type, _graph_text_hidden_dim = _load_graph_encoder(
         path=graph_path,
-        text_hidden_dim=pipeline.text_encoder.config.hidden_size,
-        slot_dim=args.slot_dim,
-        gnn_layers=args.gnn_layers,
+        device=graph_device,
+    )
+    graph_tokenizer, graph_text_encoder, _encoder_hidden_dim = load_graph_label_encoder(
+        model_id=args.model_id,
+        text_encoder_type=graph_text_encoder_type,
+        torch_dtype=dtype,
         device=graph_device,
     )
 
@@ -465,6 +546,8 @@ def main() -> int:
             prompt=prompt,
             pipeline=pipeline,
             graph_encoder=graph_encoder,
+            graph_tokenizer=graph_tokenizer,
+            graph_text_encoder=graph_text_encoder,
             device=device,
             oscr_size=args.oscr_size,
             oscr_render_size=args.oscr_render_size,
@@ -475,16 +558,19 @@ def main() -> int:
             blender_bin=args.blender_bin,
             blender_cache_dir=args.blender_cache_dir or (args.output_dir / "blender_condition_cache"),
             prompt_prefix=args.prompt_prefix,
+            gnn_layout_sample_mode=args.gnn_layout_sample_mode,
+            prompt_additions=prompt_additions,
         )
         condition_dir = args.output_dir / "conditions"
         condition_dir.mkdir(parents=True, exist_ok=True)
         oscr_viz_name = f"{prompt_name}_oscr_viz.png"
         oscr_viz_image.save(condition_dir / oscr_viz_name)
         layout["oscr_viz_file"] = str(Path("conditions") / oscr_viz_name)
+        generation_prompt = compose_generation_prompt(binding_prompt, prompt_additions)
         encoder_device = text_encoder_device(pipeline)
         prompt_embeds, pooled_prompt_embeds, _text_ids = pipeline.encode_prompt(
-            prompt=binding_prompt,
-            prompt_2=binding_prompt,
+            prompt=generation_prompt,
+            prompt_2=generation_prompt,
             device=encoder_device,
             num_images_per_prompt=1,
             max_sequence_length=args.max_sequence_length,
@@ -525,6 +611,7 @@ def main() -> int:
                     "repeat_index": repeat_index,
                     "seed": seed,
                     "file_name": filename,
+                    "generation_prompt": generation_prompt,
                     "layout": layout,
                 }
             )
@@ -556,6 +643,12 @@ def main() -> int:
         "blender_bin": args.blender_bin,
         "blender_cache_dir": str(args.blender_cache_dir or (args.output_dir / "blender_condition_cache")),
         "prompt_prefix": args.prompt_prefix,
+        "generation_prompt_suffix": prompt_additions.suffix,
+        "generation_scene_prefix": prompt_additions.scene_prefix,
+        "background_prompt": prompt_additions.background,
+        "style_prompt": prompt_additions.style,
+        "quality_prompt": prompt_additions.quality,
+        "gnn_layout_sample_mode": args.gnn_layout_sample_mode,
         "seed": args.seed,
     }
     (args.output_dir / "run_config.json").write_text(json.dumps(run_config, indent=2))

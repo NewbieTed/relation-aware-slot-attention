@@ -39,3 +39,6 @@ docs/
 
 # Logs
 logs/
+
+# Local config/archive scratch
+configs/flux/trash/

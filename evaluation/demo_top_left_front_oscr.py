@@ -15,16 +15,22 @@ from typing import Any
 
 import torch
 from PIL import Image, ImageDraw, ImageFont
-from transformers import CLIPTextModel, CLIPTokenizer
 
 from evaluation.prompt_parser import parse_prompt_to_scene_graph
 from training.graph_modules import build_slot_conditioning
 from training.oscr_renderer import render_oscr_boxes
-from training.runtime import load_graph_encoder, resolve_torch_device
+from training.runtime import (
+    DEFAULT_FLUX_MODEL_ID,
+    infer_graph_encoder_config,
+    infer_text_encoder_type,
+    load_graph_encoder,
+    load_graph_label_encoder,
+    normalize_graph_encoder_state_dict,
+    resolve_torch_device,
+)
 from training.scene_graph import build_batched_scene_graphs
 
 
-DEFAULT_CLIP_MODEL_ID = "runwayml/stable-diffusion-v1-5"
 CANVAS_SIZE = 512
 COLORS = ["#00d5ff", "#ff3366", "#2a9d8f", "#f77f00", "#ffd166", "#9b5de5"]
 
@@ -40,9 +46,38 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt-file", type=Path, default=None, help="Optional newline prompt file.")
     parser.add_argument("--graph-encoder-path", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--model-id", type=str, default=DEFAULT_CLIP_MODEL_ID)
+    parser.add_argument("--model-id", type=str, default=DEFAULT_FLUX_MODEL_ID)
     parser.add_argument("--device", choices=("auto", "cpu", "mps", "cuda"), default="auto")
     parser.add_argument("--image-size", type=int, default=CANVAS_SIZE)
+    parser.add_argument(
+        "--layout-sample-mode",
+        choices=("prior_mean", "prior_sample"),
+        default="prior_mean",
+        help="Use prior_mean for deterministic layout or prior_sample for stochastic CVAE samples.",
+    )
+    parser.add_argument(
+        "--num-layout-samples",
+        type=int,
+        default=1,
+        help="Number of GNN layout samples to render per prompt.",
+    )
+    parser.add_argument(
+        "--layout-seed",
+        type=int,
+        default=42,
+        help="Base seed for reproducible stochastic layout samples.",
+    )
+    parser.add_argument(
+        "--layout-z-scale",
+        type=float,
+        default=1.0,
+        help="Debug multiplier for sampled latent displacement around the prior/posterior mean.",
+    )
+    parser.add_argument(
+        "--debug-latents",
+        action="store_true",
+        help="Print prior/posterior latent stats and sampled z values for each layout sample.",
+    )
     parser.add_argument(
         "--depth-offset-scale",
         type=float,
@@ -266,15 +301,120 @@ def _make_contact_sheet(
     sheet.save(output_path)
 
 
+def _short_vector(tensor: torch.Tensor, *, count: int = 3) -> str:
+    values = tensor.detach().cpu().to(torch.float32).flatten()
+    shown = ", ".join(f"{float(value):+.4f}" for value in values[:count])
+    suffix = ", ..." if values.numel() > count else ""
+    return f"[{shown}{suffix}]"
+
+
+def _latent_debug_payload(conditioning: object, node_count: int) -> dict[str, Any]:
+    def _maybe_list(value: torch.Tensor | None) -> list[float] | None:
+        if value is None:
+            return None
+        return value.detach().cpu().to(torch.float32).flatten()[:3].tolist()
+
+    prior_mu = getattr(conditioning, "prior_mu", None)
+    prior_logvar = getattr(conditioning, "prior_logvar", None)
+    sampled_z = getattr(conditioning, "sampled_z", None)
+    object_prior_mu = getattr(conditioning, "object_prior_mu", None)
+    object_prior_logvar = getattr(conditioning, "object_prior_logvar", None)
+    sampled_object_z = getattr(conditioning, "sampled_object_z", None)
+
+    scene_std = torch.exp(0.5 * prior_logvar) if prior_logvar is not None else None
+    scene_eps = (
+        (sampled_z - prior_mu) / scene_std.clamp_min(1e-8)
+        if sampled_z is not None and prior_mu is not None and scene_std is not None
+        else None
+    )
+    object_std = (
+        torch.exp(0.5 * object_prior_logvar[:, :node_count])
+        if object_prior_logvar is not None
+        else None
+    )
+    object_eps = (
+        (sampled_object_z[:, :node_count] - object_prior_mu[:, :node_count])
+        / object_std.clamp_min(1e-8)
+        if sampled_object_z is not None
+        and object_prior_mu is not None
+        and object_std is not None
+        else None
+    )
+    return {
+        "scene_prior_mu_first3": _maybe_list(prior_mu),
+        "scene_prior_std_first3": _maybe_list(scene_std),
+        "scene_eps_first3": _maybe_list(scene_eps),
+        "scene_sampled_z_first3": _maybe_list(sampled_z),
+        "object_prior_mu_first3": _maybe_list(object_prior_mu[:, :node_count] if object_prior_mu is not None else None),
+        "object_prior_std_first3": _maybe_list(object_std),
+        "object_eps_first3": _maybe_list(object_eps),
+        "object_sampled_z_first3": _maybe_list(
+            sampled_object_z[:, :node_count] if sampled_object_z is not None else None
+        ),
+    }
+
+
+def _print_latent_debug(
+    *,
+    prompt_index: int,
+    sample_index: int,
+    sample_seed: int,
+    conditioning: object,
+    centers: torch.Tensor,
+    log_sizes: torch.Tensor,
+    slot_mask: torch.Tensor,
+    labels: list[str],
+) -> None:
+    prior_mu = getattr(conditioning, "prior_mu", None)
+    prior_logvar = getattr(conditioning, "prior_logvar", None)
+    sampled_z = getattr(conditioning, "sampled_z", None)
+    object_prior_mu = getattr(conditioning, "object_prior_mu", None)
+    object_prior_logvar = getattr(conditioning, "object_prior_logvar", None)
+    sampled_object_z = getattr(conditioning, "sampled_object_z", None)
+    print(f"\nLayout latent debug | prompt={prompt_index} sample={sample_index} seed={sample_seed}")
+    if prior_mu is not None and prior_logvar is not None and sampled_z is not None:
+        scene_std = torch.exp(0.5 * prior_logvar)
+        scene_eps = (sampled_z - prior_mu) / scene_std.clamp_min(1e-8)
+        print(f"  scene prior_mu first3: {_short_vector(prior_mu)}")
+        print(f"  scene prior_std first3: {_short_vector(scene_std)}")
+        print(f"  scene eps first3:      {_short_vector(scene_eps)}")
+        print(f"  scene sampled_z first3:{_short_vector(sampled_z)}")
+        print(
+            "  scene summary: "
+            f"mu_abs_mean={prior_mu.detach().abs().mean().item():.6f}, "
+            f"std_mean={scene_std.detach().mean().item():.6f}, "
+            f"z_std={sampled_z.detach().to(torch.float32).std().item():.6f}"
+        )
+    if object_prior_mu is not None and object_prior_logvar is not None and sampled_object_z is not None:
+        valid_indices = torch.where(slot_mask[0].detach().cpu().to(torch.bool))[0].tolist()
+        object_std = torch.exp(0.5 * object_prior_logvar)
+        object_eps = (sampled_object_z - object_prior_mu) / object_std.clamp_min(1e-8)
+        for slot_index in valid_indices:
+            label = labels[slot_index] if slot_index < len(labels) else f"slot{slot_index}"
+            print(f"  object[{slot_index}] {label} prior_mu first3: {_short_vector(object_prior_mu[:, slot_index])}")
+            print(f"  object[{slot_index}] {label} prior_std first3:{_short_vector(object_std[:, slot_index])}")
+            print(f"  object[{slot_index}] {label} eps first3:      {_short_vector(object_eps[:, slot_index])}")
+            print(f"  object[{slot_index}] {label} sampled_z first3:{_short_vector(sampled_object_z[:, slot_index])}")
+    sizes = log_sizes.detach().exp()
+    for slot_index, label in enumerate(labels):
+        print(
+            f"  output[{slot_index}] {label}: "
+            f"center={_short_vector(centers[:, slot_index], count=3)} "
+            f"size={_short_vector(sizes[:, slot_index], count=3)}"
+        )
+
+
 @torch.no_grad()
 def _predict_prompt(
     *,
     prompt: str,
-    tokenizer: CLIPTokenizer,
-    text_encoder: CLIPTextModel,
+    tokenizer: object,
+    text_encoder: object,
     graph_encoder: torch.nn.Module,
     device: str,
-) -> tuple[dict[str, Any], list[str], torch.Tensor, torch.Tensor, torch.Tensor]:
+    layout_sample_mode: str,
+    layout_z_scale: float,
+) -> tuple[dict[str, Any], list[str], torch.Tensor, torch.Tensor, torch.Tensor, object]:
     scene_graph = parse_prompt_to_scene_graph(prompt)
     node_count = len(scene_graph["nodes"])
     slot_targets = torch.zeros(1, node_count, 3, device=torch.device(device))
@@ -290,6 +430,8 @@ def _predict_prompt(
         scene_graph_batch=batched_graph,
         graph_encoder=graph_encoder,
         device=device,
+        layout_sample_mode=layout_sample_mode,
+        layout_z_scale=layout_z_scale,
     )
     labels = [str(node["label"]) for node in scene_graph["nodes"]]
     return (
@@ -298,6 +440,7 @@ def _predict_prompt(
         conditioning.slot_positions[:, :node_count],
         conditioning.slot_log_sizes_3d[:, :node_count],
         conditioning.slot_mask[:, :node_count],
+        conditioning,
     )
 
 
@@ -307,70 +450,116 @@ def main() -> int:
     prompts = _read_prompts(args)
     device = resolve_torch_device(args.device)
 
-    tokenizer = CLIPTokenizer.from_pretrained(args.model_id, subfolder="tokenizer")
-    text_encoder = CLIPTextModel.from_pretrained(args.model_id, subfolder="text_encoder").to(device)
-    text_encoder.eval()
+    state_dict = normalize_graph_encoder_state_dict(torch.load(args.graph_encoder_path, map_location="cpu"))
+    (
+        _slot_dim,
+        text_hidden_dim,
+        _gnn_layers,
+        _layout_mode,
+        _latent_dim,
+        _decoder_mode,
+        _decoder_box_residual,
+        _decoder_film_scale,
+        _use_scene_latent,
+    ) = infer_graph_encoder_config(state_dict)
+    text_encoder_type = infer_text_encoder_type(text_hidden_dim)
+    tokenizer, text_encoder, encoder_hidden_dim = load_graph_label_encoder(
+        model_id=args.model_id,
+        text_encoder_type=text_encoder_type,
+        torch_dtype=torch.float32,
+        device=device,
+    )
     graph_encoder = load_graph_encoder(
         path=args.graph_encoder_path,
-        text_hidden_dim=text_encoder.config.hidden_size,
+        text_hidden_dim=encoder_hidden_dim,
         device=device,
         dtype=text_encoder.dtype,
     )
     graph_encoder.eval()
 
     records: list[dict[str, Any]] = []
+    current_dir = args.output_dir / "current_oscr"
+    fixed_dir = args.output_dir / "top_left_front_oscr"
+    comparison_dir = args.output_dir / "comparison"
+    current_dir.mkdir(parents=True, exist_ok=True)
+    fixed_dir.mkdir(parents=True, exist_ok=True)
+    comparison_dir.mkdir(parents=True, exist_ok=True)
     for index, prompt in enumerate(prompts):
-        scene_graph, labels, centers, log_sizes, slot_mask = _predict_prompt(
-            prompt=prompt,
-            tokenizer=tokenizer,
-            text_encoder=text_encoder,
-            graph_encoder=graph_encoder,
-            device=device,
-        )
-        current_oscr = _tensor_oscr_to_pil(
-            render_oscr_boxes(
-                centers=centers.detach().cpu(),
-                log_sizes=log_sizes.detach().cpu(),
-                slot_mask=slot_mask.detach().cpu(),
+        for sample_index in range(max(1, args.num_layout_samples)):
+            sample_seed = int(args.layout_seed) + index * 1000 + sample_index
+            if args.layout_sample_mode == "prior_sample":
+                torch.manual_seed(sample_seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(sample_seed)
+            scene_graph, labels, centers, log_sizes, slot_mask, conditioning = _predict_prompt(
+                prompt=prompt,
+                tokenizer=tokenizer,
+                text_encoder=text_encoder,
+                graph_encoder=graph_encoder,
+                device=device,
+                layout_sample_mode=args.layout_sample_mode,
+                layout_z_scale=args.layout_z_scale,
+            )
+            if args.debug_latents:
+                _print_latent_debug(
+                    prompt_index=index,
+                    sample_index=sample_index,
+                    sample_seed=sample_seed,
+                    conditioning=conditioning,
+                    centers=centers,
+                    log_sizes=log_sizes,
+                    slot_mask=slot_mask,
+                    labels=labels,
+                )
+            current_oscr = _tensor_oscr_to_pil(
+                render_oscr_boxes(
+                    centers=centers.detach().cpu(),
+                    log_sizes=log_sizes.detach().cpu(),
+                    slot_mask=slot_mask.detach().cpu(),
+                    image_size=args.image_size,
+                )[0]
+            )
+            fixed_corner = render_fixed_corner_oscr(
+                centers=centers,
+                log_sizes=log_sizes,
+                slot_mask=slot_mask,
+                labels=labels,
                 image_size=args.image_size,
-            )[0]
-        )
-        fixed_corner = render_fixed_corner_oscr(
-            centers=centers,
-            log_sizes=log_sizes,
-            slot_mask=slot_mask,
-            labels=labels,
-            image_size=args.image_size,
-            depth_offset_scale=args.depth_offset_scale,
-            front_alpha=args.front_alpha,
-            side_alpha=args.side_alpha,
-            back_alpha=args.back_alpha,
-            edge_alpha=args.edge_alpha,
-        )
-        stem = _safe_name(prompt, index)
-        current_path = args.output_dir / f"{stem}_current_oscr.png"
-        fixed_path = args.output_dir / f"{stem}_top_left_front_oscr.png"
-        sheet_path = args.output_dir / f"{stem}_comparison.png"
-        current_oscr.save(current_path)
-        fixed_corner.save(fixed_path)
-        _make_contact_sheet(
-            prompt=prompt,
-            current=current_oscr,
-            fixed_corner=fixed_corner,
-            output_path=sheet_path,
-        )
-        record = {
-            "prompt": prompt,
-            "scene_graph": scene_graph,
-            "labels": labels,
-            "predicted_centers": centers[0].detach().cpu().to(torch.float32).tolist(),
-            "predicted_sizes": log_sizes[0].detach().cpu().to(torch.float32).exp().tolist(),
-            "current_oscr": str(current_path),
-            "top_left_front_oscr": str(fixed_path),
-            "comparison": str(sheet_path),
-        }
-        records.append(record)
-        print(f"Saved demo for prompt {index}: {sheet_path}")
+                depth_offset_scale=args.depth_offset_scale,
+                front_alpha=args.front_alpha,
+                side_alpha=args.side_alpha,
+                back_alpha=args.back_alpha,
+                edge_alpha=args.edge_alpha,
+            )
+            stem = f"{_safe_name(prompt, index)}_sample{sample_index:02d}"
+            current_path = current_dir / f"{stem}.png"
+            fixed_path = fixed_dir / f"{stem}.png"
+            sheet_path = comparison_dir / f"{stem}.png"
+            current_oscr.save(current_path)
+            fixed_corner.save(fixed_path)
+            _make_contact_sheet(
+                prompt=f"{prompt} | {args.layout_sample_mode} seed={sample_seed}",
+                current=current_oscr,
+                fixed_corner=fixed_corner,
+                output_path=sheet_path,
+            )
+            record = {
+                "prompt": prompt,
+                "sample_index": sample_index,
+                "layout_sample_mode": args.layout_sample_mode,
+                "layout_z_scale": args.layout_z_scale,
+                "layout_seed": sample_seed,
+                "scene_graph": scene_graph,
+                "labels": labels,
+                "predicted_centers": centers[0].detach().cpu().to(torch.float32).tolist(),
+                "predicted_sizes": log_sizes[0].detach().cpu().to(torch.float32).exp().tolist(),
+                "latent_debug": _latent_debug_payload(conditioning, len(labels)),
+                "current_oscr": str(current_path),
+                "top_left_front_oscr": str(fixed_path),
+                "comparison": str(sheet_path),
+            }
+            records.append(record)
+            print(f"Saved demo for prompt {index} sample {sample_index}: {sheet_path}")
 
     (args.output_dir / "top_left_front_oscr_records.json").write_text(json.dumps(records, indent=2))
     return 0

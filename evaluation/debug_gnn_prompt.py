@@ -7,11 +7,18 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from transformers import CLIPTextModel, CLIPTokenizer
 
 from evaluation.prompt_parser import parse_prompt_to_scene_graph
 from training.graph_modules import GraphSlotEncoder, mean_pool_hidden
-from training.runtime import DEFAULT_FLUX_MODEL_ID, load_graph_encoder, resolve_torch_device
+from training.runtime import (
+    DEFAULT_FLUX_MODEL_ID,
+    infer_graph_encoder_config,
+    infer_text_encoder_type,
+    load_graph_encoder,
+    load_graph_label_encoder,
+    normalize_graph_encoder_state_dict,
+    resolve_torch_device,
+)
 from training.scene_graph import RELATION_VOCAB, build_batched_scene_graphs
 
 
@@ -24,7 +31,14 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-id", type=str, default=DEFAULT_FLUX_MODEL_ID)
     parser.add_argument("--graph-encoder-path", type=Path, required=True)
     parser.add_argument("--device", choices=("auto", "cpu", "mps", "cuda"), default="auto")
-    parser.add_argument("--max-vector-elements-print", type=int, default=16)
+    parser.add_argument("--max-vector-elements-print", type=int, default=3)
+    parser.add_argument(
+        "--layout-sample-mode",
+        choices=("auto", "prior_mean", "prior_sample", "posterior"),
+        default="auto",
+        help="For CVAE checkpoints: prior_mean is deterministic, prior_sample is stochastic.",
+    )
+    parser.add_argument("--seed", type=int, default=42)
     return parser
 
 
@@ -73,8 +87,8 @@ def _relation_name_from_index(index: int) -> str:
 def _label_embeddings(
     *,
     labels: list[str],
-    tokenizer: CLIPTokenizer,
-    text_encoder: CLIPTextModel,
+    tokenizer: object,
+    text_encoder: object,
     device: str,
 ) -> tuple[torch.Tensor, list[dict[str, Any]]]:
     text_inputs = tokenizer(labels, padding=True, truncation=True, return_tensors="pt")
@@ -90,8 +104,8 @@ def _label_embeddings(
         details.append(
             {
                 "label": label,
-                "clip_embedding": _tensor_to_list(pooled_embedding),
-                "clip_embedding_norm": _norm(pooled_embedding),
+                "label_embedding": _tensor_to_list(pooled_embedding),
+                "label_embedding_norm": _norm(pooled_embedding),
             }
         )
     return pooled, details
@@ -102,10 +116,13 @@ def _build_debug_payload(
     prompt: str,
     scene_graph: dict[str, Any],
     graph_encoder: GraphSlotEncoder,
-    tokenizer: CLIPTokenizer,
-    text_encoder: CLIPTextModel,
+    tokenizer: object,
+    text_encoder: object,
     device: str,
+    layout_sample_mode: str,
+    seed: int,
 ) -> dict[str, Any]:
+    torch.manual_seed(seed)
     node_labels = [str(node["label"]) for node in scene_graph["nodes"]]
     pooled_embeddings, label_details = _label_embeddings(
         labels=node_labels,
@@ -116,8 +133,14 @@ def _build_debug_payload(
     pooled_embeddings = pooled_embeddings.to(dtype=graph_encoder.node_proj.weight.dtype)
 
     slot_targets = torch.zeros((1, len(node_labels), 3), device=device, dtype=pooled_embeddings.dtype)
+    log_size_targets = torch.zeros((1, len(node_labels), 3), device=device, dtype=pooled_embeddings.dtype)
     slot_mask = torch.ones((1, len(node_labels)), device=device, dtype=torch.bool)
-    batched_graph = build_batched_scene_graphs([scene_graph], slot_targets=slot_targets, slot_mask=slot_mask)
+    batched_graph = build_batched_scene_graphs(
+        [scene_graph],
+        slot_targets=slot_targets,
+        slot_mask=slot_mask,
+        log_size_targets=log_size_targets,
+    )
 
     node_states = graph_encoder.node_proj(pooled_embeddings).detach()
     relation_embeddings_table = graph_encoder.relation_embedding.weight.detach()
@@ -229,8 +252,57 @@ def _build_debug_payload(
         )
         sample_states = new_states
 
+    batched_node_states = sample_states.unsqueeze(0)
+    if graph_encoder.layout_mode == "triple_cvae":
+        conditioning = graph_encoder(
+            pooled_embeddings.unsqueeze(0),
+            batched_graph,
+            layout_sample_mode=layout_sample_mode,
+        )
+        slot_positions = conditioning.slot_positions[0]
+        position_mu = slot_positions
+        position_logvar = None
+        log_sizes_3d = conditioning.slot_log_sizes_3d[0]
+        log_size_mu = log_sizes_3d
+        log_size_logvar = None
+        prior_mu = conditioning.prior_mu
+        prior_logvar = conditioning.prior_logvar
+        posterior_mu = conditioning.posterior_mu
+        posterior_logvar = conditioning.posterior_logvar
+        sampled_z = conditioning.sampled_z
+    elif graph_encoder.layout_mode == "cvae":
+        (
+            batched_slot_positions,
+            batched_position_mu,
+            batched_position_logvar,
+            batched_log_sizes_3d,
+            batched_log_size_mu,
+            batched_log_size_logvar,
+            prior_mu,
+            prior_logvar,
+            posterior_mu,
+            posterior_logvar,
+            sampled_z,
+        ) = graph_encoder._cvae_layout_outputs(
+            batched_node_states,
+            batched_graph,
+            layout_sample_mode=layout_sample_mode,
+        )
+        slot_positions = batched_slot_positions[0]
+        position_mu = batched_position_mu[0]
+        position_logvar = batched_position_logvar[0]
+        log_sizes_3d = batched_log_sizes_3d[0]
+        log_size_mu = batched_log_size_mu[0]
+        log_size_logvar = batched_log_size_logvar[0]
+    else:
+        prior_mu = prior_logvar = posterior_mu = posterior_logvar = sampled_z = None
+        slot_positions = graph_encoder.position_head(sample_states)
+        position_mu = slot_positions
+        position_logvar = None
+        log_sizes_3d = graph_encoder.log_size_3d_head(sample_states).clamp(min=-4.0, max=1.0)
+        log_size_mu = log_sizes_3d
+        log_size_logvar = None
     slot_embeddings = graph_encoder.slot_out(sample_states)
-    slot_positions = graph_encoder.position_head(sample_states)
     slot_log_sigmas = graph_encoder.log_sigma_head(sample_states).clamp(min=-4.0, max=1.0)
 
     predicted_relations: list[dict[str, Any]] = []
@@ -247,8 +319,42 @@ def _build_debug_payload(
             }
         )
 
+    cvae_payload = None
+    if graph_encoder.layout_mode == "cvae":
+        assert prior_mu is not None and prior_logvar is not None
+        assert posterior_mu is not None and posterior_logvar is not None and sampled_z is not None
+        assert position_logvar is not None and log_size_logvar is not None
+        cvae_payload = {
+            "operation": "scene-level CVAE layout head",
+            "layout_sample_mode": layout_sample_mode,
+            "prior_mu": _tensor_to_list(prior_mu[0]),
+            "prior_logvar": _tensor_to_list(prior_logvar[0]),
+            "posterior_mu": _tensor_to_list(posterior_mu[0]),
+            "posterior_logvar": _tensor_to_list(posterior_logvar[0]),
+            "sampled_z": _tensor_to_list(sampled_z[0]),
+            "position_mu": {
+                node_labels[node_index]: _tensor_to_list(position_mu[node_index])
+                for node_index in range(len(node_labels))
+            },
+            "position_logvar": {
+                node_labels[node_index]: _tensor_to_list(position_logvar[node_index])
+                for node_index in range(len(node_labels))
+            },
+            "log_size_3d_mu": {
+                node_labels[node_index]: _tensor_to_list(log_size_mu[node_index])
+                for node_index in range(len(node_labels))
+            },
+            "log_size_3d_logvar": {
+                node_labels[node_index]: _tensor_to_list(log_size_logvar[node_index])
+                for node_index in range(len(node_labels))
+            },
+        }
+
     return {
         "prompt": prompt,
+        "layout_mode": graph_encoder.layout_mode,
+        "layout_sample_mode": layout_sample_mode,
+        "seed": seed,
         "scene_graph": scene_graph,
         "message_passing_edges": [
             {
@@ -261,7 +367,7 @@ def _build_debug_payload(
                 batched_graph.edge_types[0].tolist(),
             )
         ],
-        "clip_label_embeddings": label_details,
+        "label_embeddings": label_details,
         "projected_node_states": {
             node_labels[node_index]: _tensor_to_list(node_states[node_index])
             for node_index in range(len(node_labels))
@@ -286,6 +392,15 @@ def _build_debug_payload(
             node_labels[node_index]: _tensor_to_list(slot_log_sigmas[node_index].exp())
             for node_index in range(len(node_labels))
         },
+        "predicted_log_sizes_3d": {
+            node_labels[node_index]: _tensor_to_list(log_sizes_3d[node_index])
+            for node_index in range(len(node_labels))
+        },
+        "predicted_sizes_3d": {
+            node_labels[node_index]: _tensor_to_list(log_sizes_3d[node_index].exp())
+            for node_index in range(len(node_labels))
+        },
+        "cvae": cvae_payload,
         "predicted_relation_deltas": predicted_relations,
     }
 
@@ -293,6 +408,9 @@ def _build_debug_payload(
 def _render_text_report(payload: dict[str, Any], *, max_vector_elements: int) -> str:
     lines: list[str] = []
     lines.append(f"Prompt: {payload['prompt']}")
+    lines.append(f"Layout mode: {payload['layout_mode']}")
+    lines.append(f"Layout sample mode: {payload['layout_sample_mode']}")
+    lines.append(f"Seed: {payload['seed']}")
     lines.append("")
     lines.append("Scene graph:")
     for node in payload["scene_graph"]["nodes"]:
@@ -307,12 +425,12 @@ def _render_text_report(payload: dict[str, Any], *, max_vector_elements: int) ->
         )
     lines.append("")
 
-    lines.append("CLIP pooled label embeddings:")
-    for item in payload["clip_label_embeddings"]:
-        vector = torch.tensor(item["clip_embedding"])
+    lines.append("Object label embeddings:")
+    for item in payload["label_embeddings"]:
+        vector = torch.tensor(item["label_embedding"])
         lines.append(
-            f"  {item['label']}: norm={item['clip_embedding_norm']:.4f} "
-            f"{_first_n_vector(vector)}"
+            f"  {item['label']}: norm={item['label_embedding_norm']:.4f} "
+            f"{_preview_vector(vector, max_elements=max_vector_elements)}"
         )
     lines.append("")
 
@@ -322,7 +440,7 @@ def _render_text_report(payload: dict[str, Any], *, max_vector_elements: int) ->
         lines.append(
             f"  {item['sender_label']} -> {item['receiver_label']} ({item['relation']}): "
             f"norm={item['relation_embedding_norm']:.4f} "
-            f"{_first_n_vector(vector)}"
+            f"{_preview_vector(vector, max_elements=max_vector_elements)}"
         )
     if payload["active_relation_angles"]:
         lines.append("  Angles between active relation embeddings:")
@@ -336,7 +454,7 @@ def _render_text_report(payload: dict[str, Any], *, max_vector_elements: int) ->
     lines.append("Projected node states before message passing:")
     for label, values in payload["projected_node_states"].items():
         lines.append(
-            f"  {label}: {_first_n_vector(torch.tensor(values))}"
+            f"  {label}: {_preview_vector(torch.tensor(values), max_elements=max_vector_elements)}"
         )
     lines.append("")
 
@@ -354,20 +472,20 @@ def _render_text_report(payload: dict[str, Any], *, max_vector_elements: int) ->
                 "    message_input = concat(sender_state, relation_embedding)"
             )
             lines.append(
-                f"      sender_state[{message['sender_label']}] = {_first_n_vector(sender_state)}"
+                f"      sender_state[{message['sender_label']}] = {_preview_vector(sender_state, max_elements=max_vector_elements)}"
             )
             lines.append(
-                f"      relation_embedding[{message['relation']}] = {_first_n_vector(relation_embedding)}"
+                f"      relation_embedding[{message['relation']}] = {_preview_vector(relation_embedding, max_elements=max_vector_elements)}"
             )
             lines.append(
                 "      message = MLP(message_input)"
-                f" = {_first_n_vector(message_tensor)} (norm={message['message_norm']:.4f})"
+                f" = {_preview_vector(message_tensor, max_elements=max_vector_elements)} (norm={message['message_norm']:.4f})"
             )
         lines.append("  Aggregation:")
         for label, values in layer["aggregated_messages"].items():
             lines.append(
                 f"    aggregated[{label}] = "
-                f"{_first_n_vector(torch.tensor(values))}"
+                f"{_preview_vector(torch.tensor(values), max_elements=max_vector_elements)}"
             )
         lines.append("  Residual updates and new states:")
         for label, update_values in layer["residual_updates"].items():
@@ -379,33 +497,77 @@ def _render_text_report(payload: dict[str, Any], *, max_vector_elements: int) ->
                 f"    update_input[{label}] = concat(old_state[{label}], aggregated[{label}])"
             )
             lines.append(
-                f"      old_state[{label}] = {_first_n_vector(before_values)}"
+                f"      old_state[{label}] = {_preview_vector(before_values, max_elements=max_vector_elements)}"
             )
             lines.append(
-                f"      aggregated[{label}] = {_first_n_vector(aggregated_values)}"
+                f"      aggregated[{label}] = {_preview_vector(aggregated_values, max_elements=max_vector_elements)}"
             )
             lines.append(
-                f"      residual_update[{label}] = MLP(update_input) = {_first_n_vector(update_tensor)}"
+                f"      residual_update[{label}] = MLP(update_input) = {_preview_vector(update_tensor, max_elements=max_vector_elements)}"
             )
             lines.append(
                 f"      new_state[{label}] = old_state + residual_update"
-                f" = {_first_n_vector(before_values)} + {_first_n_vector(update_tensor)}"
-                f" = {_first_n_vector(torch.tensor(after_values))}"
+                f" = {_preview_vector(before_values, max_elements=max_vector_elements)} + {_preview_vector(update_tensor, max_elements=max_vector_elements)}"
+                f" = {_preview_vector(torch.tensor(after_values), max_elements=max_vector_elements)}"
             )
         lines.append("")
 
     lines.append("Final slot embeddings:")
     for label, values in payload["final_slot_embeddings"].items():
         lines.append(
-            f"  {label}: {_first_n_vector(torch.tensor(values))}"
+            f"  {label}: {_preview_vector(torch.tensor(values), max_elements=max_vector_elements)}"
         )
     lines.append("")
+
+    if payload["cvae"] is not None:
+        cvae = payload["cvae"]
+        lines.append("CVAE layout head:")
+        lines.append("  graph_state = attention_readout(final_node_states, slot_mask)")
+        lines.append("  prior_stats = prior_head(graph_state)")
+        lines.append(
+            f"    prior_mu = {_preview_vector(torch.tensor(cvae['prior_mu']), max_elements=max_vector_elements)}"
+        )
+        lines.append(
+            f"    prior_logvar = {_preview_vector(torch.tensor(cvae['prior_logvar']), max_elements=max_vector_elements)}"
+        )
+        lines.append("  gt_layout_state = attention_readout(gt_layout_encoder(concat(gt_center, gt_log_size)), slot_mask)")
+        lines.append("  posterior_stats = posterior_head(concat(graph_state, gt_layout_state))")
+        lines.append(
+            f"    posterior_mu = {_preview_vector(torch.tensor(cvae['posterior_mu']), max_elements=max_vector_elements)}"
+        )
+        lines.append(
+            f"    posterior_logvar = {_preview_vector(torch.tensor(cvae['posterior_logvar']), max_elements=max_vector_elements)}"
+        )
+        lines.append("  z = mu + exp(0.5 * logvar) * epsilon")
+        lines.append(
+            f"    sampled_z = {_preview_vector(torch.tensor(cvae['sampled_z']), max_elements=max_vector_elements)}"
+        )
+        lines.append("  decoder_input[obj] = concat(final_node_state[obj], z)")
+        for label, values in cvae["position_mu"].items():
+            lines.append(
+                f"    {label}: "
+                f"position_mu={_preview_vector(torch.tensor(values), max_elements=max_vector_elements)}, "
+                f"position_logvar={_preview_vector(torch.tensor(cvae['position_logvar'][label]), max_elements=max_vector_elements)}, "
+                f"log_size_mu={_preview_vector(torch.tensor(cvae['log_size_3d_mu'][label]), max_elements=max_vector_elements)}, "
+                f"log_size_logvar={_preview_vector(torch.tensor(cvae['log_size_3d_logvar'][label]), max_elements=max_vector_elements)}"
+            )
+        lines.append("")
 
     lines.append("Predicted (x, y, z):")
     for label, values in payload["predicted_slot_positions"].items():
         tensor_values = torch.tensor(values)
         lines.append(
             f"  {label}: ({tensor_values[0]:+.4f}, {tensor_values[1]:+.4f}, {tensor_values[2]:+.4f})"
+        )
+    lines.append("")
+
+    lines.append("Predicted 3D log-size and size:")
+    for label, values in payload["predicted_log_sizes_3d"].items():
+        log_values = torch.tensor(values)
+        size_values = torch.tensor(payload["predicted_sizes_3d"][label])
+        lines.append(
+            f"  {label}: log_size=({log_values[0]:+.4f}, {log_values[1]:+.4f}, {log_values[2]:+.4f}), "
+            f"size=({size_values[0]:+.4f}, {size_values[1]:+.4f}, {size_values[2]:+.4f})"
         )
     lines.append("")
 
@@ -436,13 +598,29 @@ def main() -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     device = resolve_torch_device(args.device)
-    tokenizer = CLIPTokenizer.from_pretrained(args.model_id, subfolder="tokenizer")
-    text_encoder = CLIPTextModel.from_pretrained(args.model_id, subfolder="text_encoder").to(device)
-    text_encoder.eval()
+    state_dict = normalize_graph_encoder_state_dict(torch.load(args.graph_encoder_path, map_location="cpu"))
+    (
+        _slot_dim,
+        text_hidden_dim,
+        _gnn_layers,
+        _layout_mode,
+        _latent_dim,
+        _decoder_mode,
+        _decoder_box_residual,
+        _decoder_film_scale,
+        _use_scene_latent,
+    ) = infer_graph_encoder_config(state_dict)
+    text_encoder_type = infer_text_encoder_type(text_hidden_dim)
+    tokenizer, text_encoder, encoder_hidden_dim = load_graph_label_encoder(
+        model_id=args.model_id,
+        text_encoder_type=text_encoder_type,
+        torch_dtype=torch.float32,
+        device=device,
+    )
 
     graph_encoder = load_graph_encoder(
         path=args.graph_encoder_path,
-        text_hidden_dim=text_encoder.config.hidden_size,
+        text_hidden_dim=encoder_hidden_dim,
         device=device,
         dtype=text_encoder.dtype,
     )
@@ -456,6 +634,8 @@ def main() -> int:
         tokenizer=tokenizer,
         text_encoder=text_encoder,
         device=device,
+        layout_sample_mode=args.layout_sample_mode,
+        seed=args.seed,
     )
 
     json_path = args.output_dir / "gnn_trace.json"

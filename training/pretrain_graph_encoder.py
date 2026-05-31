@@ -12,10 +12,12 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from .config import parse_args_with_config
-from .dataset import build_dataset_splits, collate_training_items
+from .dataset import build_dataset_splits, collate_training_items, load_metadata_rows
 from .graph_modules import (
     GraphSlotEncoder,
+    box_3d_l1_loss,
     build_slot_conditioning,
+    cvae_kl_loss,
     embedding_alignment_loss,
     inverse_relation_regularizer,
     log_size_3d_loss,
@@ -25,13 +27,16 @@ from .graph_modules import (
 )
 from .graph_targets import (
     bbox_centers_after_crop,
+    bbox_minmax_3d_after_crop,
     bbox_log_sigmas_after_crop,
     bbox_log_sizes_3d_after_crop,
 )
 from .metrics import MetricsLogger, write_split_manifest
+from .prompts import prompt_from_scop_depth_row, scene_graph_payload_from_row
 from .runtime import (
     DEFAULT_FLUX_MODEL_ID,
     is_tqdm_disabled,
+    load_graph_label_encoder,
     set_seed,
 )
 from .scene_graph import build_batched_scene_graphs
@@ -45,12 +50,33 @@ def _save_state(output_dir: Path, *, step: int, args: argparse.Namespace) -> Non
         "graph_learning_rate": args.graph_learning_rate,
         "slot_dim": args.slot_dim,
         "gnn_layers": args.gnn_layers,
+        "text_encoder_type": args.text_encoder_type,
+        "text_hidden_dim": args.text_hidden_dim,
         "position_loss_weight": args.position_loss_weight,
         "relation_loss_weight": args.relation_loss_weight,
         "embedding_loss_weight": args.embedding_loss_weight,
         "inverse_relation_loss_weight": args.inverse_relation_loss_weight,
         "box_loss_weight": args.box_loss_weight,
         "box3d_loss_weight": args.box3d_loss_weight,
+        "layout_mode": args.layout_mode,
+        "latent_dim": args.latent_dim,
+        "decoder_node_dropout": args.decoder_node_dropout,
+        "decoder_mode": args.decoder_mode,
+        "decoder_box_residual": args.decoder_box_residual,
+        "decoder_box_residual_scale": args.decoder_box_residual_scale,
+        "decoder_film_scale": args.decoder_film_scale,
+        "use_scene_latent": args.use_scene_latent,
+        "label_embedding_cache": str(args.label_embedding_cache) if args.label_embedding_cache else None,
+        "prompt_filter": args.prompt_filter,
+        "cvae_kl_weight": args.cvae_kl_weight,
+        "cvae_kl_warmup_steps": args.cvae_kl_warmup_steps,
+        "cvae_best_of_k": args.cvae_best_of_k,
+        "cvae_free_bits": args.cvae_free_bits,
+        "debug_spread_after_training": args.debug_spread_after_training,
+        "debug_spread_prompt": args.debug_spread_prompt,
+        "debug_spread_samples": args.debug_spread_samples,
+        "debug_spread_posterior_rows": args.debug_spread_posterior_rows,
+        "debug_spread_z_scale": args.debug_spread_z_scale,
     }
     (output_dir / "training_state.json").write_text(json.dumps(payload, indent=2))
 
@@ -82,6 +108,349 @@ def _unwrap_graph_encoder(graph_encoder: GraphSlotEncoder, accelerator: Accelera
     return getattr(unwrapped, "_orig_mod", unwrapped)
 
 
+def _graph_layout_mode(graph_encoder: GraphSlotEncoder) -> str:
+    base = getattr(graph_encoder, "module", graph_encoder)
+    base = getattr(base, "_orig_mod", base)
+    return getattr(base, "layout_mode", "deterministic")
+
+
+def _metric_keys(layout_mode: str) -> list[str]:
+    keys = [
+        "loss",
+        "position_loss",
+        "relation_loss",
+        "box3d_loss",
+    ]
+    if layout_mode in {"cvae", "triple_cvae"}:
+        keys.extend(["cvae_kl_loss", "cvae_kl_weighted"])
+    return keys
+
+
+def _short_vec(values: torch.Tensor) -> str:
+    return "[" + ", ".join(f"{float(value):+.4f}" for value in values.detach().cpu()) + "]"
+
+
+def _summarize_tensor(values: torch.Tensor) -> dict[str, torch.Tensor]:
+    values = values.detach().cpu().to(torch.float32)
+    return {
+        "mean": values.mean(dim=0),
+        "std": values.std(dim=0, unbiased=False),
+        "min": values.min(dim=0).values,
+        "max": values.max(dim=0).values,
+        "range": values.max(dim=0).values - values.min(dim=0).values,
+    }
+
+
+def _normalize_debug_prompt(prompt: str) -> str:
+    normalized = " ".join(prompt.split()).lower()
+    for prefix in ("a photo of ", "an image of ", "a picture of "):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix) :]
+            break
+    return normalized
+
+
+def _print_layout_summary(label: str, centers: torch.Tensor, sizes: torch.Tensor) -> None:
+    center_stats = _summarize_tensor(centers)
+    size_stats = _summarize_tensor(sizes)
+    print(f"  {label}")
+    print(f"    center mean:  {_short_vec(center_stats['mean'])}")
+    print(f"    center std:   {_short_vec(center_stats['std'])}")
+    print(f"    center min:   {_short_vec(center_stats['min'])}")
+    print(f"    center max:   {_short_vec(center_stats['max'])}")
+    print(f"    center range: {_short_vec(center_stats['range'])}")
+    print(f"    size mean:    {_short_vec(size_stats['mean'])}")
+    print(f"    size std:     {_short_vec(size_stats['std'])}")
+    print(f"    size min:     {_short_vec(size_stats['min'])}")
+    print(f"    size max:     {_short_vec(size_stats['max'])}")
+    print(f"    size range:   {_short_vec(size_stats['range'])}")
+
+
+def _print_delta_summary(centers: torch.Tensor) -> None:
+    if centers.shape[1] < 2:
+        return
+    delta = centers[:, 1, :] - centers[:, 0, :]
+    delta_stats = _summarize_tensor(delta)
+    print("  object1 - object0 center delta")
+    print(f"    mean:  {_short_vec(delta_stats['mean'])}")
+    print(f"    std:   {_short_vec(delta_stats['std'])}")
+    print(f"    min:   {_short_vec(delta_stats['min'])}")
+    print(f"    max:   {_short_vec(delta_stats['max'])}")
+    print(f"    range: {_short_vec(delta_stats['range'])}")
+
+
+def _load_label_embedding_cache(
+    path: Path | None,
+    *,
+    model_id: str,
+    text_encoder_type: str,
+    text_hidden_dim: int,
+) -> dict[str, torch.Tensor]:
+    if path is None or not path.exists():
+        return {}
+    payload = torch.load(path, map_location="cpu")
+    metadata = payload.get("metadata", {})
+    expected = {
+        "model_id": model_id,
+        "text_encoder_type": text_encoder_type,
+        "text_hidden_dim": text_hidden_dim,
+    }
+    mismatches = {
+        key: (metadata.get(key), value)
+        for key, value in expected.items()
+        if metadata.get(key) != value
+    }
+    if mismatches:
+        details = ", ".join(
+            f"{key}: cache={cache_value!r}, current={current_value!r}"
+            for key, (cache_value, current_value) in mismatches.items()
+        )
+        raise ValueError(f"Label embedding cache does not match this run ({details}).")
+    embeddings = payload.get("embeddings", {})
+    return {str(label): embedding.detach().cpu() for label, embedding in embeddings.items()}
+
+
+def _save_label_embedding_cache(
+    path: Path | None,
+    cache: dict[str, torch.Tensor],
+    *,
+    model_id: str,
+    text_encoder_type: str,
+    text_hidden_dim: int,
+) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "metadata": {
+                "model_id": model_id,
+                "text_encoder_type": text_encoder_type,
+                "text_hidden_dim": text_hidden_dim,
+            },
+            "embeddings": {label: embedding.detach().cpu() for label, embedding in cache.items()},
+        },
+        path,
+    )
+
+
+def _rows_matching_prompt(rows: list[dict[str, object]], prompt: str, *, limit: int | None = None) -> list[dict[str, object]]:
+    expected = _normalize_debug_prompt(prompt)
+    matched = [
+        row
+        for row in rows
+        if _normalize_debug_prompt(prompt_from_scop_depth_row(row)) == expected
+    ]
+    return matched[:limit] if limit is not None else matched
+
+
+@torch.no_grad()
+def _print_training_data_spread(
+    *,
+    rows: list[dict[str, object]],
+    prompt: str,
+) -> None:
+    matched_rows = _rows_matching_prompt(rows, prompt)
+    if not matched_rows:
+        print(f"No training rows matched debug prompt: {prompt}")
+        return
+    image_sizes = [tuple(row.get("image_size") or (512, 512)) for row in matched_rows]
+    boxes, mask = bbox_minmax_3d_after_crop(
+        matched_rows,
+        image_sizes,
+        max_nodes=2,
+        device=torch.device("cpu"),
+    )
+    centers = (boxes[..., :3] + boxes[..., 3:]) * 0.5
+    centers = centers.mul(2.0).sub(1.0)
+    sizes = boxes[..., 3:] - boxes[..., :3]
+    labels = [
+        str(annot.get("category_name") or annot.get("category_id") or f"obj{index}")
+        for index, annot in enumerate(matched_rows[0].get("annots", []))
+    ]
+
+    print("")
+    print("===== DEBUG: TRAINING DATA DISTRIBUTION =====")
+    print(f"Prompt filter: {prompt}")
+    print(f"Rows: {len(matched_rows)}")
+    print("Coordinate space: model centers [-1, 1], sizes in normalized box units")
+    for object_index, label in enumerate(labels[:2]):
+        valid = mask[:, object_index]
+        _print_layout_summary(
+            label,
+            centers[valid, object_index, :],
+            sizes[valid, object_index, :],
+        )
+    valid_pair = mask[:, 0] & mask[:, 1]
+    _print_delta_summary(centers[valid_pair])
+
+
+@torch.no_grad()
+def _predict_debug_prior_sample(
+    *,
+    prompt: str,
+    tokenizer: object,
+    text_encoder: object,
+    graph_encoder: GraphSlotEncoder,
+    device: str,
+    layout_z_scale: float,
+    label_embedding_cache: dict[str, torch.Tensor] | None,
+) -> tuple[list[str], torch.Tensor, torch.Tensor]:
+    from evaluation.prompt_parser import parse_prompt_to_scene_graph
+
+    scene_graph = parse_prompt_to_scene_graph(prompt)
+    node_count = len(scene_graph["nodes"])
+    slot_targets = torch.zeros(1, node_count, 3, device=torch.device(device))
+    slot_mask = torch.ones(1, node_count, device=torch.device(device), dtype=torch.bool)
+    scene_graph_batch = build_batched_scene_graphs(
+        [scene_graph],
+        slot_targets=slot_targets,
+        slot_mask=slot_mask,
+    )
+    conditioning = build_slot_conditioning(
+        tokenizer=tokenizer,
+        text_encoder=text_encoder,
+        scene_graph_batch=scene_graph_batch,
+        graph_encoder=graph_encoder,
+        device=device,
+        layout_sample_mode="prior_sample",
+        layout_z_scale=layout_z_scale,
+        label_embedding_cache=label_embedding_cache,
+    )
+    labels = [str(node["label"]) for node in scene_graph["nodes"]]
+    centers = conditioning.slot_positions[0, :node_count].detach().cpu().to(torch.float32)
+    sizes = conditioning.slot_log_sizes_3d[0, :node_count].detach().cpu().to(torch.float32).exp()
+    return labels, centers, sizes
+
+
+@torch.no_grad()
+def _predict_debug_posterior_row(
+    *,
+    row: dict[str, object],
+    tokenizer: object,
+    text_encoder: object,
+    graph_encoder: GraphSlotEncoder,
+    device: str,
+    layout_z_scale: float,
+    label_embedding_cache: dict[str, torch.Tensor] | None,
+) -> tuple[list[str], torch.Tensor, torch.Tensor]:
+    scene_graph = scene_graph_payload_from_row(row)
+    node_count = len(scene_graph["nodes"])
+    image_size = tuple(row.get("image_size") or (512, 512))
+    box_targets, slot_mask = bbox_minmax_3d_after_crop(
+        [row],
+        [image_size],
+        max_nodes=node_count,
+        device=torch.device(device),
+    )
+    centers_01 = (box_targets[..., :3] + box_targets[..., 3:]) * 0.5
+    sizes_01 = (box_targets[..., 3:] - box_targets[..., :3]).clamp_min(0.03)
+    slot_targets = centers_01.mul(2.0).sub(1.0)
+    log_size_targets = sizes_01.log()
+    scene_graph_batch = build_batched_scene_graphs(
+        [scene_graph],
+        slot_targets=slot_targets,
+        slot_mask=slot_mask,
+        log_size_targets=log_size_targets,
+        box_targets=box_targets,
+    )
+    conditioning = build_slot_conditioning(
+        tokenizer=tokenizer,
+        text_encoder=text_encoder,
+        scene_graph_batch=scene_graph_batch,
+        graph_encoder=graph_encoder,
+        device=device,
+        layout_sample_mode="posterior",
+        layout_z_scale=layout_z_scale,
+        label_embedding_cache=label_embedding_cache,
+    )
+    labels = [str(node["label"]) for node in scene_graph["nodes"]]
+    centers = conditioning.slot_positions[0, :node_count].detach().cpu().to(torch.float32)
+    sizes = conditioning.slot_log_sizes_3d[0, :node_count].detach().cpu().to(torch.float32).exp()
+    return labels, centers, sizes
+
+
+@torch.no_grad()
+def _print_model_spread(
+    *,
+    prompt: str,
+    rows: list[dict[str, object]],
+    tokenizer: object,
+    text_encoder: object,
+    graph_encoder: GraphSlotEncoder,
+    device: str,
+    sample_count: int,
+    posterior_rows: int,
+    seed: int,
+    layout_z_scale: float,
+    label_embedding_cache: dict[str, torch.Tensor] | None,
+) -> None:
+    graph_encoder.eval()
+    all_centers: list[torch.Tensor] = []
+    all_sizes: list[torch.Tensor] = []
+    labels: list[str] | None = None
+    print("")
+    print("===== DEBUG: MODEL PRIOR SAMPLE SPREAD =====")
+    print(f"Prompt: {prompt}")
+    print(f"mode=prior_sample, samples={sample_count}, seed={seed}, z_scale={layout_z_scale}")
+    for sample_index in range(max(1, sample_count)):
+        sample_seed = int(seed) + sample_index
+        torch.manual_seed(sample_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(sample_seed)
+        labels, centers, sizes = _predict_debug_prior_sample(
+            prompt=prompt,
+            tokenizer=tokenizer,
+            text_encoder=text_encoder,
+            graph_encoder=graph_encoder,
+            device=device,
+            layout_z_scale=layout_z_scale,
+            label_embedding_cache=label_embedding_cache,
+        )
+        all_centers.append(centers)
+        all_sizes.append(sizes)
+    if labels is not None:
+        centers_tensor = torch.stack(all_centers, dim=0)
+        sizes_tensor = torch.stack(all_sizes, dim=0)
+        for object_index, label in enumerate(labels):
+            _print_layout_summary(label, centers_tensor[:, object_index, :], sizes_tensor[:, object_index, :])
+        _print_delta_summary(centers_tensor)
+
+    matched_rows = _rows_matching_prompt(rows, prompt, limit=posterior_rows)
+    if not matched_rows:
+        print(f"No posterior rows matched debug prompt: {prompt}")
+        return
+    all_centers = []
+    all_sizes = []
+    labels = None
+    print("")
+    print("===== DEBUG: MODEL POSTERIOR SPREAD =====")
+    print(f"Prompt: {prompt}")
+    print(f"mode=posterior, rows={len(matched_rows)}, seed={seed}, z_scale={layout_z_scale}")
+    for row_index, row in enumerate(matched_rows):
+        sample_seed = int(seed) + row_index * 1000
+        torch.manual_seed(sample_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(sample_seed)
+        labels, centers, sizes = _predict_debug_posterior_row(
+            row=row,
+            tokenizer=tokenizer,
+            text_encoder=text_encoder,
+            graph_encoder=graph_encoder,
+            device=device,
+            layout_z_scale=layout_z_scale,
+            label_embedding_cache=label_embedding_cache,
+        )
+        all_centers.append(centers)
+        all_sizes.append(sizes)
+    if labels is not None:
+        centers_tensor = torch.stack(all_centers, dim=0)
+        sizes_tensor = torch.stack(all_sizes, dim=0)
+        for object_index, label in enumerate(labels):
+            _print_layout_summary(label, centers_tensor[:, object_index, :], sizes_tensor[:, object_index, :])
+        _print_delta_summary(centers_tensor)
+
+
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Pretrain the SCOP-Depth graph encoder before full relation-aware diffusion training."
@@ -98,11 +467,23 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--slot-dim", type=int, default=512)
     parser.add_argument("--gnn-layers", type=int, default=2)
+    parser.add_argument("--text-encoder-type", choices=("clip", "t5"), default="clip")
+    parser.add_argument("--text-hidden-dim", type=int, default=None)
+    parser.add_argument("--label-embedding-cache", type=Path, default=None)
+    parser.add_argument("--layout-mode", choices=("deterministic", "cvae", "triple_cvae"), default="deterministic")
+    parser.add_argument("--latent-dim", type=int, default=64)
+    parser.add_argument("--decoder-node-dropout", type=float, default=0.0)
+    parser.add_argument("--decoder-mode", choices=("triple_gnn", "mlp"), default="triple_gnn")
+    parser.add_argument("--decoder-box-residual", action="store_true")
+    parser.add_argument("--decoder-box-residual-scale", type=float, default=0.25)
+    parser.add_argument("--decoder-film-scale", type=float, default=0.1)
+    parser.add_argument("--use-scene-latent", action="store_true")
     parser.add_argument("--save-every", type=int, default=500)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--eval-every", type=int, default=250)
     parser.add_argument("--limit-rows", type=int, default=None)
     parser.add_argument("--prompt-prefix", type=str, default="a photo of")
+    parser.add_argument("--prompt-filter", type=str, default=None)
     parser.add_argument("--eval-fraction", type=float, default=0.1)
     parser.add_argument("--test-fraction", type=float, default=0.1)
     parser.add_argument("--position-loss-weight", type=float, default=1.0)
@@ -111,6 +492,15 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--inverse-relation-loss-weight", type=float, default=0.0)
     parser.add_argument("--box-loss-weight", type=float, default=0.0)
     parser.add_argument("--box3d-loss-weight", type=float, default=0.0)
+    parser.add_argument("--cvae-kl-weight", type=float, default=0.0)
+    parser.add_argument("--cvae-kl-warmup-steps", type=int, default=1000)
+    parser.add_argument("--cvae-best-of-k", type=int, default=1)
+    parser.add_argument("--cvae-free-bits", type=float, default=0.0)
+    parser.add_argument("--debug-spread-after-training", action="store_true")
+    parser.add_argument("--debug-spread-prompt", type=str, default=None)
+    parser.add_argument("--debug-spread-samples", type=int, default=256)
+    parser.add_argument("--debug-spread-posterior-rows", type=int, default=64)
+    parser.add_argument("--debug-spread-z-scale", type=float, default=1.0)
     parser.add_argument("--disable-tqdm", action="store_true")
     return parser
 
@@ -128,6 +518,12 @@ def _compute_graph_batch_losses(
     inverse_relation_loss_weight: float,
     box_loss_weight: float,
     box3d_loss_weight: float = 0.0,
+    cvae_kl_weight: float = 0.0,
+    cvae_kl_warmup_steps: int = 1000,
+    cvae_best_of_k: int = 1,
+    cvae_free_bits: float = 0.0,
+    step: int | None = None,
+    label_embedding_cache: dict[str, torch.Tensor] | None = None,
 ) -> dict[str, torch.Tensor]:
     max_nodes = max(len(graph["nodes"]) for graph in batch["scene_graphs"])  # type: ignore[index]
     slot_targets, slot_mask = bbox_centers_after_crop(
@@ -148,24 +544,28 @@ def _compute_graph_batch_losses(
         max_nodes=max_nodes,
         device=torch.device(device),
     )
+    box_3d_targets, _ = bbox_minmax_3d_after_crop(
+        batch["metadata"],  # type: ignore[arg-type]
+        batch["image_sizes"],  # type: ignore[arg-type]
+        max_nodes=max_nodes,
+        device=torch.device(device),
+    )
     scene_graph_batch = build_batched_scene_graphs(
         batch["scene_graphs"],  # type: ignore[arg-type]
         slot_targets=slot_targets,
         slot_mask=slot_mask,
+        log_size_targets=log_size_3d_targets,
+        box_targets=box_3d_targets,
     )
+    layout_mode = _graph_layout_mode(graph_encoder)
     conditioning = build_slot_conditioning(
         tokenizer=tokenizer,
         text_encoder=text_encoder,
         scene_graph_batch=scene_graph_batch,
         graph_encoder=graph_encoder,
         device=device,
-    )
-    pooled_embeddings = pooled_label_embeddings(
-        tokenizer=tokenizer,
-        text_encoder=text_encoder,
-        scene_graph_batch=scene_graph_batch,
-        device=device,
-        dtype=conditioning.slot_embeddings.dtype,
+        layout_sample_mode="posterior" if layout_mode in {"cvae", "triple_cvae"} else "auto",
+        label_embedding_cache=label_embedding_cache,
     )
 
     position_loss = F.smooth_l1_loss(
@@ -177,22 +577,69 @@ def _compute_graph_batch_losses(
         conditioning.slot_positions,
         scene_graph_batch,
     )
-    semantic_loss = embedding_alignment_loss(
-        conditioning.slot_embeddings,
-        pooled_embeddings,
-        conditioning.slot_mask,
-    )
+    if embedding_loss_weight:
+        pooled_embeddings = pooled_label_embeddings(
+            tokenizer=tokenizer,
+            text_encoder=text_encoder,
+            scene_graph_batch=scene_graph_batch,
+            device=device,
+            dtype=conditioning.slot_embeddings.dtype,
+            label_embedding_cache=label_embedding_cache,
+        )
+        semantic_loss = embedding_alignment_loss(
+            conditioning.slot_embeddings,
+            pooled_embeddings,
+            conditioning.slot_mask,
+        )
+    else:
+        semantic_loss = conditioning.slot_embeddings.new_tensor(0.0)
     box_loss = log_sigma_loss(
         conditioning.slot_log_sigmas,
         log_sigma_targets,
         conditioning.slot_mask,
     )
-    box3d_loss = log_size_3d_loss(
-        conditioning.slot_log_sizes_3d,
-        log_size_3d_targets,
-        conditioning.slot_mask,
-    )
+    if layout_mode == "triple_cvae":
+        box3d_loss = box_3d_l1_loss(
+            conditioning.slot_boxes_3d,
+            box_3d_targets,
+            conditioning.slot_mask,
+        )
+        if graph_encoder.training and cvae_best_of_k > 1:
+            best_box3d_loss = box3d_loss
+            best_conditioning = conditioning
+            for _sample_index in range(cvae_best_of_k - 1):
+                candidate = build_slot_conditioning(
+                    tokenizer=tokenizer,
+                    text_encoder=text_encoder,
+                    scene_graph_batch=scene_graph_batch,
+                    graph_encoder=graph_encoder,
+                    device=device,
+                    layout_sample_mode="posterior",
+                    label_embedding_cache=label_embedding_cache,
+                )
+                candidate_box3d_loss = box_3d_l1_loss(
+                    candidate.slot_boxes_3d,
+                    box_3d_targets,
+                    candidate.slot_mask,
+                )
+                if float(candidate_box3d_loss.detach().cpu()) < float(best_box3d_loss.detach().cpu()):
+                    best_box3d_loss = candidate_box3d_loss
+                    best_conditioning = candidate
+            conditioning = best_conditioning
+            box3d_loss = best_box3d_loss
+    else:
+        box3d_loss = log_size_3d_loss(
+            conditioning.slot_log_sizes_3d,
+            log_size_3d_targets,
+            conditioning.slot_mask,
+        )
     inverse_loss = inverse_relation_regularizer(graph_encoder)
+    kl_loss = cvae_kl_loss(conditioning, free_bits=cvae_free_bits)
+    if cvae_kl_warmup_steps > 0 and step is not None:
+        kl_scale = min(1.0, max(0.0, float(step) / float(cvae_kl_warmup_steps)))
+    else:
+        kl_scale = 1.0
+    weighted_kl = cvae_kl_weight * kl_scale * kl_loss
     total_loss = (
         position_loss_weight * position_loss
         + relation_loss_weight * edge_loss
@@ -200,6 +647,7 @@ def _compute_graph_batch_losses(
         + inverse_relation_loss_weight * inverse_loss
         + box_loss_weight * box_loss
         + box3d_loss_weight * box3d_loss
+        + weighted_kl
     )
     return {
         "loss": total_loss,
@@ -209,6 +657,8 @@ def _compute_graph_batch_losses(
         "inverse_relation_loss": inverse_loss,
         "box_loss": box_loss,
         "box3d_loss": box3d_loss,
+        "cvae_kl_loss": kl_loss,
+        "cvae_kl_weighted": weighted_kl,
     }
 
 
@@ -226,17 +676,15 @@ def _evaluate_graph_encoder(
     inverse_relation_loss_weight: float,
     box_loss_weight: float,
     box3d_loss_weight: float,
+    cvae_kl_weight: float,
+    cvae_kl_warmup_steps: int,
+    cvae_best_of_k: int = 1,
+    cvae_free_bits: float = 0.0,
+    label_embedding_cache: dict[str, torch.Tensor] | None = None,
 ) -> dict[str, float]:
     graph_encoder.eval()
-    totals = {
-        "loss": 0.0,
-        "position_loss": 0.0,
-        "relation_loss": 0.0,
-        "embedding_loss": 0.0,
-        "inverse_relation_loss": 0.0,
-        "box_loss": 0.0,
-        "box3d_loss": 0.0,
-    }
+    metric_keys = _metric_keys(_graph_layout_mode(graph_encoder))
+    totals = {key: 0.0 for key in metric_keys}
     batch_count = 0
     for batch in dataloader:
         metrics = _compute_graph_batch_losses(
@@ -251,13 +699,19 @@ def _evaluate_graph_encoder(
             inverse_relation_loss_weight=inverse_relation_loss_weight,
             box_loss_weight=box_loss_weight,
             box3d_loss_weight=box3d_loss_weight,
+            cvae_kl_weight=cvae_kl_weight,
+            cvae_kl_warmup_steps=cvae_kl_warmup_steps,
+            cvae_best_of_k=1,
+            cvae_free_bits=cvae_free_bits,
+            step=cvae_kl_warmup_steps,
+            label_embedding_cache=label_embedding_cache,
         )
-        for key in totals:
+        for key in metric_keys:
             totals[key] += float(metrics[key].item())
         batch_count += 1
     graph_encoder.train()
     if batch_count == 0:
-        return {key: 0.0 for key in totals}
+        return {key: 0.0 for key in metric_keys}
     return {key: value / batch_count for key, value in totals.items()}
 
 
@@ -283,6 +737,8 @@ def main() -> int:
         seed=args.seed,
         eval_fraction=args.eval_fraction,
         test_fraction=args.test_fraction,
+        load_images=False,
+        prompt_filter=args.prompt_filter,
     )
     if accelerator.is_main_process:
         write_split_manifest(
@@ -316,21 +772,42 @@ def main() -> int:
         collate_fn=collate_training_items,
     )
 
-    from transformers import CLIPTextModel, CLIPTokenizer
-
-    tokenizer = CLIPTokenizer.from_pretrained(args.model_id, subfolder="tokenizer")
-    text_encoder = CLIPTextModel.from_pretrained(
-        args.model_id,
-        subfolder="text_encoder",
+    tokenizer, text_encoder, encoder_hidden_dim = load_graph_label_encoder(
+        model_id=args.model_id,
+        text_encoder_type=args.text_encoder_type,
         torch_dtype=weight_dtype,
+        device=device,
     )
-    text_encoder.requires_grad_(False)
-    text_encoder.to(device)
+    if args.text_hidden_dim is not None and args.text_hidden_dim != encoder_hidden_dim:
+        raise ValueError(
+            f"Config text_hidden_dim={args.text_hidden_dim} does not match "
+            f"{args.text_encoder_type} encoder hidden size {encoder_hidden_dim}."
+        )
+    args.text_hidden_dim = encoder_hidden_dim
+    label_embedding_cache = _load_label_embedding_cache(
+        args.label_embedding_cache,
+        model_id=args.model_id,
+        text_encoder_type=args.text_encoder_type,
+        text_hidden_dim=encoder_hidden_dim,
+    )
+    if accelerator.is_main_process and args.label_embedding_cache:
+        print(
+            f"Loaded {len(label_embedding_cache)} cached label embeddings from "
+            f"{args.label_embedding_cache}."
+        )
 
     graph_encoder = GraphSlotEncoder(
-        text_hidden_dim=text_encoder.config.hidden_size,
+        text_hidden_dim=encoder_hidden_dim,
         slot_dim=args.slot_dim,
         num_layers=args.gnn_layers,
+        layout_mode=args.layout_mode,
+        latent_dim=args.latent_dim,
+        decoder_node_dropout=args.decoder_node_dropout,
+        decoder_mode=args.decoder_mode,
+        decoder_box_residual=args.decoder_box_residual,
+        decoder_box_residual_scale=args.decoder_box_residual_scale,
+        decoder_film_scale=args.decoder_film_scale,
+        use_scene_latent=args.use_scene_latent,
     ).to(device)
     optimizer = torch.optim.AdamW(
         graph_encoder.parameters(),
@@ -341,22 +818,13 @@ def main() -> int:
         optimizer,
         train_dataloader,
     )
+    metric_keys = _metric_keys(args.layout_mode)
 
     if accelerator.is_main_process:
         _save_state(args.output_dir, step=0, args=args)
     metrics_logger = MetricsLogger(
         args.output_dir,
-        fieldnames=[
-            "step",
-            "split",
-            "loss",
-            "position_loss",
-            "relation_loss",
-            "embedding_loss",
-            "inverse_relation_loss",
-            "box_loss",
-            "box3d_loss",
-        ],
+        fieldnames=["step", "split", *metric_keys],
     )
     progress_bar = tqdm(
         total=args.max_train_steps,
@@ -365,15 +833,7 @@ def main() -> int:
     )
 
     global_step = 0
-    running = {
-        "loss": 0.0,
-        "position_loss": 0.0,
-        "relation_loss": 0.0,
-        "embedding_loss": 0.0,
-        "inverse_relation_loss": 0.0,
-        "box_loss": 0.0,
-        "box3d_loss": 0.0,
-    }
+    running = {key: 0.0 for key in metric_keys}
     running_steps = 0
     while global_step < args.max_train_steps:
         for batch in train_dataloader:
@@ -389,6 +849,12 @@ def main() -> int:
                 inverse_relation_loss_weight=args.inverse_relation_loss_weight,
                 box_loss_weight=args.box_loss_weight,
                 box3d_loss_weight=args.box3d_loss_weight,
+                cvae_kl_weight=args.cvae_kl_weight,
+                cvae_kl_warmup_steps=args.cvae_kl_warmup_steps,
+                cvae_best_of_k=args.cvae_best_of_k,
+                cvae_free_bits=args.cvae_free_bits,
+                step=global_step,
+                label_embedding_cache=label_embedding_cache,
             )
             loss = metrics["loss"]
 
@@ -406,35 +872,29 @@ def main() -> int:
             running_steps += 1
             gathered_metrics = {
                 key: accelerator.gather(metrics[key].detach().float().reshape(1)).mean().item()
-                for key in running
+                for key in metric_keys
             }
-            for key in running:
+            for key in metric_keys:
                 running[key] += gathered_metrics[key]
 
             if global_step % args.log_every == 0:
                 train_log = {
                     "step": global_step,
                     "split": "train",
-                    "loss": running["loss"] / running_steps,
-                    "position_loss": running["position_loss"] / running_steps,
-                    "relation_loss": running["relation_loss"] / running_steps,
-                    "embedding_loss": running["embedding_loss"] / running_steps,
-                    "inverse_relation_loss": running["inverse_relation_loss"] / running_steps,
-                    "box_loss": running["box_loss"] / running_steps,
-                    "box3d_loss": running["box3d_loss"] / running_steps,
                 }
+                train_log.update({key: running[key] / running_steps for key in metric_keys})
                 if accelerator.is_main_process:
                     metrics_logger.log(train_log)
                 if accelerator.is_local_main_process:
-                    progress_bar.set_postfix(
-                        pos=f"{train_log['position_loss']:.4f}",
-                        rel=f"{train_log['relation_loss']:.4f}",
-                        sem=f"{train_log['embedding_loss']:.4f}",
-                        inv=f"{train_log['inverse_relation_loss']:.4f}",
-                        box=f"{train_log['box_loss']:.4f}",
-                        box3d=f"{train_log['box3d_loss']:.4f}",
-                    )
-                running = {key: 0.0 for key in running}
+                    postfix = {
+                        "pos": f"{train_log['position_loss']:.4f}",
+                        "rel": f"{train_log['relation_loss']:.4f}",
+                        "box3d": f"{train_log['box3d_loss']:.4f}",
+                    }
+                    if args.layout_mode in {"cvae", "triple_cvae"}:
+                        postfix["kl"] = f"{train_log['cvae_kl_loss']:.4f}"
+                    progress_bar.set_postfix(**postfix)
+                running = {key: 0.0 for key in metric_keys}
                 running_steps = 0
 
             if (
@@ -458,19 +918,23 @@ def main() -> int:
                         inverse_relation_loss_weight=args.inverse_relation_loss_weight,
                         box_loss_weight=args.box_loss_weight,
                         box3d_loss_weight=args.box3d_loss_weight,
+                        cvae_kl_weight=args.cvae_kl_weight,
+                        cvae_kl_warmup_steps=args.cvae_kl_warmup_steps,
+                        cvae_best_of_k=1,
+                        cvae_free_bits=args.cvae_free_bits,
+                        label_embedding_cache=label_embedding_cache,
                     ),
                 }
                 metrics_logger.log(eval_log)
-                print(
-                    "Eval at step "
-                    f"{global_step}: loss={eval_log['loss']:.4f}, "
+                summary = (
+                    f"Eval at step {global_step}: loss={eval_log['loss']:.4f}, "
                     f"pos={eval_log['position_loss']:.4f}, "
                     f"rel={eval_log['relation_loss']:.4f}, "
-                    f"sem={eval_log['embedding_loss']:.4f}, "
-                    f"inv={eval_log['inverse_relation_loss']:.4f}, "
-                    f"box={eval_log['box_loss']:.4f}, "
                     f"box3d={eval_log['box3d_loss']:.4f}"
                 )
+                if args.layout_mode in {"cvae", "triple_cvae"}:
+                    summary += f", kl={eval_log['cvae_kl_loss']:.4f}"
+                print(summary)
 
             if accelerator.is_main_process and global_step % args.save_every == 0:
                 checkpoint_dir = _save_graph_encoder(
@@ -481,6 +945,13 @@ def main() -> int:
                 )
                 _save_state(args.output_dir, step=global_step, args=args)
                 print(f"Saved graph pretraining checkpoint to {checkpoint_dir}")
+                _save_label_embedding_cache(
+                    args.label_embedding_cache,
+                    label_embedding_cache,
+                    model_id=args.model_id,
+                    text_encoder_type=args.text_encoder_type,
+                    text_hidden_dim=encoder_hidden_dim,
+                )
 
             if global_step >= args.max_train_steps:
                 break
@@ -508,21 +979,59 @@ def main() -> int:
                 inverse_relation_loss_weight=args.inverse_relation_loss_weight,
                 box_loss_weight=args.box_loss_weight,
                 box3d_loss_weight=args.box3d_loss_weight,
+                cvae_kl_weight=args.cvae_kl_weight,
+                cvae_kl_warmup_steps=args.cvae_kl_warmup_steps,
+                cvae_best_of_k=1,
+                cvae_free_bits=args.cvae_free_bits,
+                label_embedding_cache=label_embedding_cache,
             ),
         }
         metrics_logger.log(test_log)
-        print(
+        summary = (
             "Final test loss: "
             f"{test_log['loss']:.4f} "
             f"(pos={test_log['position_loss']:.4f}, "
             f"rel={test_log['relation_loss']:.4f}, "
-            f"sem={test_log['embedding_loss']:.4f}, "
-            f"inv={test_log['inverse_relation_loss']:.4f}, "
-            f"box={test_log['box_loss']:.4f}, "
-            f"box3d={test_log['box3d_loss']:.4f})"
+            f"box3d={test_log['box3d_loss']:.4f}"
         )
+        if args.layout_mode in {"cvae", "triple_cvae"}:
+            summary += f", kl={test_log['cvae_kl_loss']:.4f}"
+        summary += ")"
+        print(summary)
     if accelerator.is_main_process:
+        if args.debug_spread_after_training:
+            debug_prompt = args.debug_spread_prompt or args.prompt_filter
+            if debug_prompt is None:
+                print("Skipping layout spread debug: set debug_spread_prompt or prompt_filter.")
+            else:
+                print("")
+                print("===== POST-TRAINING LAYOUT SPREAD DEBUG =====")
+                metadata_rows = load_metadata_rows(args.dataset_dir)
+                _print_training_data_spread(
+                    rows=metadata_rows,
+                    prompt=debug_prompt,
+                )
+                _print_model_spread(
+                    prompt=debug_prompt,
+                    rows=metadata_rows,
+                    tokenizer=tokenizer,
+                    text_encoder=text_encoder,
+                    graph_encoder=_unwrap_graph_encoder(graph_encoder, accelerator),
+                    device=device,
+                    sample_count=args.debug_spread_samples,
+                    posterior_rows=args.debug_spread_posterior_rows,
+                    seed=args.seed,
+                    layout_z_scale=args.debug_spread_z_scale,
+                    label_embedding_cache=label_embedding_cache,
+                )
         _save_state(args.output_dir, step=global_step, args=args)
+        _save_label_embedding_cache(
+            args.label_embedding_cache,
+            label_embedding_cache,
+            model_id=args.model_id,
+            text_encoder_type=args.text_encoder_type,
+            text_hidden_dim=encoder_hidden_dim,
+        )
         print(f"Graph pretraining finished at step {global_step}.")
     accelerator.wait_for_everyone()
     return 0

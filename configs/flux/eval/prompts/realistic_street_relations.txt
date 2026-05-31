@@ -1,0 +1,6 @@
+a car to the left of a person
+a person to the right of a car
+a bicycle next to a person
+a dog in front of a person
+a traffic light above a car
+a motorcycle behind a car
