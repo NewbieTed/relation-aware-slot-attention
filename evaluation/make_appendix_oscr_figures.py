@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -126,21 +127,26 @@ def compose_grid(
     columns: int,
     output_path: Path,
     title: str | None = None,
+    draw_text: bool = True,
     title_font_size: int = 46,
     panel_title_font_size: int = 38,
     panel_title_height: int = 86,
     gap: int = 16,
     margin: int = 20,
 ) -> None:
-    titled = [
-        add_title(
-            panel.image,
-            panel.title,
-            title_height=panel_title_height,
-            font_size=panel_title_font_size,
-        )
-        for panel in panels
-    ]
+    titled = (
+        [
+            add_title(
+                panel.image,
+                panel.title,
+                title_height=panel_title_height,
+                font_size=panel_title_font_size,
+            )
+            for panel in panels
+        ]
+        if draw_text
+        else [panel.image for panel in panels]
+    )
     if not titled:
         raise ValueError("Cannot compose an empty figure grid")
 
@@ -148,12 +154,12 @@ def compose_grid(
     rows = math.ceil(len(titled) / columns)
     cell_w = max(image.width for image in titled)
     cell_h = max(image.height for image in titled)
-    header_h = int(title_font_size * 2.1) if title else 0
+    header_h = int(title_font_size * 2.1) if title and draw_text else 0
     width = margin * 2 + columns * cell_w + (columns - 1) * gap
     height = margin * 2 + header_h + rows * cell_h + (rows - 1) * gap
     canvas = Image.new("RGB", (width, height), "white")
     draw = ImageDraw.Draw(canvas)
-    if title:
+    if title and draw_text:
         font = default_font(title_font_size)
         bbox = draw.textbbox((0, 0), title, font=font)
         draw.text(((width - (bbox[2] - bbox[0])) // 2, margin), title, fill=(20, 20, 20), font=font)
@@ -179,6 +185,20 @@ def write_individual_panels(panels: list[RenderedPanel], output_dir: Path, figur
         panel.image.save(path)
         manifest.append({"index": index, "title": panel.title, "path": str(path), **panel.metadata})
     (panel_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+
+
+def slugify(value: str, *, max_length: int = 96) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+    return (slug or "figure")[:max_length]
+
+
+def figure_file_stem(name: str, figure_config: dict[str, Any]) -> str:
+    if figure_config.get("file_stem"):
+        return slugify(str(figure_config["file_stem"]))
+    prompt = figure_config.get("prompt")
+    if prompt:
+        return slugify(str(prompt))
+    return slugify(name)
 
 
 def load_rows(raw_config: dict[str, Any]) -> list[dict[str, Any]]:
@@ -593,12 +613,13 @@ def main() -> int:
         if not panels:
             raise RuntimeError(f"Figure {name!r} produced no panels")
         write_individual_panels(panels, output_dir, name)
-        output_path = figure_dir / f"{name}.png"
+        output_path = figure_dir / f"{figure_file_stem(name, figure_config)}.png"
         compose_grid(
             panels,
             columns=int(figure_config.get("columns", min(4, len(panels)))),
             output_path=output_path,
             title=figure_config.get("title"),
+            draw_text=bool(render_config.get("draw_text", True)),
             title_font_size=int(render_config.get("title_font_size", 46)),
             panel_title_font_size=int(render_config.get("panel_title_font_size", 38)),
             panel_title_height=int(render_config.get("panel_title_height", 86)),

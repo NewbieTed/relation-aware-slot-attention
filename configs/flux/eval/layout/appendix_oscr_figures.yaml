@@ -19,9 +19,7 @@ rendering:
   image_size: 512
   face_alpha: 0.10
   azimuth_degrees: 0.0
-  title_font_size: 54
-  panel_title_font_size: 44
-  panel_title_height: 104
+  draw_text: false
   grid_gap: 18
   grid_margin: 24
 
