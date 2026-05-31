@@ -185,7 +185,13 @@ def load_rows(raw_config: dict[str, Any]) -> list[dict[str, Any]]:
     return list(splits[split].rows)
 
 
-def find_row(rows: list[dict[str, Any]], prompt: str, *, prompt_prefix: str) -> dict[str, Any]:
+def find_row(
+    rows: list[dict[str, Any]],
+    prompt: str,
+    *,
+    prompt_prefix: str,
+    fallback_relation: str | None = None,
+) -> dict[str, Any]:
     target = normalize_prompt(prompt)
     row_prompts = [(row, normalize_prompt(prompt_from_scop_depth_row(row, prefix=prompt_prefix))) for row in rows]
     for row in rows:
@@ -194,11 +200,16 @@ def find_row(rows: list[dict[str, Any]], prompt: str, *, prompt_prefix: str) -> 
     for row, row_prompt in row_prompts:
         if target in row_prompt or row_prompt in target:
             return row
+    if fallback_relation:
+        for row in rows:
+            if any(str(edge[1]) == fallback_relation for edge in row.get("oros", [])):
+                return row
 
     examples = [row_prompt for _row, row_prompt in row_prompts[:20]]
     raise ValueError(
         "No row matched prompt in selected split: "
-        f"{prompt}. First available normalized prompts include: {examples}"
+        f"{prompt}. First available normalized prompts include: {examples}. "
+        "Either choose one of those prompts or set fallback_relation in the figure config."
     )
 
 
@@ -277,7 +288,12 @@ def figure_deterministic_vs_relay(
     prompt_prefix: str,
     render_config: dict[str, Any],
 ) -> list[RenderedPanel]:
-    row = find_row(rows, str(figure_config["prompt"]), prompt_prefix=prompt_prefix)
+    row = find_row(
+        rows,
+        str(figure_config["prompt"]),
+        prompt_prefix=prompt_prefix,
+        fallback_relation=figure_config.get("fallback_relation"),
+    )
     image_size = int(render_config.get("image_size", 512))
     face_alpha = float(render_config.get("face_alpha", 0.10))
     azimuth_degrees = float(render_config.get("azimuth_degrees", 0.0))
@@ -346,7 +362,12 @@ def figure_augmentation_comparison(
     prompt_prefix: str,
     render_config: dict[str, Any],
 ) -> list[RenderedPanel]:
-    row = find_row(rows, str(figure_config["prompt"]), prompt_prefix=prompt_prefix)
+    row = find_row(
+        rows,
+        str(figure_config["prompt"]),
+        prompt_prefix=prompt_prefix,
+        fallback_relation=figure_config.get("fallback_relation"),
+    )
     image_size = int(render_config.get("image_size", 512))
     face_alpha = float(render_config.get("face_alpha", 0.10))
     azimuth_degrees = float(render_config.get("azimuth_degrees", 0.0))
@@ -443,7 +464,12 @@ def figure_success_failure(
     panels: list[RenderedPanel] = []
     if explicit_cases:
         for case_index, case in enumerate(explicit_cases):
-            row = find_row(rows, str(case["prompt"]), prompt_prefix=prompt_prefix)
+            row = find_row(
+                rows,
+                str(case["prompt"]),
+                prompt_prefix=prompt_prefix,
+                fallback_relation=case.get("fallback_relation"),
+            )
             mode = str(case.get("layout_sample_mode", "prior_sample"))
             sample_index = int(case.get("sample_index", 0))
             predictions = predict_samples(

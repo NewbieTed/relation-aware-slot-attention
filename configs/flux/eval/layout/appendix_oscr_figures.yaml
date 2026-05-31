@@ -30,6 +30,7 @@ figures:
     type: deterministic_vs_relay
     title: Deterministic vs. RELAY-3D sampled OSCR layouts
     prompt: a dog to the left of a chair
+    fallback_relation: to the left of
     deterministic_checkpoint: deterministic_prompt400
     relay_checkpoint: relay_prompt400
     relay_samples: 6
@@ -41,6 +42,7 @@ figures:
     type: augmentation_comparison
     title: Prompt-balanced augmentation and 3D relation placement
     prompt: a dog in front of a bicycle
+    fallback_relation: in front of
     original_checkpoint: deterministic_original
     augmented_checkpoint: deterministic_prompt400
     seed: 42
