@@ -96,15 +96,27 @@ def default_font(size: int) -> ImageFont.ImageFont:
     return ImageFont.load_default()
 
 
-def add_title(image: Image.Image, title: str, *, title_height: int = 42) -> Image.Image:
+def add_title(
+    image: Image.Image,
+    title: str,
+    *,
+    title_height: int = 86,
+    font_size: int = 38,
+) -> Image.Image:
     output = Image.new("RGB", (image.width, image.height + title_height), "white")
     output.paste(image, (0, title_height))
     draw = ImageDraw.Draw(output)
-    font = default_font(18)
+    font = default_font(font_size)
     text = title.strip()
     bbox = draw.textbbox((0, 0), text, font=font)
     text_width = bbox[2] - bbox[0]
-    draw.text(((image.width - text_width) // 2, 12), text, fill=(25, 25, 25), font=font)
+    text_height = bbox[3] - bbox[1]
+    draw.text(
+        ((image.width - text_width) // 2, max(4, (title_height - text_height) // 2)),
+        text,
+        fill=(25, 25, 25),
+        font=font,
+    )
     return output
 
 
@@ -114,10 +126,21 @@ def compose_grid(
     columns: int,
     output_path: Path,
     title: str | None = None,
+    title_font_size: int = 46,
+    panel_title_font_size: int = 38,
+    panel_title_height: int = 86,
     gap: int = 16,
     margin: int = 20,
 ) -> None:
-    titled = [add_title(panel.image, panel.title) for panel in panels]
+    titled = [
+        add_title(
+            panel.image,
+            panel.title,
+            title_height=panel_title_height,
+            font_size=panel_title_font_size,
+        )
+        for panel in panels
+    ]
     if not titled:
         raise ValueError("Cannot compose an empty figure grid")
 
@@ -125,13 +148,13 @@ def compose_grid(
     rows = math.ceil(len(titled) / columns)
     cell_w = max(image.width for image in titled)
     cell_h = max(image.height for image in titled)
-    header_h = 56 if title else 0
+    header_h = int(title_font_size * 2.1) if title else 0
     width = margin * 2 + columns * cell_w + (columns - 1) * gap
     height = margin * 2 + header_h + rows * cell_h + (rows - 1) * gap
     canvas = Image.new("RGB", (width, height), "white")
     draw = ImageDraw.Draw(canvas)
     if title:
-        font = default_font(24)
+        font = default_font(title_font_size)
         bbox = draw.textbbox((0, 0), title, font=font)
         draw.text(((width - (bbox[2] - bbox[0])) // 2, margin), title, fill=(20, 20, 20), font=font)
 
@@ -576,6 +599,11 @@ def main() -> int:
             columns=int(figure_config.get("columns", min(4, len(panels)))),
             output_path=output_path,
             title=figure_config.get("title"),
+            title_font_size=int(render_config.get("title_font_size", 46)),
+            panel_title_font_size=int(render_config.get("panel_title_font_size", 38)),
+            panel_title_height=int(render_config.get("panel_title_height", 86)),
+            gap=int(render_config.get("grid_gap", 16)),
+            margin=int(render_config.get("grid_margin", 20)),
         )
         summary.append({"name": name, "type": figure_type, "path": str(output_path), "panels": len(panels)})
         print(f"Wrote {output_path}")

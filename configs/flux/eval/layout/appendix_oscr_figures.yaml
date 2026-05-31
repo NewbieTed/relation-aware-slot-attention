@@ -19,6 +19,11 @@ rendering:
   image_size: 512
   face_alpha: 0.10
   azimuth_degrees: 0.0
+  title_font_size: 54
+  panel_title_font_size: 44
+  panel_title_height: 104
+  grid_gap: 18
+  grid_margin: 24
 
 checkpoints:
   deterministic_original: /local1/cse_481_m_l/relation-aware-slot-attention/outputs/train/final_models/graph_pretrain_flux_3dbox_deterministic_t5_b128_600/final/graph_encoder.pt
