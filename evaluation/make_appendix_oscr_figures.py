@@ -187,10 +187,19 @@ def load_rows(raw_config: dict[str, Any]) -> list[dict[str, Any]]:
 
 def find_row(rows: list[dict[str, Any]], prompt: str, *, prompt_prefix: str) -> dict[str, Any]:
     target = normalize_prompt(prompt)
+    row_prompts = [(row, normalize_prompt(prompt_from_scop_depth_row(row, prefix=prompt_prefix))) for row in rows]
     for row in rows:
         if normalize_prompt(prompt_from_scop_depth_row(row, prefix=prompt_prefix)) == target:
             return row
-    raise ValueError(f"No row matched prompt in selected split: {prompt}")
+    for row, row_prompt in row_prompts:
+        if target in row_prompt or row_prompt in target:
+            return row
+
+    examples = [row_prompt for _row, row_prompt in row_prompts[:20]]
+    raise ValueError(
+        "No row matched prompt in selected split: "
+        f"{prompt}. First available normalized prompts include: {examples}"
+    )
 
 
 def load_predictors(raw_config: dict[str, Any]) -> dict[str, GraphModelPredictor]:

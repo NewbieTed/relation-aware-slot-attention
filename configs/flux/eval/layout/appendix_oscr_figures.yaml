@@ -29,7 +29,7 @@ figures:
   - name: fig1_deterministic_vs_relay
     type: deterministic_vs_relay
     title: Deterministic vs. RELAY-3D sampled OSCR layouts
-    prompt: a suitcase in front of an apple
+    prompt: a dog to the left of a chair
     deterministic_checkpoint: deterministic_prompt400
     relay_checkpoint: relay_prompt400
     relay_samples: 6
