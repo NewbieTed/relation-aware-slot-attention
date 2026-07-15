@@ -1,4 +1,4 @@
-# relation-aware-slot-attention
+# RELAY-3D: Scene-Graph 3D Layout Prediction 
 
 This branch is the FLUX.1-dev version of the project. It keeps the SCOP-Depth
 data pipeline and relation-aware GNN, then uses the GNN to predict normalized
